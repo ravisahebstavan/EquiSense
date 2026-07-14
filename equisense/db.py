@@ -84,3 +84,8 @@ def ensure_schema() -> None:
             cols = {c["name"] for c in insp.get_columns(table)}
             if col not in cols:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+        # hot-path composite indexes (IF NOT EXISTS works on SQLite + Postgres)
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_prices_cid_date "
+                          "ON price_observations (company_id, obs_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_macro_sym_date "
+                          "ON macro_observations (symbol, obs_date)"))

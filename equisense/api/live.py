@@ -37,15 +37,22 @@ def _series(session: Session, cid: int):
     return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows])
 
 
-def _macro(session: Session, symbol: str) -> list[float]:
-    return [r[0] for r in session.execute(
-        select(MacroObservation.close).where(MacroObservation.symbol == symbol)
-        .order_by(MacroObservation.obs_date)).all()]
+def _macro(session: Session, symbol: str, limit: int | None = None) -> list[float]:
+    q = (select(MacroObservation.close)
+         .where(MacroObservation.symbol == symbol)
+         .order_by(MacroObservation.obs_date.desc()))
+    if limit:
+        q = q.limit(limit)
+    rows = [r[0] for r in session.execute(q).all()]
+    return rows[::-1]
 
 
 def current_regime(session: Session) -> dict:
-    return classify_regime(_macro(session, "^NSEI"), _macro(session, "^INDIAVIX"),
-                           _macro(session, "INR=X"), _macro(session, "BZ=F"),
+    # regime needs ≤3y of history (VIX percentile window) — don't drag 10y
+    # over the network per dossier
+    L = 800
+    return classify_regime(_macro(session, "^NSEI", L), _macro(session, "^INDIAVIX", L),
+                           _macro(session, "INR=X", L), _macro(session, "BZ=F", L),
                            as_of=date.today().isoformat())
 
 
@@ -60,44 +67,18 @@ SIGNAL_KEYS = ["momentum", "dist_52w", "trend", "rel_strength", "mqi", "vol",
 
 def universe_signals(session: Session) -> dict[str, dict[str, Optional[float]]]:
     """Raw signal values for every company — the reference distribution that
-    §5.1 percentile normalization ranks against. Cached per price date."""
-    companies = session.scalars(select(Company)).all()
-    latest = session.scalar(select(PriceObservation.obs_date)
-                            .order_by(PriceObservation.obs_date.desc()))
-    key = (str(latest), len(companies))
+    §5.1 percentile normalization ranks against. Served from the universe
+    snapshot (one row) instead of a 50-company recompute."""
+    from .snapshot import get_universe
+    universe = get_universe(session)
+    key = universe.get("as_of")
     if _SIG_CACHE["key"] == key:
         return _SIG_CACHE["signals"]
-
-    nifty = _macro(session, "^NSEI")
     out: dict[str, dict[str, Optional[float]]] = {k: {} for k in SIGNAL_KEYS}
-    for c in companies:
-        dates, closes, volumes = _series(session, c.id)
-        if len(closes) < 60:
-            continue
-        t = c.ticker
-        out["momentum"][t] = technical.momentum_12_1(closes).value
-        out["dist_52w"][t] = technical.pct_from_52w_high(closes).value
-        out["trend"][t] = technical.trend_200dma(closes).value
-        out["rel_strength"][t] = technical.relative_strength(closes, nifty).value
-        out["mqi"][t] = novel.momentum_quality(closes).value
-        out["vol"][t] = technical.realized_vol(closes).value
-        out["heat"][t] = novel.crowding_proxy(closes, volumes).value
-        stmts = services.latest_statements(session, c.id)
-        price = closes[-1]
-        if stmts and not c.is_financial:
-            prev = stmts[-2] if len(stmts) >= 2 else None
-            if prev:
-                f = quality.piotroski_f(stmts[-1], prev, price)
-                out["f_score"][t] = f.value
-            z = quality.altman_z(stmts[-1], price)
-            out["z_score"][t] = z.value
-            out["ccs"][t] = novel.cash_conviction(stmts).value
-            out["fragility"][t] = novel.fragility(stmts, closes).value
-            rd = valuation.reverse_dcf(stmts[-1], price)
-            hist = valuation.historical_fcf_cagr(stmts)
-            if rd["implied_growth"].value is not None and hist and hist.value is not None:
-                out["exp_gap"][t] = rd["implied_growth"].value - hist.value
-            out["pe_pctile"][t] = novel.pe_percentile_vs_history(closes, dates, stmts).value
+    for item in universe["companies"]:
+        t = item["ticker"]
+        for k in SIGNAL_KEYS:
+            out[k][t] = item["signals"].get(k)
     _SIG_CACHE.update(key=key, signals=out)
     return out
 
@@ -180,7 +161,7 @@ def build_evidence(session: Session, company: Company, regime_key: str,
     E.append(ev("technical", "technical.trend", "trend", S("trend"),
                 f"price {tr.value:+.1f}% vs 200DMA" if tr.value is not None else "", [tr],
                 base_rate=get_base_rate(session, "above_200dma", 126, regime_key)))
-    rs = technical.relative_strength(closes, _macro(session, "^NSEI"), period=period)
+    rs = technical.relative_strength(closes, _macro(session, "^NSEI", 300), period=period)
     E.append(ev("technical", "technical.trend", "trend", S("rel_strength"),
                 f"relative strength vs NIFTY {rs.value:+.1f}% (63d)"
                 if rs.value is not None else "", [rs]))

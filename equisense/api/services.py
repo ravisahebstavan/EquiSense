@@ -268,6 +268,8 @@ def _txns(session: Session) -> list[pf.Transaction]:
 
 
 def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
+    from .snapshot import get_universe
+    universe = {c["id"]: c for c in get_universe(session)["companies"]}
     txns = _txns(session)
     positions = pf.positions_from_ledger(txns)
     companies = {c.id: c for c in session.scalars(select(Company)).all()}
@@ -275,13 +277,15 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
 
     prices, values = {}, {}
     for cid, pos in positions.items():
-        prices[cid] = latest_price(session, cid) or 0.0
+        snap = universe.get(cid)
+        prices[cid] = (snap["price"] if snap else latest_price(session, cid)) or 0.0
         values[cid] = pos.quantity * prices[cid]
 
     quality_tiers = {}
     for cid in positions:
-        sig = company_signals(session, companies[cid])
-        quality_tiers[cid] = quality.quality_tier(sig.f_score)
+        snap = universe.get(cid)
+        f = snap["signals"].get("f_score") if snap else None
+        quality_tiers[cid] = quality.quality_tier(f)
 
     conc = pf.concentration(
         positions, prices,
@@ -343,31 +347,44 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
 
 # ---------------------------------------------------------------- dashboard
 
+def signals_from_snapshot(item: dict) -> pers.CompanySignals:
+    s = item["signals"]
+    return pers.CompanySignals(
+        sector=item["sector"], f_score=s.get("f_score"), z_zone=s.get("z_zone"),
+        roic_pct=s.get("roic_pct"), revenue_cagr_pct=s.get("revenue_cagr_pct"),
+        dividend_yield_pct=s.get("dividend_yield_pct"), pe=s.get("pe"),
+        debt_to_equity=s.get("debt_to_equity"),
+        implied_growth_gap_pct=s.get("implied_growth_gap_pct"))
+
+
 def dashboard(session: Session, profile: pers.InvestorProfile) -> dict:
-    companies = session.scalars(select(Company)).all()
+    """Snapshot-backed: one row fetch + three small queries — serverless-fast
+    (the naive per-company version cost 40s over network Postgres)."""
+    from .snapshot import get_universe
+    universe = get_universe(session)
     watch_ids = {w.company_id: w for w in session.scalars(select(WatchlistItem)).all()}
     positions = pf.positions_from_ledger(_txns(session))
     held_ids = {cid for cid, p in positions.items() if p.quantity > 1e-9}
 
     ranked = []
-    for c in companies:
-        sig = company_signals(session, c)
+    for item in universe["companies"]:
+        sig = signals_from_snapshot(item)
         score = pers.attention_score(profile, sig)
+        cid = item["id"]
+        s = item["signals"]
         ranked.append({
-            "id": c.id, "ticker": c.ticker, "name": c.name, "sector": c.sector,
-            "held": c.id in held_ids, "watched": c.id in watch_ids,
-            "watch_rationale": watch_ids[c.id].rationale if c.id in watch_ids else None,
-            "price": latest_price(session, c.id),
+            "id": cid, "ticker": item["ticker"], "name": item["name"],
+            "sector": item["sector"],
+            "held": cid in held_ids, "watched": cid in watch_ids,
+            "watch_rationale": watch_ids[cid].rationale if cid in watch_ids else None,
+            "price": item["price"], "spark": item.get("spark", []),
             "priority": score,
-            "signals": {"f_score": sig.f_score, "z_zone": sig.z_zone,
-                        "roic_pct": None if sig.roic_pct is None else round(sig.roic_pct, 1),
-                        "revenue_cagr_pct": None if sig.revenue_cagr_pct is None
-                        else round(sig.revenue_cagr_pct, 1),
-                        "pe": None if sig.pe is None else round(sig.pe, 1),
-                        "dividend_yield_pct": None if sig.dividend_yield_pct is None
-                        else round(sig.dividend_yield_pct, 2),
-                        "implied_growth_gap_pct": None if sig.implied_growth_gap_pct is None
-                        else round(sig.implied_growth_gap_pct, 1)},
+            "signals": {"f_score": s.get("f_score"), "z_zone": s.get("z_zone"),
+                        "roic_pct": s.get("roic_pct"),
+                        "revenue_cagr_pct": s.get("revenue_cagr_pct"),
+                        "pe": s.get("pe"),
+                        "dividend_yield_pct": s.get("dividend_yield_pct"),
+                        "implied_growth_gap_pct": s.get("implied_growth_gap_pct")},
         })
     ranked.sort(key=lambda r: -r["priority"]["score"])
 

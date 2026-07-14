@@ -175,7 +175,11 @@ def refresh_stream(session: Session):
         scored = ledger.score_due_claims(session)
         yield sse("scoring_claims", "done", scored=scored["scored"])
 
-        yield sse("publishing", "done", quality_score=data_status(session)["quality_score"])
+        yield sse("publishing", "running")
+        from .snapshot import build_universe_snapshot
+        snap = build_universe_snapshot(session)  # views become single-row reads
+        yield sse("publishing", "done", companies=len(snap["companies"]),
+                  quality_score=data_status(session)["quality_score"])
         yield sse("pipeline", "complete")
     except Exception as e:  # surface, never swallow (failed refresh recovery)
         yield sse("pipeline", "failed", error=f"{type(e).__name__}: {e}")

@@ -65,45 +65,73 @@ const drawer = document.getElementById("drawer");
 const drawerBody = document.getElementById("drawer-body");
 let refreshing = false;
 
+const STAGE_LABEL = {
+  bootstrap: "First-boot bootstrap", universe: "Syncing universe",
+  downloading_prices: "Downloading prices", downloading_macro: "Downloading macro",
+  fundamentals: "Fetching fundamentals", validating: "Validating",
+  running_studies: "Running hypotheses", scoring_claims: "Scoring claims",
+  publishing: "Publishing snapshot", pipeline: "Pipeline",
+};
+
+function renderStage(d) {
+  const id = "st-" + d.stage;
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "stage"; el.id = id;
+    drawerBody.appendChild(el);
+  }
+  const detail = Object.entries(d).filter(([k]) => !["stage", "status"].includes(k))
+    .map(([k, v]) => `${k}: ${v}`).join(" · ");
+  el.innerHTML =
+    `<span class="chip ${d.status === "done" || d.status === "complete" ? "done" : d.status}">${esc(d.status)}</span>
+     <span class="name">${esc(STAGE_LABEL[d.stage] || d.stage)}</span>
+     <span class="detail">${esc(detail)}</span>`;
+}
+
+function finishRefresh(ok) {
+  refreshing = false;
+  refreshStatusStrip(); cache.companies = null;
+  drawerBody.insertAdjacentHTML("beforeend",
+    `<div class="sub" style="margin-top:10px">${ok
+      ? "Done. Views reflect fresh data on next navigation."
+      : "Stopped early — state is preserved and resumable: run Refresh again."}</div>`);
+}
+
+async function refreshViaPost() {
+  // Fallback for hosts that buffer SSE (some serverless platforms):
+  // same staged pipeline, results rendered at completion.
+  drawerBody.insertAdjacentHTML("beforeend",
+    '<div class="sub" id="post-note">Streaming unavailable here — running the full pipeline, results on completion (may take a few minutes)…</div>');
+  try {
+    const r = await api("/live/refresh", { method: "POST" });
+    document.getElementById("post-note")?.remove();
+    r.stages.forEach(renderStage);
+    finishRefresh(r.ok);
+  } catch (e) {
+    drawerBody.insertAdjacentHTML("beforeend", `<div class="unavail">${esc(e.message)}</div>`);
+    refreshing = false;
+  }
+}
+
 function openRefreshDrawer() {
   drawer.hidden = false;
   if (refreshing) return;
   refreshing = true;
   drawerBody.innerHTML = "";
-  const stages = {};
-  const label = {
-    universe: "Syncing universe", downloading_prices: "Downloading prices…",
-    downloading_macro: "Downloading macro…", validating: "Validating…",
-    running_studies: "Running hypotheses…", scoring_claims: "Scoring claims…",
-    publishing: "Publishing…", pipeline: "Pipeline",
-  };
+  let gotAny = false;
   const es = new EventSource("/api/live/refresh/stream");
   es.onmessage = (ev) => {
+    gotAny = true;
     const d = JSON.parse(ev.data);
-    const id = "st-" + d.stage;
-    if (!stages[d.stage]) {
-      const div = document.createElement("div");
-      div.className = "stage"; div.id = id;
-      drawerBody.appendChild(div);
-      stages[d.stage] = true;
-    }
-    const detail = Object.entries(d).filter(([k]) => !["stage", "status"].includes(k))
-      .map(([k, v]) => `${k}: ${v}`).join(" · ");
-    document.getElementById(id).innerHTML =
-      `<span class="chip ${d.status === "done" || d.status === "complete" ? "done" : d.status}">${esc(d.status)}</span>
-       <span class="name">${esc(label[d.stage] || d.stage)}</span>
-       <span class="detail">${esc(detail)}</span>`;
-    if (d.stage === "pipeline") {
-      es.close(); refreshing = false;
-      refreshStatusStrip(); cache.companies = null;
-      drawerBody.insertAdjacentHTML("beforeend",
-        `<div class="sub" style="margin-top:10px">${d.status === "complete"
-          ? "Done. Views will reflect fresh data on next navigation."
-          : "Failed — the error above is the recovery starting point; re-run when resolved."}</div>`);
-    }
+    renderStage(d);
+    if (d.stage === "pipeline") { es.close(); finishRefresh(d.status === "complete"); }
   };
-  es.onerror = () => { es.close(); refreshing = false;
-    drawerBody.insertAdjacentHTML("beforeend", '<div class="unavail">stream interrupted — re-open to retry</div>'); };
+  es.onerror = () => {
+    es.close();
+    if (!gotAny) { refreshViaPost(); }           // SSE-hostile host → POST fallback
+    else if (refreshing) { finishRefresh(false); } // stream cut mid-run → resumable
+  };
 }
 document.getElementById("refresh-btn").addEventListener("click", openRefreshDrawer);
 document.getElementById("drawer-close").addEventListener("click", () => drawer.hidden = true);
@@ -208,15 +236,34 @@ function sparkline(title, series, unit = "") {
   if (pts.length < 2) return "";
   const vals = pts.map(p => p.value);
   const min = Math.min(...vals), max = Math.max(...vals), range = max - min || 1;
-  const W = 160, H = 36, PAD = 3, step = (W - 2 * PAD) / (pts.length - 1);
+  const W = 160, H = 40, PAD = 3, step = (W - 2 * PAD) / (pts.length - 1);
   const xy = pts.map((p, i) => [PAD + i * step, H - PAD - ((p.value - min) / range) * (H - 2 * PAD)]);
   const poly = xy.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
   const last = xy[xy.length - 1];
+  const area = `${PAD},${H} ${poly} ${last[0].toFixed(1)},${H}`;
   return `<div class="spark" data-spark='${esc(JSON.stringify(pts.map(p => ({ p: p.period, v: p.value }))))}'>
     <div class="t">${esc(title)}</div><div class="v">${fmtN(vals[vals.length - 1], 1)}${esc(unit)}</div>
     <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-      <polyline points="${poly}"></polyline><circle class="dot" cx="${last[0]}" cy="${last[1]}" r="3"></circle>
+      <polygon class="area" points="${area}"></polygon>
+      <polyline class="line" points="${poly}"></polyline>
+      <circle class="dot" cx="${last[0]}" cy="${last[1]}" r="2.6"></circle>
     </svg><div class="tip"></div></div>`;
+}
+
+function microspark(values) {
+  if (!values || values.length < 2) return "";
+  const min = Math.min(...values), max = Math.max(...values), range = max - min || 1;
+  const W = 84, H = 22, PAD = 2, step = (W - 2 * PAD) / (values.length - 1);
+  const poly = values.map((v, i) =>
+    `${(PAD + i * step).toFixed(1)},${(H - PAD - ((v - min) / range) * (H - 2 * PAD)).toFixed(1)}`).join(" ");
+  const up = values[values.length - 1] >= values[0];
+  return `<svg class="microspark ${up ? "up" : "down"}" viewBox="0 0 ${W} ${H}"
+    preserveAspectRatio="none"><polyline points="${poly}"></polyline></svg>`;
+}
+
+function skeleton(rows = 6) {
+  return `<div class="panel">${Array.from({ length: rows }, (_, i) =>
+    `<div class="skel" style="height:16px;margin:12px 0;width:${88 - (i * 7) % 30}%"></div>`).join("")}</div>`;
 }
 function wireSparks(root) {
   root.querySelectorAll(".spark").forEach(el => {
@@ -314,7 +361,7 @@ function renderDossier(d) {
       ${esc(d.costs_taxes.applicable_tax)} · breakeven ${d.costs_taxes.breakeven_gross_move_pct}%
       ${d.costs_taxes.ltcg_cliff_note ? "<br>⚠ " + esc(d.costs_taxes.ltcg_cliff_note) : ""}</div>` : "";
   return `
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+    <div class="verdict-banner ${s.verdict}">
       <span class="verdict ${s.verdict}">${esc(s.verdict.replaceAll("_", " "))}</span>
       <span>net ${signed(s.net_score, 3)} · ${esc(s.conviction_band)} conviction · dispersion ${s.dispersion}</span>
       <span class="sub">as of ${esc(d.as_of)} · regime ${esc(d.regime.label)} (context)</span>
@@ -353,6 +400,7 @@ async function viewDashboard() {
   const top = d.ranked.slice(0, 8).map(r => `
     <tr class="clickable" data-company="${r.id}">
       <td><strong>${esc(r.ticker)}</strong></td><td>${esc(r.sector)}</td>
+      <td>${microspark(r.spark)}</td>
       <td>${r.held ? '<span class="chip held">held</span>' : ""}${r.watched ? '<span class="chip">watch</span>' : ""}</td>
       <td class="num">${fmtMoney(r.price)}</td>
       <td class="num">${r.signals.f_score ?? "—"}</td>
@@ -400,7 +448,7 @@ async function viewDashboard() {
         ${st.warnings.map(w => `<div class="breach">⚠ ${esc(w)}</div>`).join("")}
       </div>
       <div class="panel span8"><h2>Highest attention (your profile's ordering)</h2>
-        <div class="tablewrap"><table><thead><tr><th>Ticker</th><th>Sector</th><th></th>
+        <div class="tablewrap"><table><thead><tr><th>Ticker</th><th>Sector</th><th>1y</th><th></th>
           <th class="num">Price</th><th class="num">F</th><th class="num">P/E</th><th>Priority</th></tr></thead>
           <tbody>${top}</tbody></table></div>
         <div class="sub" style="margin-top:6px"><a href="#/companies">full universe →</a></div>
@@ -445,6 +493,7 @@ async function viewCompanies() {
     <tr class="clickable" data-company="${c.id}">
       <td><strong>${esc(c.ticker)}</strong><div class="sub">${esc(c.name)}</div></td>
       <td>${esc(c.sector)}</td>
+      <td>${microspark(c.spark)}</td>
       <td>${c.held ? '<span class="chip held">held</span>' : ""}${c.watched ? '<span class="chip">watch</span>' : ""}</td>
       <td class="num">${fmtMoney(c.price)}</td>
       <td class="num">${c.signals.f_score ?? "—"}/9</td>
@@ -466,7 +515,7 @@ async function viewCompanies() {
       <span class="sub">click headers to sort · click a row to open the workspace</span>
     </div>
     <div class="panel"><div class="tablewrap"><table>
-      <thead><tr><th>Company</th><th>Sector</th><th></th>
+      <thead><tr><th>Company</th><th>Sector</th><th>1y</th><th></th>
         ${TH("Price", "price")}${TH("F", "f_score")}<th>Z</th>${TH("ROIC%", "roic_pct")}
         ${TH("Rev CAGR", "revenue_cagr_pct")}${TH("P/E", "pe")}${TH("Exp gap*", "implied_growth_gap_pct")}
         ${TH("Priority", "priority")}</tr></thead>
@@ -516,7 +565,7 @@ async function viewCompanyDetail(id, tab = "overview") {
     <div class="sub">${esc(c.description)}</div>
     <div class="tabs">${tabs.map(([k, l]) =>
       `<button class="${k === tab ? "active" : ""}" data-tab="${k}">${l}</button>`).join("")}</div>
-    <div id="tab-body"><div class="loading">Loading…</div></div>`;
+    <div id="tab-body">${skeleton(6)}</div>`;
   app.querySelectorAll("[data-tab]").forEach(b =>
     b.addEventListener("click", () => location.hash = `#/companies/${id}/${b.dataset.tab}`));
 
@@ -857,7 +906,7 @@ async function viewLab(section = "hypotheses") {
     <h1>Research Laboratory</h1>
     <div class="tabs">${tabs.map(([k, l]) =>
       `<button class="${k === section ? "active" : ""}" data-tab="${k}">${l}</button>`).join("")}</div>
-    <div id="lab-body"><div class="loading">Loading…</div></div>`;
+    <div id="lab-body">${skeleton(6)}</div>`;
   app.querySelectorAll("[data-tab]").forEach(b =>
     b.addEventListener("click", () => location.hash = `#/lab/${b.dataset.tab}`));
   const body = document.getElementById("lab-body");
@@ -981,7 +1030,8 @@ async function route() {
   const [name, arg, sub] = parts;
   document.querySelectorAll("#nav a").forEach(a =>
     a.classList.toggle("active", a.dataset.route === name));
-  app.innerHTML = '<div class="loading">Loading…</div>';
+  app.innerHTML = `<div class="skel" style="height:22px;width:220px;margin:4px 0 16px"></div>
+    ${skeleton(5)}<div class="grid2">${skeleton(4)}${skeleton(4)}</div>`;
   try {
     if (name === "companies" && arg) await viewCompanyDetail(parseInt(arg), sub || "overview");
     else if (name === "companies") await viewCompanies();

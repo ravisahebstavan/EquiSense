@@ -191,6 +191,19 @@ class JournalEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class AppSnapshot(Base):
+    """Precomputed view cache (serverless performance): heavy universe-wide
+    computations run ONCE per data refresh and are stored as JSON, so page
+    loads are a single-row fetch instead of hundreds of queries over the
+    network. `as_of` ties freshness to the latest price date."""
+    __tablename__ = "app_snapshots"
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    as_of: Mapped[str] = mapped_column(String(20))
+    payload: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+                                                 onupdate=datetime.utcnow)
+
+
 class LedgerRecord(Base):
     """DB backend for the append-only, hash-chained decision ledger — used on
     hosted deployments where the filesystem is ephemeral (DEPLOYMENT.md).

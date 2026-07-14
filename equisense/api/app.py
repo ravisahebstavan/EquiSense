@@ -441,11 +441,15 @@ def live_run_studies(s: Session = Depends(db)):
 
 @app.post("/api/live/refresh")
 def live_refresh(s: Session = Depends(db)):
-    """Incremental price + macro refresh (fast path; fundamentals via CLI)."""
-    from ..ingestion.yahoo import ingest_macro, ingest_prices, sync_universe
-    ids = sync_universe(s)
-    return {"price_rows": ingest_prices(s, ids, years=1),
-            "macro_rows": ingest_macro(s, years=1)}
+    """Full staged pipeline WITHOUT streaming — the fallback for hosts that
+    buffer SSE. Returns every stage event the stream would have emitted."""
+    import json as _json
+    from .status import refresh_stream
+    stages = [_json.loads(ev[5:].strip()) for ev in refresh_stream(s)
+              if ev.startswith("data:")]
+    return {"stages": stages,
+            "ok": any(st.get("stage") == "pipeline" and st.get("status") == "complete"
+                      for st in stages)}
 
 
 @app.get("/api/live/ledger")
@@ -492,7 +496,8 @@ def live_refresh_stream(s: Session = Depends(db)):
     from fastapi.responses import StreamingResponse
     from .status import refresh_stream
     return StreamingResponse(refresh_stream(s), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache"})
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/live/portfolio-risk")
@@ -510,13 +515,16 @@ def cron_refresh(s: Session = Depends(db)):
     from ..ingestion.yahoo import ingest_macro, ingest_prices, sync_universe
     from ..research.base_rates import run_all_studies
     from .. import ledger as L
+    from .snapshot import build_universe_snapshot
     ids = sync_universe(s)
     prices = ingest_prices(s, ids, years=1)
     macro = ingest_macro(s, years=1)
     studies = run_all_studies(s)["records"]
     scored = L.score_due_claims(s)["scored"]
+    snap = build_universe_snapshot(s)
     return {"price_rows": prices, "macro_rows": macro,
-            "base_rate_records": studies, "claims_scored": scored}
+            "base_rate_records": studies, "claims_scored": scored,
+            "snapshot_companies": len(snap["companies"])}
 
 
 @app.get("/api/companies/{company_id}/memory")
