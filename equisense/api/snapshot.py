@@ -22,7 +22,7 @@ from ..models import (AppSnapshot, Company, FilingPeriod, MacroObservation,
                       PriceObservation)
 
 UNIVERSE_KEY = "universe"
-SNAP_VERSION = 2  # bump when the item schema changes → forces a rebuild
+SNAP_VERSION = 3  # bump when the item schema changes → forces a rebuild
 
 
 def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list]]:
@@ -134,6 +134,8 @@ def build_universe_snapshot(session: Session) -> dict:
             "id": c.id, "ticker": c.ticker, "name": c.name, "sector": c.sector,
             "cap_band": c.cap_band, "is_financial": c.is_financial,
             "price": round(price, 2),
+            "chg_1d_pct": None if len(closes) < 2 or not closes[-2]
+            else round((closes[-1] / closes[-2] - 1) * 100, 2),
             "adv_cr": None if adv is None else round(adv, 2),
             "spark": [round(v, 1) for v in window[::step]][-40:],
             "signals": sig,

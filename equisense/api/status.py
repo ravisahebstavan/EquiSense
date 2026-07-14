@@ -180,6 +180,13 @@ def refresh_stream(session: Session):
         snap = build_universe_snapshot(session)  # views become single-row reads
         yield sse("publishing", "done", companies=len(snap["companies"]),
                   quality_score=data_status(session)["quality_score"])
+
+        from .autopilot import get_config, run_autopilot
+        if get_config(session)["enabled"]:
+            yield sse("autopilot", "running")
+            rep = run_autopilot(session)
+            yield sse("autopilot", "done", entries=len(rep["entries"]),
+                      exits=len(rep["exits"]))
         yield sse("pipeline", "complete")
     except Exception as e:  # surface, never swallow (failed refresh recovery)
         yield sse("pipeline", "failed", error=f"{type(e).__name__}: {e}")

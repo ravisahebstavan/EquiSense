@@ -68,6 +68,8 @@ _SOFT_MIGRATIONS = [
     ("base_rates", "n_eff", "INTEGER"),
     ("base_rates", "cohort_breadth_pct", "FLOAT"),
     ("base_rates", "net_median_excess_pct", "FLOAT"),
+    ("base_rates", "median_ci95_lo_pct", "FLOAT"),
+    ("base_rates", "median_ci95_hi_pct", "FLOAT"),
 ]
 
 

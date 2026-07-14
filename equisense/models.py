@@ -111,6 +111,8 @@ class BaseRateRecord(Base):
     n_eff: Mapped[int | None] = mapped_column(Integer)               # overlap-corrected (§8 Phase II, A1 fix)
     cohort_breadth_pct: Mapped[float | None] = mapped_column(Float)  # avg % of universe selected (A5)
     net_median_excess_pct: Mapped[float | None] = mapped_column(Float)  # after round-trip cost model
+    median_ci95_lo_pct: Mapped[float | None] = mapped_column(Float)     # moving-block bootstrap (PHASE2 §8)
+    median_ci95_hi_pct: Mapped[float | None] = mapped_column(Float)
     hit_rate: Mapped[float | None] = mapped_column(Float)            # P(excess return > 0)
     mean_excess_pct: Mapped[float | None] = mapped_column(Float)
     median_excess_pct: Mapped[float | None] = mapped_column(Float)

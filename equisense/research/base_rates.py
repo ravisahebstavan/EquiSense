@@ -161,6 +161,9 @@ def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
             if n_eff < MIN_N_EFF:
                 continue  # publication gate re-based on N_eff (Phase II §8, A1)
             s = pd.Series(vals) * 100
+            from .backtest import moving_block_bootstrap_ci
+            ci_lo, ci_hi = moving_block_bootstrap_ci(
+                [v * 100 for v in vals], block_len=max(1, horizon // SAMPLING_DAYS))
             caveats = [SURVIVORSHIP_CAVEAT,
                        f"N_eff={n_eff} (overlap-corrected from N={len(vals)}); "
                        "CIs should be read against N_eff"]
@@ -180,6 +183,8 @@ def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
                 "mean_excess_pct": float(s.mean()),
                 "median_excess_pct": float(s.median()),
                 "net_median_excess_pct": float(s.median()) - DEFAULT_ROUND_TRIP_COST_PCT,
+                "median_ci95_lo_pct": None if ci_lo != ci_lo else round(ci_lo, 2),
+                "median_ci95_hi_pct": None if ci_hi != ci_hi else round(ci_hi, 2),
                 "q25_excess_pct": float(s.quantile(0.25)),
                 "q75_excess_pct": float(s.quantile(0.75)),
                 "spec": json.dumps({"hypothesis": hyp_id,

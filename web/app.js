@@ -471,7 +471,8 @@ async function viewDashboard() {
       <td><strong>${esc(r.ticker)}</strong></td><td>${esc(r.sector)}</td>
       <td>${microspark(r.spark)}</td>
       <td>${r.held ? '<span class="chip held">held</span>' : ""}${r.watched ? '<span class="chip">watch</span>' : ""}</td>
-      <td class="num">${fmtMoney(r.price)}</td>
+      <td class="num">${fmtMoney(r.price)}
+        <div class="sub" style="color:${(r.chg_1d_pct ?? 0) >= 0 ? "var(--good-text)" : "var(--critical)"}">${signed(r.chg_1d_pct, 2)}%</div></td>
       <td class="num">${r.signals.f_score ?? "—"}</td>
       <td class="num">${fmtN(r.signals.pe, 1)}</td>
       <td><span class="priority-bar"><i style="width:${r.priority.score}%"></i></span>${r.priority.score}</td>
@@ -568,7 +569,8 @@ async function viewCompanies() {
       <td>${esc(c.sector)}</td>
       <td>${microspark(c.spark)}</td>
       <td>${c.held ? '<span class="chip held">held</span>' : ""}${c.watched ? '<span class="chip">watch</span>' : ""}</td>
-      <td class="num">${fmtMoney(c.price)}</td>
+      <td class="num">${fmtMoney(c.price)}
+        <div class="sub" style="color:${(c.chg_1d_pct ?? 0) >= 0 ? "var(--good-text)" : "var(--critical)"}">${signed(c.chg_1d_pct, 2)}%</div></td>
       <td class="num">${c.signals.f_score ?? "—"}/9</td>
       <td>${c.signals.z_zone ? `<span class="chip ${c.signals.z_zone}">${c.signals.z_zone}</span>` : "—"}</td>
       <td class="num">${fmtN(c.signals.roic_pct, 1)}</td>
@@ -978,9 +980,21 @@ function equityChart(curve, benchmark) {
     </svg></div>`;
 }
 
+function renderApReport(r) {
+  if (!r) return '<div class="empty">No autopilot runs yet.</div>';
+  const li = (arr, cls) => arr.map(x => `<div class="${cls}" style="margin:2px 0">
+    ${typeof x === "string" ? esc(x)
+      : esc(`${x.ticker}: ${x.quantity} sh @ ₹${fmtN(x.fill_price, 1)} — ${x.reason}`)}</div>`).join("");
+  return `<div class="score-detail"><strong>Last run ${esc((r.ran_at || "").slice(0, 16))}</strong> ·
+    ${r.entries.length} entries · ${r.exits.length} exits · ${r.skipped.length} skips<br>
+    ${li(r.entries, "sub")}${li(r.exits, "breach")}
+    <details class="ctx"><summary>Skips (with reasons)</summary>${li(r.skipped, "sub")}</details></div>`;
+}
+
 async function viewTrading() {
-  const [a, companies, cands, learn] = await Promise.all([
-    api("/paper"), getCompanies(), api("/live/candidates"), api("/live/learning")]);
+  const [a, companies, cands, learn, ap] = await Promise.all([
+    api("/paper"), getCompanies(), api("/live/candidates"), api("/live/learning"),
+    api("/autopilot")]);
   const body = app;
   const opts = companies.map(c => `<option value="${c.id}" data-price="${c.price}">${esc(c.ticker)} — ${esc(c.name)}</option>`).join("");
   const alpha = a.alpha_pct;
@@ -1050,6 +1064,29 @@ async function viewTrading() {
     ${a.curve ? `<div class="panel">${equityChart(a.curve, a.benchmark)}
       ${a.alpha_note ? `<div class="sub" style="margin-top:8px">${esc(a.alpha_note)}</div>` : ""}</div>` : ""}
 
+    <div class="panel"><h2>Autopilot — the system trades this book on policy</h2>
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+        <button class="${ap.config.enabled ? "" : "primary"}" id="ap-toggle">
+          ${ap.config.enabled ? "Disable autopilot" : "Enable autopilot"}</button>
+        <span class="chip ${ap.config.enabled ? "active" : "closed"}">
+          ${ap.config.enabled ? "ENABLED — runs after every data refresh" : "disabled"}</span>
+        <button id="ap-run">Run once now</button>
+      </div>
+      <div class="frm" style="margin-top:10px">
+        <div><label>Max new positions / run</label><input id="ap-max" type="number" min="0" max="10" value="${ap.config.max_new_per_run}"></div>
+        <div><label>Max open positions</label><input id="ap-open" type="number" min="1" max="20" value="${ap.config.max_open_positions}"></div>
+        <div><label>Cash reserve %</label><input id="ap-cash" type="number" min="0" max="90" value="${ap.config.cash_reserve_pct}"></div>
+        <div><label>Time exit (days)</label><input id="ap-days" type="number" min="30" max="730" value="${ap.config.time_exit_days}"></div>
+      </div>
+      <button id="ap-save" style="margin-top:2px">Save policy</button>
+      <span class="sub" id="ap-msg" style="margin-left:8px"></span>
+      <div id="ap-report" style="margin-top:10px">${renderApReport(ap.last_run)}</div>
+      <div class="sub" style="margin-top:6px">Exits fire on stop breach (2.5× daily vol below
+        avg cost), time (claim horizon), or verdict flip; entries take top qualified candidates
+        within policy caps. Every action and every skip is reasoned, ledger-chained, and feeds
+        the learning loop via full dossiers.</div>
+    </div>
+
     <div class="panel"><h2>Qualified trade candidates — ${cands.scanned} companies reasoned,
       ${cands.verdict_counts.abstain} abstained</h2>
       <div class="sub" style="margin-bottom:8px">As of ${esc(cands.as_of)} ·
@@ -1105,6 +1142,27 @@ async function viewTrading() {
           <td class="hashline">${esc(t.from_dossier || "manual")}</td></tr>`).join("")}
         </tbody></table></div>` : '<div class="empty">No fills yet.</div>'}
     </div>`;
+
+  document.getElementById("ap-toggle").addEventListener("click", async () => {
+    await api("/autopilot", { method: "PUT", body: JSON.stringify({ enabled: !ap.config.enabled }) });
+    viewTrading();
+  });
+  document.getElementById("ap-save").addEventListener("click", async () => {
+    await api("/autopilot", { method: "PUT", body: JSON.stringify({
+      max_new_per_run: parseInt(document.getElementById("ap-max").value),
+      max_open_positions: parseInt(document.getElementById("ap-open").value),
+      cash_reserve_pct: parseFloat(document.getElementById("ap-cash").value),
+      time_exit_days: parseInt(document.getElementById("ap-days").value) }) });
+    document.getElementById("ap-msg").textContent = "Policy saved.";
+  });
+  document.getElementById("ap-run").addEventListener("click", async (e) => {
+    e.target.disabled = true; e.target.textContent = "Running…";
+    try {
+      const r = await api("/autopilot/run", { method: "POST" });
+      document.getElementById("ap-report").innerHTML = renderApReport(r);
+      viewTrading();
+    } catch (err) { document.getElementById("ap-msg").textContent = err.message; e.target.disabled = false; }
+  });
 
   body.querySelectorAll("[data-exec-cid]").forEach(b => b.addEventListener("click", async () => {
     b.disabled = true;
@@ -1326,7 +1384,8 @@ async function viewResearch() {
 
 async function viewLab(section = "hypotheses") {
   const tabs = [["hypotheses", "Hypotheses"], ["baserates", "Base Rates"],
-                ["calibration", "Calibration & Ledger"], ["data", "Data Health"]];
+                ["calibration", "Calibration & Ledger"], ["backtest", "Backtest"],
+                ["data", "Data Health"]];
   app.innerHTML = `
     <h1>Research Laboratory</h1>
     <div class="tabs">${tabs.map(([k, l]) =>
@@ -1380,7 +1439,7 @@ async function viewLab(section = "hypotheses") {
       <div class="sub">Survivorship caveat on every record: universe = current constituents backfilled.</div>
       <div class="tablewrap" style="margin-top:8px"><table><thead><tr>
         <th>Study</th><th>Hyp</th><th>Regime</th><th class="num">N<sub>eff</sub></th><th class="num">N</th>
-        <th class="num">Hit</th><th class="num">Median</th><th class="num">Net</th><th class="num">IQR</th></tr></thead>
+        <th class="num">Hit</th><th class="num">Median</th><th class="num">Net</th><th class="num">95% CI</th><th class="num">IQR</th></tr></thead>
         <tbody>${br.records.map(r => `
           <tr><td>${esc(r.study_key)}</td><td>${esc(r.registry_ref)}</td><td>${esc(r.regime)}</td>
             <td class="num">${r.n_eff ?? "—"}</td><td class="num sub">${r.n}</td>
@@ -1388,6 +1447,7 @@ async function viewLab(section = "hypotheses") {
             <td class="num">${signed(r.median_excess_pct)}%</td>
             <td class="num" style="color:${(r.net_median_excess_pct ?? 0) > 0 ? "var(--good-text)" : "var(--critical)"}">
               ${r.net_median_excess_pct == null ? "—" : signed(r.net_median_excess_pct) + "%"}</td>
+            <td class="num sub">${r.ci95 ? "[" + r.ci95 + "]%" : "—"}</td>
             <td class="num">[${r.iqr}]%</td></tr>`).join("")}
         </tbody></table></div>
       <div style="margin-top:10px"><button class="primary" id="run-studies">Recompute studies</button></div>
@@ -1419,6 +1479,32 @@ async function viewLab(section = "hypotheses") {
       </div>`;
     document.getElementById("score-claims").addEventListener("click", async (e) => {
       e.target.disabled = true; await api("/live/score", { method: "POST" }); viewLab("calibration");
+    });
+  } else if (section === "backtest") {
+    const bt = await api("/backtest/strategy");
+    body.innerHTML = bt.error ? `<div class="panel"><div class="empty">${esc(bt.error)}</div></div>` : `
+      <div class="panel"><h2>Strategy backtest — the live price-cluster rule, simulated</h2>
+        <div class="sub" style="margin-bottom:8px">${esc(bt.spec)}</div>
+        <div class="tiles">
+          <div class="tile"><div class="label">Annualized (net)</div>
+            <div class="value ${bt.annualized_net_pct >= 0 ? "pos" : "neg"}">${signed(bt.annualized_net_pct)}%</div>
+            <div class="sub">NIFTY same windows: ${signed(bt.nifty_annualized_pct)}%</div></div>
+          <div class="tile"><div class="label">Hit rate</div><div class="value">${(bt.hit_rate * 100).toFixed(0)}%</div></div>
+          <div class="tile"><div class="label">Mean period (net)</div><div class="value">${signed(bt.mean_period_return_net_pct)}%</div>
+            <div class="sub">median 95% CI [${bt.median_ci95_pct}]% (block bootstrap)</div></div>
+          <div class="tile"><div class="label">Effective sample</div><div class="value">${bt.n_eff}</div>
+            <div class="sub">${bt.periods} overlapping periods</div></div>
+          <div class="tile"><div class="label">Naive Sharpe</div><div class="value">${fmtN(bt.sharpe_naive, 2)}</div></div>
+        </div>
+        ${bt.curve && bt.curve.length > 1 ? equityChart(
+          bt.curve.map(p => ({ date: p.date, equity: p.strategy })), null) : ""}
+        <div class="sub" style="margin-top:8px">${bt.caveats.map(esc).join(" · ")}</div>
+        <div style="margin-top:10px"><button id="bt-refresh">Recompute</button></div>
+      </div>`;
+    const btn = document.getElementById("bt-refresh");
+    if (btn) btn.addEventListener("click", async (e) => {
+      e.target.disabled = true; e.target.textContent = "computing…";
+      await api("/backtest/strategy?refresh=true"); viewLab("backtest");
     });
   } else if (section === "data") {
     const st = await api("/live/status");

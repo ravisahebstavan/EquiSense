@@ -335,6 +335,54 @@ def live_learning():
     return learning_state()
 
 
+# ------------------------------------------------------------- autopilot
+
+class AutopilotConfigIn(BaseModel):
+    enabled: Optional[bool] = None
+    max_new_per_run: Optional[int] = Field(None, ge=0, le=10)
+    max_open_positions: Optional[int] = Field(None, ge=1, le=20)
+    cash_reserve_pct: Optional[float] = Field(None, ge=0, le=90)
+    time_exit_days: Optional[int] = Field(None, ge=30, le=730)
+
+
+@app.get("/api/autopilot")
+def autopilot_state(s: Session = Depends(db)):
+    from .autopilot import get_config, last_run
+    return {"config": get_config(s), "last_run": last_run(s)}
+
+
+@app.put("/api/autopilot")
+def autopilot_config(c: AutopilotConfigIn, s: Session = Depends(db)):
+    from .autopilot import set_config
+    return set_config(s, c.model_dump(exclude_none=True))
+
+
+@app.post("/api/autopilot/run")
+def autopilot_run(s: Session = Depends(db)):
+    from .autopilot import run_autopilot
+    return run_autopilot(s, force=True)
+
+
+# -------------------------------------------------------------- backtest
+
+@app.get("/api/backtest/strategy")
+def backtest_strategy(refresh: bool = False, s: Session = Depends(db)):
+    from ..research.backtest import cached_strategy_backtest
+    return cached_strategy_backtest(s, refresh=refresh)
+
+
+@app.get("/api/companies/{company_id}/prices")
+def company_prices(company_id: int, days: int = 1250, s: Session = Depends(db)):
+    """Daily close history for the interactive chart."""
+    _get_company(s, company_id)
+    from ..models import PriceObservation
+    rows = s.execute(
+        select(PriceObservation.obs_date, PriceObservation.close)
+        .where(PriceObservation.company_id == company_id)
+        .order_by(PriceObservation.obs_date.desc()).limit(days)).all()
+    return [{"time": str(d), "value": round(c, 2)} for d, c in reversed(rows)]
+
+
 # ------------------------------------------------------------------- theses
 
 def _thesis_dict(t: Thesis, ticker: str) -> dict:
@@ -500,6 +548,7 @@ def live_base_rates(s: Session = Depends(db)):
                 "regime": r.regime_filter, "horizon_days": r.horizon_days,
                 "n": r.n, "hit_rate": round(r.hit_rate, 3),
                 "median_excess_pct": round(r.median_excess_pct, 2),
+                "ci95": None if r.median_ci95_lo_pct is None else f"{r.median_ci95_lo_pct}, {r.median_ci95_hi_pct}",
                 "iqr": [round(r.q25_excess_pct, 2), round(r.q75_excess_pct, 2)],
                 "computed_at": r.computed_at.isoformat(),
             } for r in rows]}
@@ -594,9 +643,13 @@ def cron_refresh(s: Session = Depends(db)):
     studies = run_all_studies(s)["records"]
     scored = L.score_due_claims(s)["scored"]
     snap = build_universe_snapshot(s)
+    from .autopilot import get_config, run_autopilot
+    auto = run_autopilot(s) if get_config(s)["enabled"] else None
     return {"price_rows": prices, "macro_rows": macro,
             "base_rate_records": studies, "claims_scored": scored,
-            "snapshot_companies": len(snap["companies"])}
+            "snapshot_companies": len(snap["companies"]),
+            "autopilot": None if auto is None else
+            {"entries": len(auto["entries"]), "exits": len(auto["exits"])}}
 
 
 @app.get("/api/companies/{company_id}/memory")
