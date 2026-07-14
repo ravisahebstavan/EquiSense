@@ -86,11 +86,14 @@ def register_dossier(dossier: dict) -> dict:
     horizon_days = dossier.get("claim_horizon_days", 126)
     score_after = (date.today() + timedelta(days=int(horizon_days * 1.5))).isoformat()
     if synth["verdict"] in ("long_candidate", "avoid_short_candidate"):
+        from .research.learning import calibrated_probability
+        p, p_basis = calibrated_probability(synth["net_score"])
         claim = {
             "type": "directional_excess",
             "direction": 1 if synth["verdict"] == "long_candidate" else -1,
             "horizon_days": horizon_days,
-            "stated_probability": _stated_probability(synth),
+            "stated_probability": p,
+            "probability_basis": p_basis,
             "benchmark": "universe_median_forward_return",
             "score_after": score_after,
             "entry_price": dossier["company"].get("price"),
@@ -115,6 +118,7 @@ def register_dossier(dossier: dict) -> dict:
         "verdict": synth["verdict"],
         "net_score": synth["net_score"],
         "conviction_band": synth["conviction_band"],
+        "cluster_scores": synth.get("cluster_scores", {}),  # learning attribution
         "claim": claim,
         "dossier_sha256": hashlib.sha256(
             json.dumps(dossier, sort_keys=True, default=str).encode()).hexdigest(),

@@ -100,6 +100,58 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
     return inserted
 
 
+def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
+    """Near-live price refresh: re-fetch the last 5 daily bars and UPSERT —
+    today's running bar updates intraday (Yahoo serves the live running
+    candle, typically ≤15 min delayed for NSE). This is what keeps paper
+    fills anchored to executable reality while the site is open."""
+    symbols = [yahoo_symbol(t) for t in ids]
+    data = yf.download(symbols, period="5d", interval="1d", auto_adjust=True,
+                       progress=False, group_by="ticker", threads=True)
+    updated = inserted = 0
+    latest_prices: dict[str, float] = {}
+    for t, sym in zip(ids, symbols):
+        cid = ids[t]
+        try:
+            frame = data[sym] if len(symbols) > 1 else data
+            closes = frame["Close"].dropna()
+            volumes = frame["Volume"]
+        except KeyError:
+            continue
+        for d, c in closes.items():
+            v = volumes.get(d)
+            v = None if v is None or math.isnan(v) else float(v)
+            row = session.execute(
+                select(PriceObservation)
+                .where(PriceObservation.company_id == cid,
+                       PriceObservation.obs_date == d.date())).scalar_one_or_none()
+            if row is None:
+                session.add(PriceObservation(company_id=cid, obs_date=d.date(),
+                                             close=float(c), volume=v))
+                inserted += 1
+            elif abs(row.close - float(c)) > 1e-9 or (v is not None and row.volume != v):
+                row.close = float(c)
+                row.volume = v
+                updated += 1
+        if len(closes):
+            latest_prices[t] = round(float(closes.iloc[-1]), 2)
+    session.commit()
+    return {"updated": updated, "inserted": inserted, "prices": latest_prices,
+            "as_of_utc": datetime.now(timezone.utc).isoformat()}
+
+
+def market_open_ist() -> dict:
+    """NSE regular session: 09:15–15:30 IST, Mon–Fri (holidays not modeled —
+    stated, not hidden)."""
+    from datetime import timedelta
+    ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    open_now = (ist.weekday() < 5
+                and (ist.hour, ist.minute) >= (9, 15)
+                and (ist.hour, ist.minute) <= (15, 30))
+    return {"ist": ist.strftime("%H:%M"), "open": open_now,
+            "note": "NSE 09:15–15:30 IST Mon–Fri; exchange holidays not modeled"}
+
+
 def ingest_macro(session: Session, years: int = 10) -> int:
     inserted = 0
     for symbol, (name, role) in MACRO_SERIES.items():

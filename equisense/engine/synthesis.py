@@ -53,7 +53,10 @@ class Synthesis:
         }
 
 
-def synthesize(evidence: list[Evidence]) -> Synthesis:
+def synthesize(evidence: list[Evidence],
+               weights: dict[str, float] | None = None) -> Synthesis:
+    """`weights` (cluster → multiplier) come ONLY from the learning module's
+    gated posteriors (research/learning.py); None = uniform provisional."""
     # Shadow evidence (admission cap 0, §5.2) is rendered but never aggregated.
     items = [e for e in evidence if e is not None and e.direction != "shadow"]
     by_cluster: dict[str, list[Evidence]] = {}
@@ -76,8 +79,11 @@ def synthesize(evidence: list[Evidence]) -> Synthesis:
                                 f"Only {len(present)} evidence clusters available — "
                                 f"below the {MIN_CLUSTERS}-cluster floor. Too hard pile."])
 
-    # uniform provisional weights across present clusters
-    net = mean(cluster_scores[c] for c in present)
+    if weights:
+        wsum = sum(weights.get(c, 1.0) for c in present)
+        net = sum(cluster_scores[c] * weights.get(c, 1.0) for c in present) / wsum
+    else:
+        net = mean(cluster_scores[c] for c in present)
     dispersion = pstdev(cluster_scores.values()) if len(present) > 1 else 0.0
 
     dissent = []
@@ -98,10 +104,13 @@ def synthesize(evidence: list[Evidence]) -> Synthesis:
         band = ("high" if abs(net) >= 0.45 and confidence["score"] >= 0.6
                 else "moderate" if abs(net) >= 0.25 else "low")
 
+    note = (PROVISIONAL_NOTE if not weights else
+            "Cluster weights are LEARNED from scored trade history "
+            "(gated Beta-Binomial posteriors — see the Trading tab's learning panel).")
     return Synthesis(verdict=verdict, net_score=net, conviction_band=band,
                      cluster_scores=cluster_scores, cluster_counts=cluster_counts,
                      dispersion=dispersion, dissent=dissent, coverage=coverage,
-                     confidence=confidence, notes=[PROVISIONAL_NOTE])
+                     confidence=confidence, notes=[note])
 
 
 def _confidence(cluster_scores: dict, items: list[Evidence],

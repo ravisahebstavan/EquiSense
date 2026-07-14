@@ -22,6 +22,7 @@ from ..models import (AppSnapshot, Company, FilingPeriod, MacroObservation,
                       PriceObservation)
 
 UNIVERSE_KEY = "universe"
+SNAP_VERSION = 2  # bump when the item schema changes → forces a rebuild
 
 
 def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list]]:
@@ -128,16 +129,19 @@ def build_universe_snapshot(session: Session) -> dict:
 
         window = closes[-252:]  # 1y of closes, downsampled to ≤40 points
         step = max(1, len(window) // 40)
+        adv = technical.adv_crore(closes, volumes)
         items.append({
             "id": c.id, "ticker": c.ticker, "name": c.name, "sector": c.sector,
             "cap_band": c.cap_band, "is_financial": c.is_financial,
             "price": round(price, 2),
+            "adv_cr": None if adv is None else round(adv, 2),
             "spark": [round(v, 1) for v in window[::step]][-40:],
             "signals": sig,
         })
 
     as_of = max((prices[cid][0][-1] for cid in prices), default=None)
-    snap = {"as_of": str(as_of), "built_at": datetime.utcnow().isoformat(),
+    snap = {"as_of": str(as_of), "version": SNAP_VERSION,
+            "built_at": datetime.utcnow().isoformat(),
             "companies": items}
     row = session.get(AppSnapshot, UNIVERSE_KEY)
     if row is None:
@@ -154,7 +158,9 @@ def get_universe(session: Session, allow_rebuild: bool = True) -> dict:
     latest = session.scalar(select(func.max(PriceObservation.obs_date)))
     row = session.get(AppSnapshot, UNIVERSE_KEY)
     if row is not None and (latest is None or row.as_of >= str(latest)):
-        return json.loads(row.payload)
+        snap = json.loads(row.payload)
+        if snap.get("version") == SNAP_VERSION:
+            return snap
     if not allow_rebuild:
         return json.loads(row.payload) if row else {"as_of": None, "companies": []}
     return build_universe_snapshot(session)

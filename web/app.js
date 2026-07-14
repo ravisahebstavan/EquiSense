@@ -103,6 +103,7 @@ async function refreshStatusStrip() {
       <span class="seg">Prices <strong>${esc(p.latest)}</strong> (${p.staleness_days}d) · ${fmtN(p.rows, 0)} obs · ${p.companies} cos</span>
       <span class="seg">Coverage <strong>${esc(p.coverage)}</strong></span>
       <span class="seg">Provider ${esc(st.provider.split(" ")[0])}</span>
+      ${cache.market ? `<span class="seg">Market <strong>${cache.market.open ? "OPEN" : "closed"}</strong> · ${esc(cache.market.ist)} IST</span>` : ""}
       ${autoRefreshing ? '<span class="seg" style="color:var(--accent)">⟳ auto-refreshing…</span>' : ""}
       ${warn}
       <span class="seg" style="margin-left:auto"><a href="#/lab/data">data health →</a></span>`;
@@ -199,7 +200,7 @@ const COMMANDS = [
   { label: "Go to Dashboard", k: "gd", run: () => location.hash = "#/dashboard" },
   { label: "Go to Companies", k: "gc", run: () => location.hash = "#/companies" },
   { label: "Go to Portfolio", k: "gp", run: () => location.hash = "#/portfolio" },
-  { label: "Go to Paper Trading", k: "", run: () => location.hash = "#/portfolio/paper" },
+  { label: "Go to Trading Desk", k: "gt", run: () => location.hash = "#/trading" },
   { label: "Edit Investor Profile & Limits", k: "", run: () => location.hash = "#/portfolio/profile" },
   { label: "Go to Research", k: "gr", run: () => location.hash = "#/research" },
   { label: "Go to Lab", k: "gl", run: () => location.hash = "#/lab" },
@@ -253,7 +254,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { closePalette(); drawer.hidden = true; return; }
   if (pendingG) {
     pendingG = false;
-    const map = { d: "dashboard", c: "companies", p: "portfolio", r: "research", l: "lab" };
+    const map = { d: "dashboard", c: "companies", p: "portfolio", t: "trading", r: "research", l: "lab" };
     if (map[e.key]) location.hash = "#/" + map[e.key];
     return;
   }
@@ -736,7 +737,7 @@ async function renderCompanyDossier(body, id) {
             quantity: parseInt(exec.dataset.shares),
             dossier_hash: exec.dataset.hash })});
           msg.innerHTML = `filled ${r.quantity} @ ₹${fmtN(r.fill_price, 1)} —
-            <a href="#/portfolio/paper">view paper account</a>`;
+            <a href="#/trading">view trading desk</a>`;
         } catch (err) { msg.textContent = err.message; exec.disabled = false; }
       });
     }
@@ -841,7 +842,8 @@ function wireTxnForm(onSaved) {
 }
 
 async function viewPortfolio(sub = "real") {
-  const tabs = [["real", "Real Book"], ["paper", "Paper Trading"], ["profile", "Profile & Limits"]];
+  if (sub === "paper") { location.hash = "#/trading"; return; }
+  const tabs = [["real", "Real Book"], ["profile", "Profile & Limits"]];
   app.innerHTML = `
     <h1>Portfolio Desk</h1>
     <div class="tabs">${tabs.map(([k, l]) =>
@@ -850,7 +852,6 @@ async function viewPortfolio(sub = "real") {
   app.querySelectorAll("[data-tab]").forEach(b =>
     b.addEventListener("click", () => location.hash = `#/portfolio/${b.dataset.tab}`));
   const body = document.getElementById("pf-body");
-  if (sub === "paper") return renderPaperDesk(body);
   if (sub === "profile") return renderProfileEditor(body);
   return renderRealBook(body);
 }
@@ -977,14 +978,65 @@ function equityChart(curve, benchmark) {
     </svg></div>`;
 }
 
-async function renderPaperDesk(body) {
-  const [a, companies] = await Promise.all([api("/paper"), getCompanies()]);
+async function viewTrading() {
+  const [a, companies, cands, learn] = await Promise.all([
+    api("/paper"), getCompanies(), api("/live/candidates"), api("/live/learning")]);
+  const body = app;
   const opts = companies.map(c => `<option value="${c.id}" data-price="${c.price}">${esc(c.ticker)} — ${esc(c.name)}</option>`).join("");
   const alpha = a.alpha_pct;
+  const mkt = cache.market;
+
+  const candRows = cands.candidates.length ? cands.candidates.map((c, i) => `
+    <div class="evi ${c.tradable ? "long" : ""}" style="${c.tradable ? "" : "opacity:.75"}">
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+        <strong style="font-size:14px">${i + 1}. ${esc(c.ticker)}</strong>
+        <span class="sub">${esc(c.name)} · ${esc(c.sector)} · ₹${fmtN(c.price, 1)}</span>
+        <span class="chip ${c.conviction_band}">${esc(human(c.conviction_band))} conviction</span>
+        <span class="sub">net ${signed(c.net_score)} · dispersion ${c.dispersion}</span>
+        ${c.tradable ? `<button class="primary" data-exec-cid="${c.id}"
+          data-exec-qty="${c.sizing.shares}" style="margin-left:auto">
+          ▶ Buy ${c.sizing.shares} sh (${fmtMoney(c.sizing.value)})</button>`
+          : '<span class="chip closed" style="margin-left:auto">not tradable</span>'}
+      </div>
+      <div class="sub" style="margin-top:4px">Why: ${c.drivers.map(esc).join(" · ")}</div>
+      ${c.dissent.length ? `<div class="breach">${c.dissent.map(esc).join(" · ")}</div>` : ""}
+      <div class="sub">Stop ${fmtN(c.sizing.stop_distance_pct, 1)}% ·
+        sized by ${esc(human(c.sizing.binding))} ·
+        round trip ≈ ${c.round_trip_cost_pct}% · breakeven move ${c.breakeven_move_pct}%</div>
+      ${c.gates.map(g => `<div class="sub" style="color:${g.startsWith("failed") ? "var(--critical)" : "var(--serious)"}">⚠ ${esc(g)}</div>`).join("")}
+    </div>`).join("")
+    : `<div class="empty">No trade clears every gate right now — in the current
+       ${esc(cands.regime)} regime, standing aside IS the defensible position.
+       The system only shows trades it can justify end to end.</div>`;
+
+  const posts = learn.cluster_posteriors;
+  const learnBars = Object.keys(posts).length
+    ? Object.entries(posts).map(([k, p]) => `
+      <div class="hbar"><span class="lbl">${esc(human(k))} (${p.wins}/${p.n})</span>
+        <div class="track"><div class="fill ${p.posterior_mean >= 0.5 ? "q-high" : "q-low"}"
+          style="width:${p.posterior_mean * 100}%"></div></div>
+        <span class="pct">${(p.posterior_mean * 100).toFixed(0)}%</span></div>`).join("")
+    : '<div class="empty">No scored outcomes yet — posteriors populate as claims reach their horizons.</div>';
+
+  const outcomes = learn.recent_outcomes.length ? learn.recent_outcomes.map(o => `
+    <div class="metric-row" style="cursor:default">
+      <span class="m-label">${esc(o.company)} · ${esc(human(o.verdict))} →
+        realized ${signed(o.realized_excess_pct)}%</span>
+      <span class="m-value" style="color:${o.hit ? "var(--good-text)" : "var(--critical)"}">
+        ${o.hit ? "hit" : "miss"}</span>
+      <span class="m-unit">B ${fmtN(o.brier, 2)}</span></div>`).join("")
+    : '<div class="empty">Outcomes appear here as claim horizons expire (126 trading days).</div>';
+
   body.innerHTML = `
-    <div class="sub" style="margin-bottom:8px">Virtual account opened ${esc(a.opened)} ·
-      fills at the latest EOD close · every fill is hash-chain registered and can link to the
-      dossier that motivated it — this is the platform's live validation loop.</div>
+    <h1>Trading Desk
+      <span class="sub">${mkt ? `market ${mkt.open ? "OPEN" : "closed"} · ${esc(mkt.ist)} IST · ` : ""}
+      prices refresh every 5 min while this site is open (≤15 min exchange delay) ·
+      paper account, real executable prices</span></h1>
+    <div class="sub" style="margin:4px 0 10px">Everything below is real-data grounded:
+      candidates are reasoned across the full universe (patterns + fundamentals + risk,
+      percentile-weighted, admission-capped), gated on liquidity and after-tax costs, sized
+      for this account, and every fill is pre-registered in the tamper-evident ledger —
+      trades you could place at a real broker as shown.</div>
     <div class="tiles">
       <div class="tile"><div class="label">Equity</div><div class="value">${fmtMoney(a.equity)}</div></div>
       <div class="tile"><div class="label">Cash</div><div class="value">${fmtMoney(a.cash)}</div></div>
@@ -997,6 +1049,15 @@ async function renderPaperDesk(body) {
     </div>
     ${a.curve ? `<div class="panel">${equityChart(a.curve, a.benchmark)}
       ${a.alpha_note ? `<div class="sub" style="margin-top:8px">${esc(a.alpha_note)}</div>` : ""}</div>` : ""}
+
+    <div class="panel"><h2>Qualified trade candidates — ${cands.scanned} companies reasoned,
+      ${cands.verdict_counts.abstain} abstained</h2>
+      <div class="sub" style="margin-bottom:8px">As of ${esc(cands.as_of)} ·
+        regime ${esc(cands.regime)} · weights: ${esc(cands.weights_status)}</div>
+      ${candRows}
+      <div class="sub" style="margin-top:8px">${esc(cands.discipline_note)}</div>
+    </div>
+
     <div class="grid2">
       <div class="panel"><h2>Open positions</h2>
         ${a.positions.length ? `<div class="tablewrap"><table><thead><tr><th>Company</th>
@@ -1009,22 +1070,30 @@ async function renderPaperDesk(body) {
             <td class="num" style="color:${p.unrealized_pnl >= 0 ? "var(--good-text)" : "var(--critical)"}">${fmtMoney(p.unrealized_pnl)}</td>
             <td><button data-close="${p.company_id}" data-qty="${p.quantity}" style="font-size:11px">close</button></td>
           </tr>`).join("")}</tbody></table></div>`
-          : '<div class="empty">No open paper positions — place a trade, or execute a dossier\'s sizing directly from any company\'s Dossier tab.</div>'}
-      </div>
-      <div class="panel"><h2>Place paper trade</h2>
+          : '<div class="empty">No open paper positions — execute a qualified candidate above, or place a manual trade.</div>'}
+        <h2 style="margin-top:14px">Manual trade</h2>
         <div class="frm">
           <div><label>Company</label><select id="pp-company">${opts}</select></div>
           <div><label>Side</label><select id="pp-side"><option value="buy">Buy</option><option value="sell">Sell</option></select></div>
           <div><label>Quantity</label><input id="pp-qty" type="number" min="1" step="1" placeholder="10"></div>
         </div>
         <div class="sub" id="pp-price-hint" style="margin-bottom:8px"></div>
-        <button class="primary" id="pp-save">Execute at last close</button>
+        <button class="primary" id="pp-save">Execute at latest price</button>
         <div id="pp-msg" class="sub" style="margin-top:6px"></div>
-        <h2 style="margin-top:16px">Account</h2>
+      </div>
+      <div class="panel"><h2>How the system learns from its trades</h2>
+        <div class="sub" style="margin-bottom:8px">${esc(learn.how_it_learns)}</div>
+        <h2>Cluster reliability posteriors (Beta-Binomial)</h2>
+        ${learnBars}
+        <div class="sub" style="margin:6px 0 10px">Weights: ${esc(learn.weights_status)} ·
+          unlock gate: ${learn.unlock_n} scored alignments per cluster ·
+          ${esc(learn.calibration_note)}</div>
+        <h2>Recent scored outcomes (${learn.scored_claims} total)</h2>
+        ${outcomes}
+        <h2 style="margin-top:12px">Account</h2>
         <div class="frm"><div><label>Reset with starting cash (₹)</label>
           <input id="pp-cash" type="number" value="1000000" step="10000"></div></div>
         <button id="pp-reset">Reset paper account</button>
-        <span class="sub" style="margin-left:8px">wipes fills; the ledger record of the reset remains</span>
       </div>
     </div>
     <div class="panel"><h2>Fill history (${a.trades.length})</h2>
@@ -1037,6 +1106,16 @@ async function renderPaperDesk(body) {
         </tbody></table></div>` : '<div class="empty">No fills yet.</div>'}
     </div>`;
 
+  body.querySelectorAll("[data-exec-cid]").forEach(b => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try {
+      await api("/paper/trade", { method: "POST", body: JSON.stringify({
+        company_id: parseInt(b.dataset.execCid), side: "buy",
+        quantity: parseInt(b.dataset.execQty) })});
+      viewTrading();
+    } catch (e) { b.after(Object.assign(document.createElement("span"),
+      { className: "sub", textContent: " " + e.message })); b.disabled = false; }
+  }));
   const hint = () => {
     const sel = document.getElementById("pp-company");
     const price = sel.selectedOptions[0]?.dataset.price;
@@ -1393,6 +1472,7 @@ async function route() {
     if (name === "companies" && arg) await viewCompanyDetail(parseInt(arg), sub || "overview");
     else if (name === "companies") await viewCompanies();
     else if (name === "portfolio") await viewPortfolio(arg || "real");
+    else if (name === "trading") await viewTrading();
     else if (name === "research") await viewResearch();
     else if (name === "lab") await viewLab(arg || "hypotheses");
     else await viewDashboard();
@@ -1403,7 +1483,18 @@ async function route() {
   }
 }
 
+async function quoteLoop() {
+  try {
+    const q = await api("/live/quotes", { method: "POST" });
+    cache.market = q.market;
+    cache.quotes = q.prices;
+    if ((location.hash || "").includes("trading")) route();
+  } catch { /* quotes are best-effort; status strip reports staleness */ }
+}
+
 window.addEventListener("hashchange", route);
 refreshStatusStrip();
 setInterval(refreshStatusStrip, 120000);
+quoteLoop();
+setInterval(quoteLoop, 300000);
 route();

@@ -305,6 +305,36 @@ def paper_reset(r: PaperResetIn, s: Session = Depends(db)):
     return reset_account(s, r.starting_cash)
 
 
+# ---------------------------------------------------- trading desk (live)
+
+@app.post("/api/live/quotes")
+def live_quotes(s: Session = Depends(db)):
+    """Near-live price upsert (today's running bar) + market clock — called
+    on a timer while the site is open so fills stay executable-real."""
+    from ..ingestion.yahoo import market_open_ist, refresh_quotes, sync_universe
+    ids = sync_universe(s)
+    result = refresh_quotes(s, ids)
+    result["market"] = market_open_ist()
+    return result
+
+
+@app.get("/api/live/candidates")
+def live_candidates(s: Session = Depends(db)):
+    """Universe-wide reasoning → the short list of defensible trades, sized
+    for the paper account, every gate shown."""
+    from .candidates import qualified_candidates
+    from .paper import account
+    acct = account(s, include_curve=False)
+    return qualified_candidates(s, book_value=acct["equity"], cash=acct["cash"])
+
+
+@app.get("/api/live/learning")
+def live_learning():
+    """The self-refinement state: cluster posteriors, calibration, outcomes."""
+    from ..research.learning import learning_state
+    return learning_state()
+
+
 # ------------------------------------------------------------------- theses
 
 def _thesis_dict(t: Thesis, ticker: str) -> dict:
