@@ -1,0 +1,229 @@
+"""ORM entities (PROJECT_DRAFT §15.2).
+
+Design decisions carried through from the draft:
+- FilingPeriod is versioned by filing date and restatement version (§14.4) and
+  keeps standalone vs consolidated as first-class scopes (§10.1).
+- Ratios are NEVER stored — always computed on read from filings (§15.3).
+- Portfolio state is a transaction ledger, not mutable holdings (§11.1).
+- Thesis is a structured object with falsifiable assumptions and invalidation
+  triggers, not a prose blob (§23.1).
+"""
+from __future__ import annotations
+
+from datetime import date, datetime
+
+from sqlalchemy import (Boolean, Date, DateTime, Float, ForeignKey, Integer,
+                        LargeBinary, String, Text)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .db import Base
+
+
+class Company(Base):
+    __tablename__ = "companies"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(20), unique=True)
+    name: Mapped[str] = mapped_column(String(120))
+    sector: Mapped[str] = mapped_column(String(60))
+    industry: Mapped[str] = mapped_column(String(80), default="")
+    exchange: Mapped[str] = mapped_column(String(10), default="NSE")  # §16.4: market id from day one
+    cap_band: Mapped[str] = mapped_column(String(10), default="large")  # large | mid | small
+    peer_group: Mapped[str] = mapped_column(String(60), default="")     # manually curated (§10.8)
+    description: Mapped[str] = mapped_column(Text, default="")
+    is_demo_data: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_financial: Mapped[bool] = mapped_column(Boolean, default=False)  # banks/NBFC: statement engines skip
+
+    filings: Mapped[list["FilingPeriod"]] = relationship(back_populates="company")
+
+
+class FilingPeriod(Base):
+    """One fiscal period × scope × restatement version (§14.4, §10.1).
+    Canonical line items as typed columns (₹ crore; shares in crore)."""
+    __tablename__ = "filing_periods"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    period: Mapped[str] = mapped_column(String(10))        # "FY2025"
+    fiscal_year: Mapped[int] = mapped_column(Integer)
+    scope: Mapped[str] = mapped_column(String(15), default="consolidated")
+    filing_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    restatement_version: Mapped[int] = mapped_column(Integer, default=1)
+    is_latest: Mapped[bool] = mapped_column(Boolean, default=True)
+    source: Mapped[str] = mapped_column(String(20), default="manual")     # manual | demo | yahoo
+    pit_grade: Mapped[str] = mapped_column(String(20), default="reconstructed")  # archived | reconstructed (§6.1)
+
+    revenue: Mapped[float | None] = mapped_column(Float)
+    gross_profit: Mapped[float | None] = mapped_column(Float)
+    ebitda: Mapped[float | None] = mapped_column(Float)
+    depreciation: Mapped[float | None] = mapped_column(Float)
+    ebit: Mapped[float | None] = mapped_column(Float)
+    interest_expense: Mapped[float | None] = mapped_column(Float)
+    pbt: Mapped[float | None] = mapped_column(Float)
+    tax_expense: Mapped[float | None] = mapped_column(Float)
+    net_income: Mapped[float | None] = mapped_column(Float)
+    total_assets: Mapped[float | None] = mapped_column(Float)
+    current_assets: Mapped[float | None] = mapped_column(Float)
+    cash: Mapped[float | None] = mapped_column(Float)
+    inventory: Mapped[float | None] = mapped_column(Float)
+    receivables: Mapped[float | None] = mapped_column(Float)
+    current_liabilities: Mapped[float | None] = mapped_column(Float)
+    payables: Mapped[float | None] = mapped_column(Float)
+    total_debt: Mapped[float | None] = mapped_column(Float)
+    total_equity: Mapped[float | None] = mapped_column(Float)
+    retained_earnings: Mapped[float | None] = mapped_column(Float)
+    shares_outstanding: Mapped[float | None] = mapped_column(Float)
+    cfo: Mapped[float | None] = mapped_column(Float)
+    capex: Mapped[float | None] = mapped_column(Float)
+    dividends_paid: Mapped[float | None] = mapped_column(Float)
+
+    company: Mapped[Company] = relationship(back_populates="filings")
+
+
+class PriceObservation(Base):
+    __tablename__ = "price_observations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    obs_date: Mapped[date] = mapped_column(Date, index=True)
+    close: Mapped[float] = mapped_column(Float)                    # ₹ per share
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)  # shares traded
+
+
+class MacroObservation(Base):
+    """Macro/reference series (NIFTY, India VIX, USDINR, Brent) — regime inputs."""
+    __tablename__ = "macro_observations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    role: Mapped[str] = mapped_column(String(20))  # index | vix | currency | commodity
+    obs_date: Mapped[date] = mapped_column(Date, index=True)
+    close: Mapped[float] = mapped_column(Float)
+
+
+class BaseRateRecord(Base):
+    """Cached T2 base-rate study result (RESEARCH_BLUEPRINT §7.1, §10.1).
+    Computed from the platform's own stored price history — never asserted."""
+    __tablename__ = "base_rates"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    study_key: Mapped[str] = mapped_column(String(60), index=True)   # e.g. "momentum_12_1_top_quintile"
+    evidence_family: Mapped[str] = mapped_column(String(40))
+    registry_ref: Mapped[str] = mapped_column(String(60))            # hypothesis registry id
+    horizon_days: Mapped[int] = mapped_column(Integer)
+    regime_filter: Mapped[str] = mapped_column(String(30), default="all")
+    n: Mapped[int] = mapped_column(Integer)
+    n_eff: Mapped[int | None] = mapped_column(Integer)               # overlap-corrected (§8 Phase II, A1 fix)
+    cohort_breadth_pct: Mapped[float | None] = mapped_column(Float)  # avg % of universe selected (A5)
+    net_median_excess_pct: Mapped[float | None] = mapped_column(Float)  # after round-trip cost model
+    hit_rate: Mapped[float | None] = mapped_column(Float)            # P(excess return > 0)
+    mean_excess_pct: Mapped[float | None] = mapped_column(Float)
+    median_excess_pct: Mapped[float | None] = mapped_column(Float)
+    q25_excess_pct: Mapped[float | None] = mapped_column(Float)
+    q75_excess_pct: Mapped[float | None] = mapped_column(Float)
+    spec: Mapped[str] = mapped_column(Text, default="")              # JSON of exact study spec
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SectorAttribute(Base):
+    """Extensible attributes for sector-specific KPIs (§15.1) — e.g. ARPOB,
+    bed occupancy — without a schema explosion."""
+    __tablename__ = "sector_attributes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    period: Mapped[str] = mapped_column(String(10))
+    name: Mapped[str] = mapped_column(String(60))
+    value: Mapped[float] = mapped_column(Float)
+    unit: Mapped[str] = mapped_column(String(20), default="")
+
+
+class InvestorProfileRow(Base):
+    __tablename__ = "investor_profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(60), unique=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    horizon: Mapped[str] = mapped_column(String(10), default="long")
+    horizon_target_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    risk_tolerance: Mapped[str] = mapped_column(String(15), default="moderate")
+    style: Mapped[float] = mapped_column(Float, default=50.0)
+    dividend_preference: Mapped[float] = mapped_column(Float, default=20.0)
+    quality_emphasis: Mapped[float] = mapped_column(Float, default=60.0)
+    sector_preferences: Mapped[str] = mapped_column(Text, default="")   # comma-separated
+    sector_exclusions: Mapped[str] = mapped_column(Text, default="")
+    max_position_pct: Mapped[float] = mapped_column(Float, default=10.0)
+    max_sector_pct: Mapped[float] = mapped_column(Float, default=30.0)
+    max_drawdown_pct: Mapped[float] = mapped_column(Float, default=25.0)
+    preferred_lens: Mapped[str] = mapped_column(String(20), default="balanced")
+    rules: Mapped[str] = mapped_column(Text, default="")                # newline-separated
+
+
+class TransactionRow(Base):
+    __tablename__ = "transactions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    side: Mapped[str] = mapped_column(String(4))  # buy | sell
+    quantity: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)
+    trade_date: Mapped[date] = mapped_column(Date)
+    fees: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class Thesis(Base):
+    """Structured, falsifiable thesis (§23.1) with lifecycle (§23.2)."""
+    __tablename__ = "theses"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    statement: Mapped[str] = mapped_column(Text)
+    assumptions: Mapped[str] = mapped_column(Text)            # newline-separated, falsifiable
+    invalidation_triggers: Mapped[str] = mapped_column(Text)  # newline-separated
+    sizing_rationale: Mapped[str] = mapped_column(Text, default="")
+    review_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft")
+    # draft | active | under_review | confirmed | invalidated | closed
+    elaboration: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+                                                 onupdate=datetime.utcnow)
+
+
+class JournalEntry(Base):
+    __tablename__ = "journal_entries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id"), nullable=True)
+    thesis_id: Mapped[int | None] = mapped_column(ForeignKey("theses.id"), nullable=True)
+    content: Mapped[str] = mapped_column(Text)
+    cfa_topic: Mapped[str] = mapped_column(String(80), default="")  # §22 learning-linked tag
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class LedgerRecord(Base):
+    """DB backend for the append-only, hash-chained decision ledger — used on
+    hosted deployments where the filesystem is ephemeral (DEPLOYMENT.md).
+    `payload` is the full JSON record including hash and prev_hash; `seq`
+    preserves chain order."""
+    __tablename__ = "ledger_records"
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    hash: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[str] = mapped_column(Text)
+
+
+class VaultBlob(Base):
+    """DB backend for the raw vault: content-addressed immutable payloads."""
+    __tablename__ = "vault_blobs"
+    hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    blob: Mapped[bytes] = mapped_column(LargeBinary)
+
+
+class VaultFetch(Base):
+    __tablename__ = "vault_fetches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hash: Mapped[str] = mapped_column(String(64), index=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    endpoint: Mapped[str] = mapped_column(String(200))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    nbytes: Mapped[int] = mapped_column(Integer, default=0)
+    meta: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class WatchlistItem(Base):
+    __tablename__ = "watchlist_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), unique=True)
+    rationale: Mapped[str] = mapped_column(Text)  # REQUIRED at add-time (§21)
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

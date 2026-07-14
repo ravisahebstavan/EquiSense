@@ -1,0 +1,268 @@
+"""EquiSense proprietary analytics (RESEARCH_BLUEPRINT §3 opportunity map).
+
+Novel, named composite diagnostics. "Proprietary" here means *original
+construction*, not secret: every score's formula is fully documented, every
+component exposed, and each is a registered hypothesis subject to the
+base-rate module — the anti-Trendlyne commitment (§10.7 of v1 stands).
+
+All pure functions. Statements oldest → newest.
+"""
+from __future__ import annotations
+
+import math
+from bisect import bisect_left
+from datetime import date
+from typing import Optional, Sequence
+
+from .types import Metric, StatementData, fmt, safe_div
+from .technical import TRADING_DAYS, momentum_12_1, realized_vol, trend_200dma, volume_anomaly
+
+
+def _clamp(v, lo=0.0, hi=100.0):
+    return max(lo, min(hi, v))
+
+
+# ---------------------------------------------------------------- MQI
+
+def momentum_quality(closes: Sequence[float], period: str = "") -> Metric:
+    """Momentum Quality Index (MQI) — EquiSense original.
+
+    Rewards *smooth* trend over violent trend: identical 12-1 returns score
+    higher when achieved with lower volatility and more persistent daily
+    progress. Construction:
+        MQI = risk_adjusted_momentum × persistence_multiplier
+        risk-adj momentum = (12-1 return %) / (annualized vol %)
+        persistence = fraction of up days over the momentum window
+        multiplier = 0.5 + persistence  (range 0.5–1.5)
+    Hypothesis (registered: HYP-004): smooth momentum decays slower than raw
+    momentum — path quality carries information about holder composition.
+    """
+    mom = momentum_12_1(closes).value
+    vol = realized_vol(closes, 126).value
+    window = closes[-(TRADING_DAYS - 21):-21] if len(closes) >= TRADING_DAYS else closes
+    ups = sum(1 for i in range(1, len(window)) if window[i] > window[i - 1])
+    persistence = ups / max(1, len(window) - 1)
+    if mom is None or vol in (None, 0):
+        value = None
+        formula = "insufficient history"
+    else:
+        value = (mom / vol) * (0.5 + persistence)
+        formula = (f"({fmt(mom)}% mom / {fmt(vol)}% vol) × "
+                   f"(0.5 + persistence {persistence:.2f})")
+    return Metric(
+        key="momentum_quality", label="Momentum Quality Index (MQI)",
+        value=value, unit="score", formula=formula,
+        inputs={"momentum_12_1_pct": mom, "vol_126d_pct": vol,
+                "up_day_fraction": round(persistence, 3)},
+        period=period, family="novel",
+        caveat="EquiSense-original composite; hypothesis HYP-004 in the registry. "
+               "Not a validated standalone signal until its base-rate table says so.")
+
+
+# ---------------------------------------------------------------- CCS
+
+def cash_conviction(stmts: list[StatementData], period: str = "") -> Metric:
+    """Cash Conviction Score (CCS, 0–100) — EquiSense original.
+
+    'How much of the reported profit story is backed by actual cash?'
+    Three components over up to 3 recent fiscal years:
+      conversion (50 pts): mean CFO/NI, full marks at ≥1.1, zero at ≤0.4
+      accrual discipline (30 pts): mean accruals ratio, full at ≤0%, zero at ≥+8%
+      asset honesty (20 pts): capex/depreciation, full in [0.8, 3.0] —
+        penalizes both starvation (<0.8) and unexplained splurge (>3.0)
+    """
+    recent = [s for s in stmts if s.net_income and s.cfo is not None][-3:]
+    if not recent:
+        return Metric(key="cash_conviction", label="Cash Conviction Score (CCS)",
+                      value=None, unit="score", formula="no usable statements",
+                      inputs={}, period=period, family="novel")
+    conv = [s.cfo / s.net_income for s in recent if s.net_income > 0]
+    accr = [(s.net_income - s.cfo) / s.total_assets for s in recent if s.total_assets]
+    cd = [s.capex / s.depreciation for s in recent
+          if s.capex is not None and s.depreciation]
+    conv_m = sum(conv) / len(conv) if conv else None
+    accr_m = sum(accr) / len(accr) * 100 if accr else None
+    cd_m = sum(cd) / len(cd) if cd else None
+
+    pts_conv = 0.0 if conv_m is None else _clamp((conv_m - 0.4) / 0.7 * 50, 0, 50)
+    pts_accr = 15.0 if accr_m is None else _clamp((8 - accr_m) / 8 * 30, 0, 30)
+    if cd_m is None:
+        pts_capex = 10.0
+    elif 0.8 <= cd_m <= 3.0:
+        pts_capex = 20.0
+    else:
+        pts_capex = _clamp(20 - abs(cd_m - (0.8 if cd_m < 0.8 else 3.0)) * 10, 0, 20)
+    score = pts_conv + pts_accr + pts_capex
+    return Metric(
+        key="cash_conviction", label="Cash Conviction Score (CCS)",
+        value=score, unit="score",
+        formula=(f"conversion {pts_conv:.0f}/50 (CFO/NI {fmt(conv_m, 2)}) + "
+                 f"accruals {pts_accr:.0f}/30 ({fmt(accr_m, 1)}%) + "
+                 f"capex sanity {pts_capex:.0f}/20 (capex/dep {fmt(cd_m, 2)})"),
+        inputs={"mean_cfo_ni": conv_m, "mean_accruals_pct": accr_m,
+                "mean_capex_dep": cd_m, "years_used": len(recent)},
+        period=period, family="novel",
+        caveat="EquiSense-original composite (registry HYP-005). Component "
+               "thresholds are stated design choices, inspectable above.")
+
+
+# ---------------------------------------------------------------- Fragility
+
+def fragility(stmts: list[StatementData], closes: Sequence[float],
+              period: str = "") -> Metric:
+    """Fragility Index (0–100, higher = more fragile) — EquiSense original.
+
+    'If conditions turn hostile, how much does this break?' Four stressors:
+      balance-sheet (40): net debt/EBITDA, 0 pts at ≤0x, 40 at ≥4x
+      coverage (20): interest coverage, 0 pts at ≥12x, 20 at ≤1.5x
+      market (25): realized vol percentile proxy — vol/60% capped
+      drawdown habit (15): 1y max drawdown, 0 at ≥−10%, 15 at ≤−50%
+    """
+    s = stmts[-1] if stmts else None
+    nd_ebitda = None
+    cov = None
+    if s is not None:
+        if s.total_debt is not None and s.cash is not None and s.ebitda:
+            nd_ebitda = (s.total_debt - s.cash) / s.ebitda
+        cov = safe_div(s.ebit, s.interest_expense)
+    vol = realized_vol(closes, 126).value
+    peak, mdd = float("-inf"), 0.0
+    for c in closes[-TRADING_DAYS:]:
+        peak = max(peak, c)
+        mdd = min(mdd, c / peak - 1)
+
+    pts_bs = 20.0 if nd_ebitda is None else _clamp(nd_ebitda / 4 * 40, 0, 40)
+    pts_cov = 10.0 if cov is None else _clamp((12 - cov) / 10.5 * 20, 0, 20)
+    pts_vol = 12.5 if vol is None else _clamp(vol / 60 * 25, 0, 25)
+    pts_dd = _clamp((abs(mdd) * 100 - 10) / 40 * 15, 0, 15)
+    score = pts_bs + pts_cov + pts_vol + pts_dd
+    return Metric(
+        key="fragility", label="Fragility Index",
+        value=score, unit="score",
+        formula=(f"balance-sheet {pts_bs:.0f}/40 (ND/EBITDA {fmt(nd_ebitda, 2)}) + "
+                 f"coverage {pts_cov:.0f}/20 ({fmt(cov, 1)}x) + "
+                 f"vol {pts_vol:.0f}/25 ({fmt(vol, 1)}%) + "
+                 f"drawdown {pts_dd:.0f}/15 ({mdd * 100:.1f}%)"),
+        inputs={"net_debt_ebitda": nd_ebitda, "interest_coverage": cov,
+                "vol_126d_pct": vol, "max_dd_1y_pct": mdd * 100},
+        period=period, family="novel",
+        caveat="EquiSense-original composite (registry HYP-006). Missing "
+               "components take neutral midpoints, shown above.")
+
+
+# ------------------------------------------------------- valuation history
+
+def pe_percentile_vs_history(closes: Sequence[float], close_dates: Sequence[date],
+                             stmts: list[StatementData], period: str = "") -> Metric:
+    """Current trailing P/E's percentile within its own multi-year P/E history.
+
+    Historical P/E at each month-end uses the latest fiscal year EPS *known at
+    that time* (PIT-honest within the reconstructed-fundamentals caveat).
+    """
+    eps_by_fy_end: list[tuple[date, float]] = []
+    for s in stmts:
+        if s.net_income and s.shares_outstanding:
+            fy_end = date(s.fiscal_year, 3, 31)
+            eps_by_fy_end.append((fy_end + __import__("datetime").timedelta(days=60),
+                                  s.net_income / s.shares_outstanding))
+    eps_by_fy_end.sort()
+    if not eps_by_fy_end or len(closes) < 260:
+        return Metric(key="pe_percentile", label="P/E Percentile vs Own History",
+                      value=None, unit="pctile", formula="insufficient history",
+                      inputs={}, period=period, family="novel")
+    known_dates = [d for d, _ in eps_by_fy_end]
+
+    def eps_known(on: date) -> Optional[float]:
+        i = bisect_left(known_dates, on)
+        return eps_by_fy_end[i - 1][1] if i > 0 else None
+
+    pes: list[float] = []
+    for i in range(0, len(closes), 21):  # ~monthly sampling
+        e = eps_known(close_dates[i])
+        if e and e > 0:
+            pes.append(closes[i] / e)
+    e_now = eps_known(close_dates[-1])
+    pe_now = closes[-1] / e_now if e_now and e_now > 0 else None
+    if pe_now is None or len(pes) < 12:
+        return Metric(key="pe_percentile", label="P/E Percentile vs Own History",
+                      value=None, unit="pctile", formula="insufficient P/E history",
+                      inputs={}, period=period, family="novel")
+    pctile = sum(1 for p in pes if p <= pe_now) / len(pes) * 100
+    return Metric(
+        key="pe_percentile", label="P/E Percentile vs Own History",
+        value=pctile, unit="pctile",
+        formula=f"Current trailing P/E {fmt(pe_now, 1)}x vs {len(pes)} monthly "
+                f"observations of own history",
+        inputs={"pe_now": pe_now, "pe_history_min": min(pes),
+                "pe_history_median": sorted(pes)[len(pes) // 2],
+                "pe_history_max": max(pes), "n_observations": len(pes)},
+        period=period, family="novel",
+        caveat="EPS timeline reconstructed from latest-known filings "
+               "(pit_grade: reconstructed) with a 60-day publication lag assumption.")
+
+
+# ---------------------------------------------------------------- TVT
+
+TVT_QUADRANTS = {
+    ("cheap", "up"): "coiled value — cheap vs own history AND in an uptrend",
+    ("cheap", "down"): "falling knife or deep value — cheap but trend is against it",
+    ("expensive", "up"): "momentum-carried — trend is up but priced richly vs own history",
+    ("expensive", "down"): "unwinding — expensive AND breaking down; historically the worst quadrant",
+}
+
+
+def trend_value_tension(pe_pctile: Optional[float], trend_above_ma_pct: Optional[float],
+                        period: str = "") -> Metric:
+    """Trend–Value Tension (TVT) — EquiSense original quadrant diagnostic.
+
+    Crosses valuation-vs-own-history against trend regime. The *tension*
+    quadrants (cheap+down, expensive+up) are where the interesting decisions
+    live; the aligned quadrants are the easy ones.
+    """
+    if pe_pctile is None or trend_above_ma_pct is None:
+        return Metric(key="tvt", label="Trend–Value Tension (TVT)", value=None,
+                      unit="quadrant", formula="needs P/E percentile + trend",
+                      inputs={}, period=period, family="novel")
+    val = "cheap" if pe_pctile <= 40 else ("expensive" if pe_pctile >= 60 else "fair")
+    trd = "up" if trend_above_ma_pct > 0 else "down"
+    quadrant = TVT_QUADRANTS.get((val, trd), f"{val} & trend {trd} — neutral zone")
+    tension = abs(pe_pctile - 50) / 50 * (1 if (val == "cheap") == (trd == "down") else -1)
+    return Metric(
+        key="tvt", label="Trend–Value Tension (TVT)",
+        value=round(tension, 3), unit="quadrant",
+        formula=f"P/E percentile {pe_pctile:.0f} × trend {trend_above_ma_pct:+.1f}% "
+                f"vs 200DMA → “{quadrant}”",
+        inputs={"pe_percentile": pe_pctile, "trend_vs_200dma_pct": trend_above_ma_pct,
+                "quadrant": quadrant},
+        period=period, family="novel",
+        caveat="Quadrant labels describe historical tendencies, not instructions. "
+               "Tension >0 = disagreement between value and trend evidence.")
+
+
+# ---------------------------------------------------------------- crowding
+
+def crowding_proxy(closes: Sequence[float], volumes: Sequence[Optional[float]],
+                   period: str = "") -> Metric:
+    """Participation Heat — EquiSense original crowding proxy.
+
+    Volume surge × recent price extension. High values = late-crowd
+    conditions; entries here have historically worse short-horizon
+    distributions (hypothesis HYP-007, testable against stored history).
+    """
+    vsurge = volume_anomaly(volumes).value
+    r63 = None
+    if len(closes) >= 64 and closes[-64] > 0:
+        r63 = (closes[-1] / closes[-64] - 1) * 100
+    if vsurge is None or r63 is None:
+        value = None
+        formula = "needs volume + 63d of prices"
+    else:
+        value = vsurge * max(0.0, r63) / 10
+        formula = f"vol surge {vsurge:.2f}x × max(0, 63d return {r63:+.1f}%) / 10"
+    return Metric(
+        key="crowding_proxy", label="Participation Heat", value=value, unit="score",
+        formula=formula,
+        inputs={"volume_surge": vsurge, "return_63d_pct": r63},
+        period=period, family="novel",
+        caveat="Proxy only — true crowding needs ownership/flow data "
+               "(delivery %, FII per-stock) not available from the free source.")

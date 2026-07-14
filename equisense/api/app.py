@@ -1,0 +1,535 @@
+"""EquiSense API + web app (PROJECT_DRAFT §16.2 application layer).
+
+Run:  uvicorn equisense.api.app:app --reload
+"""
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager, contextmanager
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..ai import narrator
+from ..db import Base, engine, get_session
+from ..engine import valuation
+from ..models import (Company, InvestorProfileRow, JournalEntry, Thesis,
+                      TransactionRow, WatchlistItem)
+from ..seed import seed
+from . import services
+
+WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Runs per cold start on serverless — must stay fast and idempotent.
+    Live data bootstrap is NOT done here (serverless kills background
+    threads): the refresh stream is bootstrap-aware instead (status.py)."""
+    from ..db import IS_SQLITE, ensure_schema
+    ensure_schema()
+    with get_session() as s:
+        if IS_SQLITE and os.environ.get("EQUISENSE_AUTO_INGEST") != "1":
+            seed(s)  # demo data only for local SQLite dev — never into a hosted DB
+        if not s.scalars(select(InvestorProfileRow)).first():
+            s.add(InvestorProfileRow(name="default", is_active=True))
+            s.commit()
+    yield
+
+
+app = FastAPI(title="EquiSense", version="0.1.0", lifespan=lifespan)
+
+_LOGIN_HTML = """<!DOCTYPE html><html><head><title>EquiSense</title><style>
+body{background:#0d0d0d;color:#fff;font:15px system-ui;display:flex;align-items:center;
+justify-content:center;height:100vh;margin:0}form{background:#1a1a19;padding:28px;
+border-radius:10px;border:1px solid #383835}input{font:inherit;padding:8px 10px;
+border-radius:6px;border:1px solid #383835;background:#0d0d0d;color:#fff;width:260px}
+button{font:inherit;margin-left:8px;padding:8px 14px;border-radius:6px;border:none;
+background:#3987e5;color:#fff;cursor:pointer}</style></head><body>
+<form onsubmit="location='/?token='+encodeURIComponent(document.getElementById('t').value);return false">
+<div style="font-weight:700;margin-bottom:10px">Equi<span style="color:#3987e5">Sense</span> — access token</div>
+<input id="t" type="password" placeholder="EQUISENSE_ACCESS_TOKEN" autofocus><button>Enter</button>
+</form></body></html>"""
+
+
+@app.middleware("http")
+async def auth_gate(request: Request, call_next):
+    """Single-user token gate (PROJECT_DRAFT §28.2: authenticated access even
+    for a personal app). Enabled only when EQUISENSE_ACCESS_TOKEN is set —
+    local development stays frictionless."""
+    token = os.environ.get("EQUISENSE_ACCESS_TOKEN")
+    if not token:
+        return await call_next(request)
+    supplied = (request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+                or request.query_params.get("token")
+                or request.cookies.get("eqs_token"))
+    if supplied != token:
+        if request.url.path.startswith("/api"):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return HTMLResponse(_LOGIN_HTML, status_code=401)
+    response = await call_next(request)
+    if request.query_params.get("token") == token:
+        response.set_cookie("eqs_token", token, httponly=True, samesite="lax",
+                            max_age=90 * 24 * 3600)
+    return response
+
+
+def db():
+    s = get_session()
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+# ------------------------------------------------------------------ schemas
+
+class ProfileUpdate(BaseModel):
+    horizon: Optional[str] = None
+    horizon_target_year: Optional[int] = None
+    risk_tolerance: Optional[str] = None
+    style: Optional[float] = Field(None, ge=0, le=100)
+    dividend_preference: Optional[float] = Field(None, ge=0, le=100)
+    quality_emphasis: Optional[float] = Field(None, ge=0, le=100)
+    sector_preferences: Optional[list[str]] = None
+    sector_exclusions: Optional[list[str]] = None
+    max_position_pct: Optional[float] = Field(None, gt=0, le=100)
+    max_sector_pct: Optional[float] = Field(None, gt=0, le=100)
+    max_drawdown_pct: Optional[float] = Field(None, gt=0, le=100)
+    preferred_lens: Optional[str] = None
+    rules: Optional[list[str]] = None
+
+
+class ValuationAssumptions(BaseModel):
+    """Editable assumptions for the reverse DCF (§19.2)."""
+    risk_free_rate: float = Field(0.070, ge=0, le=0.25)
+    equity_risk_premium: float = Field(0.065, ge=0, le=0.20)
+    beta: float = Field(1.0, ge=0.1, le=3.0)
+    tax_rate: float = Field(0.2517, ge=0, le=0.6)
+    cost_of_debt: Optional[float] = Field(None, ge=0, le=0.4)
+    horizon_years: int = Field(10, ge=3, le=25)
+    terminal_growth: float = Field(0.04, ge=0, le=0.08)
+
+    def to_engine(self) -> valuation.ReverseDcfAssumptions:
+        return valuation.ReverseDcfAssumptions(
+            horizon_years=self.horizon_years, terminal_growth=self.terminal_growth,
+            wacc=valuation.WaccAssumptions(
+                risk_free_rate=self.risk_free_rate,
+                equity_risk_premium=self.equity_risk_premium,
+                beta=self.beta, tax_rate=self.tax_rate,
+                cost_of_debt=self.cost_of_debt))
+
+
+class TransactionIn(BaseModel):
+    company_id: int
+    side: str = Field(pattern="^(buy|sell)$")
+    quantity: float = Field(gt=0)
+    price: float = Field(gt=0)
+    trade_date: date
+    fees: float = Field(0.0, ge=0)
+
+
+class ThesisIn(BaseModel):
+    company_id: int
+    statement: str = Field(min_length=10)
+    assumptions: list[str] = Field(min_length=1)          # falsifiable, §23.1
+    invalidation_triggers: list[str] = Field(min_length=1)  # required, §23.1
+    sizing_rationale: str = ""
+    review_date: Optional[date] = None
+    elaboration: str = ""
+
+
+class ThesisStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(draft|active|under_review|confirmed|invalidated|closed)$")
+
+
+class JournalIn(BaseModel):
+    content: str = Field(min_length=3)
+    company_id: Optional[int] = None
+    thesis_id: Optional[int] = None
+    cfa_topic: str = ""
+
+
+class WatchlistIn(BaseModel):
+    company_id: int
+    rationale: str = Field(min_length=10)  # required rationale at add-time (§21)
+
+
+class ThesisDraftRequest(BaseModel):
+    user_angle: str = Field(min_length=5,
+                            description="Your own rationale fragments, in your words")
+
+
+# ---------------------------------------------------------------- companies
+
+def _get_company(s: Session, company_id: int) -> Company:
+    c = s.get(Company, company_id)
+    if not c:
+        raise HTTPException(404, "company not found")
+    return c
+
+
+@app.get("/api/companies")
+def list_companies(s: Session = Depends(db)):
+    profile = services.active_profile(s)
+    return services.dashboard(s, profile)["ranked"]
+
+
+@app.get("/api/companies/{company_id}")
+def company_detail(company_id: int, s: Session = Depends(db)):
+    c = _get_company(s, company_id)
+    return services.company_analysis(s, c, services.active_profile(s))
+
+
+@app.post("/api/companies/{company_id}/valuation")
+def company_valuation(company_id: int, assumptions: ValuationAssumptions,
+                      s: Session = Depends(db)):
+    """Recompute the reverse DCF under user-edited assumptions (§19.2)."""
+    c = _get_company(s, company_id)
+    stmts = services.latest_statements(s, company_id)
+    price = services.latest_price(s, company_id)
+    if not stmts or price is None:
+        raise HTTPException(422, "insufficient data")
+    result = valuation.reverse_dcf(stmts[-1], price, assumptions.to_engine())
+    hist = valuation.historical_fcf_cagr(stmts)
+    return {"implied_growth": result["implied_growth"].to_dict(),
+            "wacc": result["wacc"].to_dict(),
+            "historical_fcf_cagr": hist.to_dict() if hist else None,
+            "assumptions": result["assumptions"],
+            "enterprise_value": result["enterprise_value"],
+            "base_fcf": result["base_fcf"]}
+
+
+# ------------------------------------------------------------------ profile
+
+@app.get("/api/profile")
+def get_profile(s: Session = Depends(db)):
+    return services.active_profile(s).to_dict()
+
+
+@app.put("/api/profile")
+def update_profile(update: ProfileUpdate, s: Session = Depends(db)):
+    row = s.scalars(select(InvestorProfileRow)
+                    .where(InvestorProfileRow.is_active.is_(True))).first()
+    if row is None:
+        raise HTTPException(404, "no active profile")
+    data = update.model_dump(exclude_none=True)
+    for k, v in data.items():
+        if k in ("sector_preferences", "sector_exclusions"):
+            v = ",".join(v)
+        elif k == "rules":
+            v = "\n".join(v)
+        setattr(row, k, v)
+    s.commit()
+    return services.profile_from_row(row).to_dict()
+
+
+# ---------------------------------------------------------------- dashboard
+
+@app.get("/api/dashboard")
+def get_dashboard(s: Session = Depends(db)):
+    return services.dashboard(s, services.active_profile(s))
+
+
+# ---------------------------------------------------------------- portfolio
+
+@app.get("/api/portfolio")
+def get_portfolio(s: Session = Depends(db)):
+    return services.portfolio_view(s, services.active_profile(s))
+
+
+@app.get("/api/transactions")
+def list_transactions(s: Session = Depends(db)):
+    rows = s.scalars(select(TransactionRow).order_by(TransactionRow.trade_date.desc())).all()
+    companies = {c.id: c.ticker for c in s.scalars(select(Company)).all()}
+    return [{"id": r.id, "ticker": companies.get(r.company_id), "company_id": r.company_id,
+             "side": r.side, "quantity": r.quantity, "price": r.price,
+             "trade_date": r.trade_date.isoformat(), "fees": r.fees} for r in rows]
+
+
+@app.post("/api/transactions", status_code=201)
+def add_transaction(t: TransactionIn, s: Session = Depends(db)):
+    _get_company(s, t.company_id)
+    row = TransactionRow(**t.model_dump())
+    s.add(row)
+    s.commit()
+    return {"id": row.id}
+
+
+# ------------------------------------------------------------------- theses
+
+def _thesis_dict(t: Thesis, ticker: str) -> dict:
+    return {"id": t.id, "company_id": t.company_id, "ticker": ticker,
+            "statement": t.statement,
+            "assumptions": t.assumptions.splitlines(),
+            "invalidation_triggers": t.invalidation_triggers.splitlines(),
+            "sizing_rationale": t.sizing_rationale,
+            "review_date": t.review_date.isoformat() if t.review_date else None,
+            "status": t.status, "elaboration": t.elaboration,
+            "created_at": t.created_at.isoformat()}
+
+
+@app.get("/api/theses")
+def list_theses(s: Session = Depends(db)):
+    companies = {c.id: c.ticker for c in s.scalars(select(Company)).all()}
+    return [_thesis_dict(t, companies.get(t.company_id, "?"))
+            for t in s.scalars(select(Thesis).order_by(Thesis.created_at.desc())).all()]
+
+
+@app.post("/api/theses", status_code=201)
+def create_thesis(t: ThesisIn, s: Session = Depends(db)):
+    c = _get_company(s, t.company_id)
+    row = Thesis(company_id=t.company_id, statement=t.statement,
+                 assumptions="\n".join(t.assumptions),
+                 invalidation_triggers="\n".join(t.invalidation_triggers),
+                 sizing_rationale=t.sizing_rationale, review_date=t.review_date,
+                 elaboration=t.elaboration, status="draft")
+    s.add(row)
+    s.commit()
+    return _thesis_dict(row, c.ticker)
+
+
+@app.patch("/api/theses/{thesis_id}/status")
+def update_thesis_status(thesis_id: int, u: ThesisStatusUpdate, s: Session = Depends(db)):
+    t = s.get(Thesis, thesis_id)
+    if not t:
+        raise HTTPException(404, "thesis not found")
+    t.status = u.status
+    s.commit()
+    c = s.get(Company, t.company_id)
+    return _thesis_dict(t, c.ticker if c else "?")
+
+
+# ------------------------------------------------------------------ journal
+
+@app.get("/api/journal")
+def list_journal(s: Session = Depends(db)):
+    companies = {c.id: c.ticker for c in s.scalars(select(Company)).all()}
+    return [{"id": j.id, "content": j.content, "cfa_topic": j.cfa_topic,
+             "ticker": companies.get(j.company_id) if j.company_id else None,
+             "company_id": j.company_id, "thesis_id": j.thesis_id,
+             "created_at": j.created_at.isoformat()}
+            for j in s.scalars(select(JournalEntry)
+                               .order_by(JournalEntry.created_at.desc())).all()]
+
+
+@app.post("/api/journal", status_code=201)
+def add_journal(j: JournalIn, s: Session = Depends(db)):
+    row = JournalEntry(**j.model_dump())
+    s.add(row)
+    s.commit()
+    return {"id": row.id}
+
+
+# ---------------------------------------------------------------- watchlist
+
+@app.get("/api/watchlist")
+def list_watchlist(s: Session = Depends(db)):
+    companies = {c.id: c for c in s.scalars(select(Company)).all()}
+    return [{"id": w.id, "company_id": w.company_id,
+             "ticker": companies[w.company_id].ticker,
+             "name": companies[w.company_id].name,
+             "rationale": w.rationale, "added_at": w.added_at.isoformat()}
+            for w in s.scalars(select(WatchlistItem)).all()]
+
+
+@app.post("/api/watchlist", status_code=201)
+def add_watchlist(w: WatchlistIn, s: Session = Depends(db)):
+    _get_company(s, w.company_id)
+    existing = s.scalars(select(WatchlistItem)
+                         .where(WatchlistItem.company_id == w.company_id)).first()
+    if existing:
+        raise HTTPException(409, "already on watchlist")
+    row = WatchlistItem(company_id=w.company_id, rationale=w.rationale)
+    s.add(row)
+    s.commit()
+    return {"id": row.id}
+
+
+@app.delete("/api/watchlist/{item_id}", status_code=204)
+def remove_watchlist(item_id: int, s: Session = Depends(db)):
+    row = s.get(WatchlistItem, item_id)
+    if row:
+        s.delete(row)
+        s.commit()
+
+
+# ----------------------------------------------------------------------- AI
+
+@app.post("/api/ai/narrate/company/{company_id}")
+def ai_narrate_company(company_id: int, s: Session = Depends(db)):
+    """Statement narrative (§13.3). The full grounded context is returned so
+    the UI can show exactly what the model was given (§19.1 layer 3)."""
+    c = _get_company(s, company_id)
+    analysis = services.company_analysis(s, c, services.active_profile(s))
+    context = {
+        "company": analysis["company"], "period": analysis["period"],
+        "cards": {k: v for k, v in analysis["cards"].items() if k != "peer_comparison"},
+        "trends": analysis["trends"],
+        "note": "Demo dataset — figures are approximations for product demonstration."
+        if c.is_demo_data else None,
+    }
+    return narrator.narrate_statements(context)
+
+
+@app.post("/api/ai/narrate/portfolio")
+def ai_narrate_portfolio(s: Session = Depends(db)):
+    profile = services.active_profile(s)
+    view = services.portfolio_view(s, profile)
+    context = {"portfolio": view, "profile": profile.to_dict()}
+    return narrator.narrate_portfolio(context)
+
+
+@app.post("/api/ai/thesis-draft/{company_id}")
+def ai_thesis_draft(company_id: int, req: ThesisDraftRequest, s: Session = Depends(db)):
+    c = _get_company(s, company_id)
+    analysis = services.company_analysis(s, c, services.active_profile(s))
+    context = {"company": analysis["company"], "period": analysis["period"],
+               "cards": {k: v for k, v in analysis["cards"].items()},
+               "trends": analysis["trends"]}
+    return narrator.draft_thesis(context, req.user_angle)
+
+
+# ---------------------------------------------------------------- live (v2)
+
+@app.get("/api/live/regime")
+def live_regime(s: Session = Depends(db)):
+    from .live import current_regime
+    return current_regime(s)
+
+
+@app.post("/api/live/dossier/{company_id}")
+def live_dossier(company_id: int, s: Session = Depends(db)):
+    """Build, pre-register (hash-chained), and return a full decision dossier."""
+    from .live import build_dossier
+    c = _get_company(s, company_id)
+    profile = services.active_profile(s)
+    view = services.portfolio_view(s, profile)
+    book = view["total_value"] or 1_000_000
+    return build_dossier(s, c, book_value=book,
+                         max_position_pct=profile.max_position_pct)
+
+
+@app.get("/api/live/base-rates")
+def live_base_rates(s: Session = Depends(db)):
+    from ..models import BaseRateRecord
+    from ..research.registry import REGISTRY
+    rows = s.scalars(select(BaseRateRecord).order_by(BaseRateRecord.study_key)).all()
+    return {"registry": REGISTRY,
+            "records": [{
+                "study_key": r.study_key, "registry_ref": r.registry_ref,
+                "regime": r.regime_filter, "horizon_days": r.horizon_days,
+                "n": r.n, "hit_rate": round(r.hit_rate, 3),
+                "median_excess_pct": round(r.median_excess_pct, 2),
+                "iqr": [round(r.q25_excess_pct, 2), round(r.q75_excess_pct, 2)],
+                "computed_at": r.computed_at.isoformat(),
+            } for r in rows]}
+
+
+@app.post("/api/live/studies/run")
+def live_run_studies(s: Session = Depends(db)):
+    from ..research.base_rates import run_all_studies
+    return run_all_studies(s)
+
+
+@app.post("/api/live/refresh")
+def live_refresh(s: Session = Depends(db)):
+    """Incremental price + macro refresh (fast path; fundamentals via CLI)."""
+    from ..ingestion.yahoo import ingest_macro, ingest_prices, sync_universe
+    ids = sync_universe(s)
+    return {"price_rows": ingest_prices(s, ids, years=1),
+            "macro_rows": ingest_macro(s, years=1)}
+
+
+@app.get("/api/live/ledger")
+def live_ledger():
+    from .. import ledger
+    return {"records": ledger.read_all()[-50:], "chain": ledger.verify_chain()}
+
+
+@app.post("/api/live/score")
+def live_score(s: Session = Depends(db)):
+    from .. import ledger
+    return ledger.score_due_claims(s)
+
+
+@app.get("/api/live/calibration")
+def live_calibration():
+    from .. import ledger
+    return ledger.calibration_report()
+
+
+@app.post("/api/live/reg001")
+def live_reg001(s: Session = Depends(db)):
+    """Run REG-001: the regime engine justifying its own existence (PHASE2 §6.1)."""
+    from ..research.reg001 import run_reg001
+    return run_reg001(s)
+
+
+@app.get("/api/live/vault")
+def live_vault():
+    from ..ingestion.vault import vault_stats
+    return vault_stats()
+
+
+@app.get("/api/live/status")
+def live_status(s: Session = Depends(db)):
+    """Data-trust surface: freshness, coverage, quality score, warnings."""
+    from .status import data_status
+    return data_status(s)
+
+
+@app.get("/api/live/refresh/stream")
+def live_refresh_stream(s: Session = Depends(db)):
+    """Staged pipeline refresh as Server-Sent Events — everything visible."""
+    from fastapi.responses import StreamingResponse
+    from .status import refresh_stream
+    return StreamingResponse(refresh_stream(s), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/live/portfolio-risk")
+def live_portfolio_risk(s: Session = Depends(db)):
+    from .status import portfolio_risk
+    return portfolio_risk(s)
+
+
+@app.get("/api/cron/refresh")
+def cron_refresh(s: Session = Depends(db)):
+    """Daily keep-fresh for Vercel Cron (GET; Vercel sends
+    `Authorization: Bearer $CRON_SECRET`, which the auth gate accepts when
+    CRON_SECRET equals EQUISENSE_ACCESS_TOKEN). Incremental prices + macro,
+    then recompute studies and score due claims."""
+    from ..ingestion.yahoo import ingest_macro, ingest_prices, sync_universe
+    from ..research.base_rates import run_all_studies
+    from .. import ledger as L
+    ids = sync_universe(s)
+    prices = ingest_prices(s, ids, years=1)
+    macro = ingest_macro(s, years=1)
+    studies = run_all_studies(s)["records"]
+    scored = L.score_due_claims(s)["scored"]
+    return {"price_rows": prices, "macro_rows": macro,
+            "base_rate_records": studies, "claims_scored": scored}
+
+
+@app.get("/api/companies/{company_id}/memory")
+def company_memory_view(company_id: int, s: Session = Depends(db)):
+    from .status import company_memory
+    return company_memory(s, _get_company(s, company_id))
+
+
+# ---------------------------------------------------------------- static UI
+
+if WEB_DIR.exists():
+    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        return FileResponse(WEB_DIR / "index.html")

@@ -1,0 +1,384 @@
+"""Application services: assemble deterministic engine outputs for the API.
+
+This layer orchestrates; it computes nothing itself (§17 dependency rule —
+all ratio math lives in equisense.engine and only there).
+"""
+from __future__ import annotations
+
+from datetime import date
+from typing import Optional
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..engine import personalization as pers
+from ..engine import portfolio as pf
+from ..engine import quality, ratios, valuation
+from ..engine.types import Metric, StatementData
+from ..models import (Company, FilingPeriod, InvestorProfileRow,
+                      PriceObservation, SectorAttribute, Thesis,
+                      TransactionRow, WatchlistItem)
+
+
+def statement_data(fp: FilingPeriod) -> StatementData:
+    fields = [f for f in StatementData.__dataclass_fields__
+              if f not in ("period", "fiscal_year", "scope")]
+    return StatementData(period=fp.period, fiscal_year=fp.fiscal_year, scope=fp.scope,
+                         **{f: getattr(fp, f) for f in fields})
+
+
+def latest_statements(session: Session, company_id: int,
+                      scope: str = "consolidated") -> list[StatementData]:
+    """Latest restatement version per fiscal year, oldest→newest (§14.4)."""
+    rows = session.scalars(
+        select(FilingPeriod)
+        .where(FilingPeriod.company_id == company_id,
+               FilingPeriod.scope == scope,
+               FilingPeriod.is_latest.is_(True))
+        .order_by(FilingPeriod.fiscal_year)).all()
+    return [statement_data(r) for r in rows]
+
+
+def latest_price(session: Session, company_id: int) -> Optional[float]:
+    row = session.scalars(
+        select(PriceObservation)
+        .where(PriceObservation.company_id == company_id)
+        .order_by(PriceObservation.obs_date.desc())).first()
+    return row.close if row else None
+
+
+def cagr(first: Optional[float], last: Optional[float], years: int) -> Optional[float]:
+    if not first or not last or first <= 0 or last <= 0 or years <= 0:
+        return None
+    return ((last / first) ** (1 / years) - 1) * 100
+
+
+# ------------------------------------------------------------------ profile
+
+def profile_from_row(row: InvestorProfileRow) -> pers.InvestorProfile:
+    return pers.InvestorProfile(
+        name=row.name, horizon=row.horizon,
+        horizon_target_year=row.horizon_target_year,
+        risk_tolerance=row.risk_tolerance, style=row.style,
+        dividend_preference=row.dividend_preference,
+        quality_emphasis=row.quality_emphasis,
+        sector_preferences=[s.strip() for s in row.sector_preferences.split(",") if s.strip()],
+        sector_exclusions=[s.strip() for s in row.sector_exclusions.split(",") if s.strip()],
+        max_position_pct=row.max_position_pct, max_sector_pct=row.max_sector_pct,
+        max_drawdown_pct=row.max_drawdown_pct, preferred_lens=row.preferred_lens,
+        rules=[r.strip() for r in row.rules.splitlines() if r.strip()])
+
+
+def active_profile(session: Session) -> pers.InvestorProfile:
+    row = session.scalars(select(InvestorProfileRow)
+                          .where(InvestorProfileRow.is_active.is_(True))).first()
+    if row is None:
+        row = session.scalars(select(InvestorProfileRow)).first()
+    return profile_from_row(row) if row else pers.InvestorProfile()
+
+
+# ---------------------------------------------------------------- signals
+
+def company_signals(session: Session, company: Company) -> pers.CompanySignals:
+    stmts = latest_statements(session, company.id)
+    price = latest_price(session, company.id)
+    sig = pers.CompanySignals(sector=company.sector)
+    if not stmts:
+        return sig
+    curr = stmts[-1]
+    if len(stmts) >= 2:
+        f = quality.piotroski_f(curr, stmts[-2], price)
+        sig.f_score = f.value
+        sig.revenue_cagr_pct = cagr(stmts[0].revenue, curr.revenue,
+                                    curr.fiscal_year - stmts[0].fiscal_year)
+    z = quality.altman_z(curr, price)
+    sig.z_zone = quality.altman_zone(z.value)
+    sig.roic_pct = ratios.roic(curr).value
+    ps = {m.key: m for m in ratios.per_share_ratios(curr, price)}
+    sig.pe = ps.get("pe").value if "pe" in ps else None
+    sig.pb = ps.get("pb").value if "pb" in ps else None
+    sig.dividend_yield_pct = ps.get("dividend_yield").value if "dividend_yield" in ps else None
+    lev = {m.key: m for m in ratios.leverage_ratios(curr)}
+    sig.debt_to_equity = lev["debt_to_equity"].value
+    if price is not None:
+        rd = valuation.reverse_dcf(curr, price)
+        hist = valuation.historical_fcf_cagr(stmts)
+        if rd["implied_growth"].value is not None and hist and hist.value is not None:
+            sig.implied_growth_gap_pct = rd["implied_growth"].value - hist.value
+    return sig
+
+
+# --------------------------------------------------------- company analysis
+
+def _series(stmts: list[StatementData], fn) -> list[dict]:
+    out = []
+    for s in stmts:
+        v = fn(s)
+        out.append({"period": s.period, "value": None if v is None else round(v, 2)})
+    return out
+
+
+def company_analysis(session: Session, company: Company,
+                     profile: pers.InvestorProfile,
+                     dcf_assumptions: Optional[valuation.ReverseDcfAssumptions] = None) -> dict:
+    stmts = latest_statements(session, company.id)
+    price = latest_price(session, company.id)
+    if not stmts:
+        return {"error": "no filings"}
+    curr = stmts[-1]
+    prev = stmts[-2] if len(stmts) >= 2 else None
+    years = curr.fiscal_year - stmts[0].fiscal_year
+
+    def md(ms: list[Metric]) -> list[dict]:
+        return [m.to_dict() for m in ms]
+
+    f = quality.piotroski_f(curr, prev, price) if prev else None
+    z = quality.altman_z(curr, price)
+    rd = valuation.reverse_dcf(curr, price, dcf_assumptions) if price else None
+    hist_fcf = valuation.historical_fcf_cagr(stmts)
+    per_share = ratios.per_share_ratios(curr, price)
+    ps_map = {m.key: m for m in per_share}
+
+    trends = {
+        "revenue": _series(stmts, lambda s: s.revenue),
+        "net_income": _series(stmts, lambda s: s.net_income),
+        "operating_margin": _series(stmts, lambda s: None if not s.revenue or s.ebit is None
+                                    else s.ebit / s.revenue * 100),
+        "roic": _series(stmts, lambda s: ratios.roic(s).value),
+        "fcf": _series(stmts, lambda s: None if s.cfo is None or s.capex is None
+                       else s.cfo - s.capex),
+        "eps": _series(stmts, lambda s: None if not s.shares_outstanding or s.net_income is None
+                       else s.net_income / s.shares_outstanding),
+    }
+
+    sector_attrs = session.scalars(
+        select(SectorAttribute).where(SectorAttribute.company_id == company.id)).all()
+
+    cards = {
+        "quality_scores": {
+            "title": "Quality & Distress",
+            "metrics": md([m for m in [f, z] if m]),
+            "extras": {"z_zone": quality.altman_zone(z.value),
+                       "quality_tier": quality.quality_tier(f.value if f else None)},
+        },
+        "profitability": {
+            "title": "Profitability & Returns",
+            "metrics": md(ratios.profitability_ratios(curr) + [ratios.roic(curr)]),
+        },
+        "growth_trends": {
+            "title": "Growth & Trajectory",
+            "metrics": [],
+            "extras": {
+                "revenue_cagr_pct": cagr(stmts[0].revenue, curr.revenue, years),
+                "net_income_cagr_pct": cagr(stmts[0].net_income, curr.net_income, years),
+                "window": f"{stmts[0].period}–{curr.period}",
+            },
+        },
+        "valuation": {
+            "title": "Valuation (implied expectations)",
+            "metrics": md([m for m in [
+                rd["implied_growth"] if rd else None,
+                rd["wacc"] if rd else None,
+                hist_fcf,
+                ps_map.get("pe"), ps_map.get("pb"), ps_map.get("ev_ebitda")] if m]),
+            "extras": {"assumptions": rd["assumptions"] if rd else None,
+                       "enterprise_value": rd.get("enterprise_value") if rd else None,
+                       "base_fcf": rd.get("base_fcf") if rd else None,
+                       "price": price},
+        },
+        "cash_flow_quality": {
+            "title": "Cash-Flow Quality",
+            "metrics": md(quality.cash_flow_quality(curr)),
+        },
+        "income": {
+            "title": "Income & Payout",
+            "metrics": md([m for m in [ps_map.get("dividend_yield")] if m]),
+            "extras": {"payout_ratio_pct": None if not curr.net_income or not curr.dividends_paid
+                       else round(curr.dividends_paid / curr.net_income * 100, 1)},
+        },
+        "leverage_liquidity": {
+            "title": "Leverage & Liquidity",
+            "metrics": md(ratios.leverage_ratios(curr) + ratios.liquidity_ratios(curr)),
+        },
+        "efficiency": {
+            "title": "Efficiency",
+            "metrics": md(ratios.efficiency_ratios(curr)),
+        },
+        "peer_comparison": {
+            "title": "Peer Comparison",
+            "table": peer_table(session, company),
+        },
+    }
+
+    return {
+        "company": {"id": company.id, "ticker": company.ticker, "name": company.name,
+                    "sector": company.sector, "industry": company.industry,
+                    "cap_band": company.cap_band, "description": company.description,
+                    "is_demo_data": company.is_demo_data, "price": price},
+        "period": curr.period,
+        "card_order": pers.card_order(profile),
+        "cards": cards,
+        "trends": trends,
+        "per_share": md(per_share),
+        "sector_attributes": [{"name": a.name, "value": a.value, "unit": a.unit,
+                               "period": a.period} for a in sector_attrs],
+        "statements": [vars(s) for s in stmts],
+    }
+
+
+def peer_table(session: Session, company: Company) -> list[dict]:
+    peers = session.scalars(select(Company)
+                            .where(Company.peer_group == company.peer_group)).all()
+    rows = []
+    for p in peers:
+        stmts = latest_statements(session, p.id)
+        if not stmts:
+            continue
+        curr = stmts[-1]
+        prev = stmts[-2] if len(stmts) >= 2 else None
+        price = latest_price(session, p.id)
+        ps = {m.key: m for m in ratios.per_share_ratios(curr, price)}
+        f = quality.piotroski_f(curr, prev, price) if prev else None
+        z = quality.altman_z(curr, price)
+        years = curr.fiscal_year - stmts[0].fiscal_year
+        rows.append({
+            "id": p.id, "ticker": p.ticker, "name": p.name,
+            "is_self": p.id == company.id,
+            "revenue": curr.revenue,
+            "revenue_cagr_pct": cagr(stmts[0].revenue, curr.revenue, years),
+            "operating_margin_pct": None if not curr.revenue or curr.ebit is None
+            else round(curr.ebit / curr.revenue * 100, 1),
+            "roic_pct": ratios.roic(curr).rounded(1),
+            "pe": ps["pe"].rounded(1) if "pe" in ps else None,
+            "ev_ebitda": ps["ev_ebitda"].rounded(1) if "ev_ebitda" in ps else None,
+            "f_score": f.value if f else None,
+            "z_zone": quality.altman_zone(z.value),
+        })
+    rows.sort(key=lambda r: -(r["revenue"] or 0))
+    return rows
+
+
+# ---------------------------------------------------------------- portfolio
+
+def _txns(session: Session) -> list[pf.Transaction]:
+    rows = session.scalars(select(TransactionRow)).all()
+    return [pf.Transaction(company_id=r.company_id, side=r.side, quantity=r.quantity,
+                           price=r.price, trade_date=r.trade_date, fees=r.fees)
+            for r in rows]
+
+
+def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
+    txns = _txns(session)
+    positions = pf.positions_from_ledger(txns)
+    companies = {c.id: c for c in session.scalars(select(Company)).all()}
+    today = date.today()
+
+    prices, values = {}, {}
+    for cid, pos in positions.items():
+        prices[cid] = latest_price(session, cid) or 0.0
+        values[cid] = pos.quantity * prices[cid]
+
+    quality_tiers = {}
+    for cid in positions:
+        sig = company_signals(session, companies[cid])
+        quality_tiers[cid] = quality.quality_tier(sig.f_score)
+
+    conc = pf.concentration(
+        positions, prices,
+        sectors={cid: companies[cid].sector for cid in positions},
+        cap_bands={cid: companies[cid].cap_band for cid in positions},
+        quality_tiers=quality_tiers)
+
+    holdings = []
+    for cid, pos in sorted(positions.items(), key=lambda kv: -values[kv[0]]):
+        if pos.quantity <= 1e-9:
+            continue
+        r = pf.position_xirr(txns, cid, values[cid], today)
+        c = companies[cid]
+        holdings.append({
+            "company_id": cid, "ticker": c.ticker, "name": c.name,
+            "sector": c.sector, "quantity": round(pos.quantity, 4),
+            "avg_cost": round(pos.avg_cost, 2), "invested": round(pos.invested, 2),
+            "price": prices[cid], "value": round(values[cid], 2),
+            "unrealized_pnl": round(values[cid] - pos.invested, 2),
+            "realized_pnl": round(pos.realized_pnl, 2),
+            "xirr_pct": None if r is None else round(r * 100, 2),
+            "weight_pct": conc["by_position"].get(cid),
+            "quality_tier": quality_tiers.get(cid),
+            "lots": pf.lot_aging(pos, today),
+        })
+
+    xirr_metric = pf.portfolio_xirr(txns, values, today)
+
+    # Profile-limit checks (diagnostic facts only — no trade suggestions, §11.5)
+    breaches = []
+    for cid, w in conc["by_position"].items():
+        if w > profile.max_position_pct:
+            breaches.append(f"{companies[cid].ticker} is {w:.1f}% of the book — above "
+                            f"your stated {profile.max_position_pct:.0f}% single-position limit.")
+    for sector, w in conc["by_sector"].items():
+        if w > profile.max_sector_pct:
+            breaches.append(f"{sector} is {w:.1f}% of the book — above your stated "
+                            f"{profile.max_sector_pct:.0f}% sector limit.")
+
+    invested_total = sum(p.invested for p in positions.values())
+    return {
+        "as_of": today.isoformat(),
+        "total_value": conc["total_value"],
+        "total_invested": round(invested_total, 2),
+        "unrealized_pnl": round(conc["total_value"] - invested_total, 2),
+        "realized_pnl": round(sum(p.realized_pnl for p in positions.values()), 2),
+        "xirr": xirr_metric.to_dict() if xirr_metric else None,
+        "holdings": holdings,
+        "concentration": {
+            "by_position": {companies[cid].ticker: w
+                            for cid, w in conc["by_position"].items()},
+            "by_sector": conc["by_sector"],
+            "by_cap_band": conc["by_cap_band"],
+            "by_quality_tier": conc["by_quality_tier"],
+        },
+        "profile_limit_breaches": breaches,
+    }
+
+
+# ---------------------------------------------------------------- dashboard
+
+def dashboard(session: Session, profile: pers.InvestorProfile) -> dict:
+    companies = session.scalars(select(Company)).all()
+    watch_ids = {w.company_id: w for w in session.scalars(select(WatchlistItem)).all()}
+    positions = pf.positions_from_ledger(_txns(session))
+    held_ids = {cid for cid, p in positions.items() if p.quantity > 1e-9}
+
+    ranked = []
+    for c in companies:
+        sig = company_signals(session, c)
+        score = pers.attention_score(profile, sig)
+        ranked.append({
+            "id": c.id, "ticker": c.ticker, "name": c.name, "sector": c.sector,
+            "held": c.id in held_ids, "watched": c.id in watch_ids,
+            "watch_rationale": watch_ids[c.id].rationale if c.id in watch_ids else None,
+            "price": latest_price(session, c.id),
+            "priority": score,
+            "signals": {"f_score": sig.f_score, "z_zone": sig.z_zone,
+                        "roic_pct": None if sig.roic_pct is None else round(sig.roic_pct, 1),
+                        "revenue_cagr_pct": None if sig.revenue_cagr_pct is None
+                        else round(sig.revenue_cagr_pct, 1),
+                        "pe": None if sig.pe is None else round(sig.pe, 1),
+                        "dividend_yield_pct": None if sig.dividend_yield_pct is None
+                        else round(sig.dividend_yield_pct, 2),
+                        "implied_growth_gap_pct": None if sig.implied_growth_gap_pct is None
+                        else round(sig.implied_growth_gap_pct, 1)},
+        })
+    ranked.sort(key=lambda r: -r["priority"]["score"])
+
+    today = date.today()
+    reviews_due = []
+    for t in session.scalars(select(Thesis)).all():
+        if t.status == "active" and t.review_date and t.review_date <= today:
+            c = next((x for x in companies if x.id == t.company_id), None)
+            reviews_due.append({"thesis_id": t.id, "ticker": c.ticker if c else "?",
+                                "statement": t.statement,
+                                "review_date": t.review_date.isoformat()})
+
+    return {"profile": profile.to_dict(), "ranked": ranked,
+            "thesis_reviews_due": reviews_due}

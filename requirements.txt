@@ -1,0 +1,9 @@
+# Vercel Python runtime installs from this file (pyproject stays the source
+# of truth for local dev: pip install -e ".[dev]").
+fastapi>=0.110
+sqlalchemy>=2.0
+pydantic>=2.6
+anthropic>=0.90
+yfinance>=0.2.40
+pandas>=2.0
+psycopg[binary]>=3.1

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EquiSense</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Equi<span>Sense</span></div>
+  <nav id="nav">
+    <a href="#/dashboard" data-route="dashboard">Dashboard <kbd>gd</kbd></a>
+    <a href="#/companies" data-route="companies">Companies <kbd>gc</kbd></a>
+    <a href="#/portfolio" data-route="portfolio">Portfolio <kbd>gp</kbd></a>
+    <a href="#/research" data-route="research">Research <kbd>gr</kbd></a>
+    <a href="#/lab" data-route="lab">Lab <kbd>gl</kbd></a>
+  </nav>
+  <button id="palette-btn" title="Command palette">Search / Commands <kbd>Ctrl K</kbd></button>
+  <button id="refresh-btn" class="primary" title="Staged live refresh">⟳ Refresh</button>
+</header>
+
+<div class="status-strip" id="status-strip">connecting…</div>
+
+<main id="app"><div class="loading">Loading…</div></main>
+
+<div id="palette" class="overlay" hidden>
+  <div class="palette-box">
+    <input id="palette-input" placeholder="Type a ticker, company, or command…" autocomplete="off">
+    <div id="palette-list"></div>
+  </div>
+</div>
+
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-head">
+    <strong>Pipeline refresh</strong>
+    <button id="drawer-close">✕</button>
+  </div>
+  <div id="drawer-body"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

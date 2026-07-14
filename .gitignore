@@ -1,0 +1,13 @@
+# Real user data never enters the repo (PROJECT_DRAFT §28.2) — decided at commit one.
+data/
+*.db
+.env
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+dist/
+*.egg-info/
+.vercel/
+.claude/settings.local.json
