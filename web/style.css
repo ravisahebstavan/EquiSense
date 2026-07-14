@@ -322,6 +322,9 @@ details.ctx pre { max-height: 240px; overflow: auto; background: var(--inset); p
 .tabs button.active { color: var(--ink); border-bottom-color: var(--accent); }
 
 /* ----------------------------------------------------------- overlay */
+/* CRITICAL: author display rules override the `hidden` attribute — restore it */
+[hidden] { display: none !important; }
+
 .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 50;
   display: flex; align-items: flex-start; justify-content: center; padding-top: 11vh;
   backdrop-filter: blur(2px); }

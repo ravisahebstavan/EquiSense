@@ -354,7 +354,11 @@ function renderDossier(d) {
         <div class="sub">risk ${fmtMoney(d.sizing.risk_at_stop)}</div></div>
       <div class="tile"><div class="label">Binding constraint</div><div class="value" style="font-size:14px">${esc(d.sizing.binding_constraint)}</div></div>
     </div>
-    <div class="score-detail">${esc(JSON.stringify(d.sizing.working))}<br>⚠ ${esc(d.sizing.caveat)}</div>
+    <div class="score-detail">
+      ${Object.entries(d.sizing.working).map(([k, v]) =>
+        `<span style="display:inline-block;margin:1px 14px 1px 0">${esc(k.replaceAll("_", " "))}:
+         <strong>${typeof v === "number" ? fmtN(v, 2) : esc(v)}</strong></span>`).join("")}
+      <div style="margin-top:5px">⚠ ${esc(d.sizing.caveat)}</div></div>
     <h2 style="margin-top:12px">Costs & taxes (India)</h2>
     <div class="score-detail">Round trip ≈ ${d.costs_taxes.round_trip_cost_pct}%
       (statutory ${d.costs_taxes.statutory_pct}% + impact ${d.costs_taxes.impact_estimate_pct}%) ·
@@ -425,6 +429,7 @@ async function viewDashboard() {
         <div class="sub" style="margin-top:6px">REG-001: conditioning showed no OOS value — regime is descriptive.</div>
       </div>
       <div class="panel span4"><h2>Portfolio</h2>
+        ${pf.holdings.length ? `
         <div class="tiles" style="grid-template-columns:1fr 1fr">
           <div class="tile"><div class="label">Value</div><div class="value">${fmtMoney(pf.total_value)}</div></div>
           <div class="tile"><div class="label">XIRR</div>
@@ -432,7 +437,10 @@ async function viewDashboard() {
         </div>
         ${pf.profile_limit_breaches.slice(0, 3).map(b => `<div class="breach">⚠ ${esc(b)}</div>`).join("")
           || '<div class="sub">No profile-limit breaches.</div>'}
-        <div class="sub" style="margin-top:4px"><a href="#/portfolio">full monitor →</a></div>
+        <div class="sub" style="margin-top:4px"><a href="#/portfolio">full monitor →</a></div>`
+        : `<div class="empty">No transactions yet — the monitor activates with your first
+           recorded trade.</div>
+           <div style="text-align:center"><a href="#/portfolio">record a transaction →</a></div>`}
       </div>
       <div class="panel span4"><h2>System & Model Health</h2>
         <div class="metric-row" style="cursor:default"><span class="m-label">Data quality</span>
@@ -718,8 +726,58 @@ function corrCell(v) {
   return `<td><span style="background:${bg}">${v.toFixed(2)}</span></td>`;
 }
 
+function txnFormHtml(companies) {
+  const opts = companies.map(c => `<option value="${c.id}">${esc(c.ticker)} — ${esc(c.name)}</option>`).join("");
+  const today = new Date().toISOString().slice(0, 10);
+  return `<div class="panel"><h2>Record transaction</h2>
+    <div class="frm">
+      <div><label>Company</label><select id="tx-company">${opts}</select></div>
+      <div><label>Side</label><select id="tx-side"><option value="buy">Buy</option><option value="sell">Sell</option></select></div>
+      <div><label>Quantity</label><input id="tx-qty" type="number" min="1" step="1" placeholder="10"></div>
+      <div><label>Price (₹/share)</label><input id="tx-price" type="number" min="0.05" step="0.05" placeholder="1234.50"></div>
+      <div><label>Trade date</label><input id="tx-date" type="date" value="${today}"></div>
+      <div><label>Fees (₹)</label><input id="tx-fees" type="number" min="0" step="0.01" value="0"></div>
+    </div>
+    <button class="primary" id="tx-save">Record</button>
+    <span class="sub" style="margin-left:10px">The ledger is the source of truth — positions, XIRR,
+      heat and tax lots all derive from it.</span>
+    <div id="tx-msg" class="sub" style="margin-top:6px"></div></div>`;
+}
+
+function wireTxnForm(onSaved) {
+  document.getElementById("tx-save").addEventListener("click", async () => {
+    const msg = document.getElementById("tx-msg");
+    try {
+      await api("/transactions", { method: "POST", body: JSON.stringify({
+        company_id: parseInt(document.getElementById("tx-company").value),
+        side: document.getElementById("tx-side").value,
+        quantity: parseFloat(document.getElementById("tx-qty").value),
+        price: parseFloat(document.getElementById("tx-price").value),
+        trade_date: document.getElementById("tx-date").value,
+        fees: parseFloat(document.getElementById("tx-fees").value || "0"),
+      })});
+      onSaved();
+    } catch (e) { msg.textContent = "Rejected: " + e.message; }
+  });
+}
+
 async function viewPortfolio() {
-  const [p, risk] = await Promise.all([api("/portfolio"), api("/live/portfolio-risk")]);
+  const [p, risk, companies] = await Promise.all([
+    api("/portfolio"), api("/live/portfolio-risk"), getCompanies()]);
+
+  if (!p.holdings.length) {
+    app.innerHTML = `
+      <h1>Portfolio Monitor</h1>
+      <div class="panel" style="margin-top:12px">
+        <div class="empty">No transactions recorded yet. Record your first trade below —
+          positions, P&amp;L, XIRR, concentration, correlation and portfolio heat all
+          derive from the transaction ledger.</div>
+      </div>
+      ${txnFormHtml(companies)}`;
+    wireTxnForm(viewPortfolio);
+    return;
+  }
+
   const holdings = p.holdings.map(h => `
     <tr class="clickable" data-company="${h.company_id}">
       <td><strong>${esc(h.ticker)}</strong><div class="sub">${esc(h.sector)}</div></td>
@@ -781,9 +839,11 @@ async function viewPortfolio() {
         ${hbars(p.concentration.by_quality_tier, (k) => "q-" + k)}
         <div class="sub" style="margin-top:6px">Capital in fundamentally fragile businesses — the axis most tools omit.</div></div>
     </div>
+    ${txnFormHtml(companies)}
     <div class="panel">${aiBlock("pfnarrate", "Brief me on this book (grounded)")}</div>`;
   app.querySelectorAll("tr[data-company]").forEach(tr =>
     tr.addEventListener("click", () => location.hash = `#/companies/${tr.dataset.company}`));
+  wireTxnForm(viewPortfolio);
   wireAi(app, { pfnarrate: () => api("/ai/narrate/portfolio", { method: "POST" }) });
 }
 
