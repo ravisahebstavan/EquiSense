@@ -15,6 +15,34 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const signed = (v, d = 2) => v == null ? "—" : (v >= 0 ? "+" : "") + fmtN(v, d);
 
+/* Every identifier shown to the user is rendered in frontend form: explicit
+   labels first, then a generic snake_case → Title Case fallback. */
+const LABELS = {
+  long_candidate: "Long Candidate", avoid_short_candidate: "Avoid / Short Candidate",
+  abstain_no_edge: "Abstain — No Edge Detected", abstain_disagreement: "Abstain — Engines Disagree",
+  abstain_insufficient: "Abstain — Insufficient Data",
+  trend: "Trend", value: "Value", quality: "Quality", flow: "Flow",
+  macro: "Macro", risk: "Risk", portfolio: "Portfolio Fit",
+  agreement: "Engine agreement", coverage: "Evidence coverage",
+  base_rate_depth: "Base-rate depth (Nₑᶠᶠ)", calibration_history: "Calibration history",
+  risk_budget: "Risk budget", position_cap: "Position cap",
+  heat_room: "Heat headroom", liquidity_cap: "Liquidity cap",
+  directional_excess: "Directional call", abstention_counterfactual: "Abstention (counterfactual)",
+  dossier: "Dossier issued", score: "Claim scored", paper_trade: "Paper fill",
+  paper_reset: "Paper account reset",
+  registered: "Registered", "registered-deferred": "Registered (deferred)",
+  computed: "Computed", validated: "Validated", deployed: "Deployed",
+  rejected: "Rejected", retired: "Retired",
+  scored_claims: "Scored directional claims", scored_abstentions: "Scored abstentions",
+  hit_rate: "Hit rate", mean_stated_probability: "Mean stated probability",
+  mean_brier: "Mean Brier score", wrongful_abstention_rate: "Wrongful-abstention rate",
+  wrongful_threshold_pct: "Wrongful threshold", mean_abstained_excess_pct: "Mean abstained excess",
+  conditioning_helps: "Conditioning helps", no_measurable_value: "No measurable value",
+  conditioning_hurts: "Conditioning hurts", insufficient_data: "Insufficient data",
+};
+const human = (s) => LABELS[s] ?? String(s ?? "")
+  .replaceAll("_", " ").replace(/\b[a-z]/g, c => c.toUpperCase());
+
 async function api(path, opts = {}) {
   const r = await fetch("/api" + path, { headers: { "Content-Type": "application/json" }, ...opts });
   if (!r.ok) {
@@ -36,11 +64,34 @@ async function getCompanies(force = false) {
 
 function qClass(q) { return q >= 85 ? "ok" : q >= 60 ? "mid" : "bad"; }
 
+let autoRefreshing = false;
+
+async function maybeAutoRefresh(st) {
+  /* Stay-fresh policy: if prices are stale beyond a weekend and we haven't
+     auto-refreshed in the last 6 hours, run the pipeline silently in the
+     background — no clicks required. (A daily server-side cron does the same
+     on the hosted deployment.) */
+  const stale = st.datasets.prices.staleness_days;
+  const last = parseInt(localStorage.getItem("eqs_auto_refresh") || "0");
+  if (stale === null || stale <= 2 || refreshing || autoRefreshing) return;
+  if (Date.now() - last < 6 * 3600 * 1000) return;
+  autoRefreshing = true;
+  localStorage.setItem("eqs_auto_refresh", String(Date.now()));
+  try {
+    await api("/live/refresh", { method: "POST" });
+    cache.companies = null;
+    await refreshStatusStrip();
+    route();
+  } catch { /* surfaced via status warnings on next poll */ }
+  finally { autoRefreshing = false; }
+}
+
 async function refreshStatusStrip() {
   const el = document.getElementById("status-strip");
   try {
     const [st, rg] = await Promise.all([api("/live/status"), api("/live/regime")]);
     cache.status = st; cache.regime = rg;
+    maybeAutoRefresh(st);
     const p = st.datasets.prices;
     const warn = st.warnings.length
       ? `<span class="seg warn" title="${esc(st.warnings.join("\n"))}">⚠ ${st.warnings.length} warning${st.warnings.length > 1 ? "s" : ""}</span>`
@@ -52,6 +103,7 @@ async function refreshStatusStrip() {
       <span class="seg">Prices <strong>${esc(p.latest)}</strong> (${p.staleness_days}d) · ${fmtN(p.rows, 0)} obs · ${p.companies} cos</span>
       <span class="seg">Coverage <strong>${esc(p.coverage)}</strong></span>
       <span class="seg">Provider ${esc(st.provider.split(" ")[0])}</span>
+      ${autoRefreshing ? '<span class="seg" style="color:var(--accent)">⟳ auto-refreshing…</span>' : ""}
       ${warn}
       <span class="seg" style="margin-left:auto"><a href="#/lab/data">data health →</a></span>`;
   } catch (e) {
@@ -147,6 +199,8 @@ const COMMANDS = [
   { label: "Go to Dashboard", k: "gd", run: () => location.hash = "#/dashboard" },
   { label: "Go to Companies", k: "gc", run: () => location.hash = "#/companies" },
   { label: "Go to Portfolio", k: "gp", run: () => location.hash = "#/portfolio" },
+  { label: "Go to Paper Trading", k: "", run: () => location.hash = "#/portfolio/paper" },
+  { label: "Edit Investor Profile & Limits", k: "", run: () => location.hash = "#/portfolio/profile" },
   { label: "Go to Research", k: "gr", run: () => location.hash = "#/research" },
   { label: "Go to Lab", k: "gl", run: () => location.hash = "#/lab" },
   { label: "Refresh live data (staged pipeline)", k: "R", run: openRefreshDrawer },
@@ -337,7 +391,7 @@ function renderDossier(d) {
       <span class="tier ${e.tier}">${e.tier}</span>
       ${e.direction === "shadow" ? '<span class="tier" style="color:var(--serious);border-color:var(--serious)">SHADOW</span>' : ""}
       <strong>${esc(e.engine)}</strong> · ${esc(e.statement)}
-      <span class="sub">(${esc(e.cluster)}, ${signed(e.strength, 2)})</span>
+      <span class="sub">(${esc(human(e.cluster))} · strength ${signed(e.strength, 2)})</span>
       ${e.base_rate ? `<div class="base-rate">📊 [${esc(e.base_rate.registry_ref)}, regime=${esc(e.base_rate.regime)}]
         N<sub>eff</sub>=${e.base_rate.n_eff ?? "?"} (N=${e.base_rate.n}) · hit ${(e.base_rate.hit_rate * 100).toFixed(0)}%
         · median ${signed(e.base_rate.median_excess_pct)}% (net ${signed(e.base_rate.net_median_excess_pct)}%)
@@ -352,7 +406,7 @@ function renderDossier(d) {
         <div class="sub">${d.sizing.recommended_shares} sh · ${fmtN(d.sizing.pct_of_book, 1)}% of book</div></div>
       <div class="tile"><div class="label">Stop distance</div><div class="value">${fmtN(d.sizing.stop_distance_pct, 1)}%</div>
         <div class="sub">risk ${fmtMoney(d.sizing.risk_at_stop)}</div></div>
-      <div class="tile"><div class="label">Binding constraint</div><div class="value" style="font-size:14px">${esc(d.sizing.binding_constraint)}</div></div>
+      <div class="tile"><div class="label">Binding constraint</div><div class="value" style="font-size:14px">${esc(human(d.sizing.binding_constraint))}</div></div>
     </div>
     <div class="score-detail">
       ${Object.entries(d.sizing.working).map(([k, v]) =>
@@ -364,30 +418,40 @@ function renderDossier(d) {
       (statutory ${d.costs_taxes.statutory_pct}% + impact ${d.costs_taxes.impact_estimate_pct}%) ·
       ${esc(d.costs_taxes.applicable_tax)} · breakeven ${d.costs_taxes.breakeven_gross_move_pct}%
       ${d.costs_taxes.ltcg_cliff_note ? "<br>⚠ " + esc(d.costs_taxes.ltcg_cliff_note) : ""}</div>` : "";
+  const executeBtn = (d.synthesis.verdict === "long_candidate" && d.sizing
+    && d.sizing.recommended_shares > 0)
+    ? `<button class="primary" id="paper-exec" data-shares="${d.sizing.recommended_shares}"
+         data-hash="${esc(d.ledger.hash)}">
+         ▶ Execute in paper account (${d.sizing.recommended_shares} sh)</button>
+       <span class="sub" id="paper-exec-msg"></span>` : "";
   return `
     <div class="verdict-banner ${s.verdict}">
-      <span class="verdict ${s.verdict}">${esc(s.verdict.replaceAll("_", " "))}</span>
-      <span>net ${signed(s.net_score, 3)} · ${esc(s.conviction_band)} conviction · dispersion ${s.dispersion}</span>
+      <span class="verdict ${s.verdict}">${esc(human(s.verdict))}</span>
+      <span>net ${signed(s.net_score, 3)} · ${esc(human(s.conviction_band))} conviction · dispersion ${s.dispersion}</span>
       <span class="sub">as of ${esc(d.as_of)} · regime ${esc(d.regime.label)} (context)</span>
+      ${executeBtn}
     </div>
     ${s.dissent.length ? `<div class="breach" style="margin-top:6px">${s.dissent.map(esc).join("<br>")}</div>` : ""}
     <div class="sub" style="margin:6px 0">${s.notes.map(esc).join(" ")}</div>
     <h2 style="margin-top:8px">Cluster scores (uniform provisional weights)</h2>
-    ${clusterBars(s.cluster_scores)}
-    <div class="score-detail" style="margin-top:8px">Confidence ${conf.score} —
-      ${esc(JSON.stringify(conf.components))}<br>${esc(conf.label)}</div>
+    ${clusterBars(Object.fromEntries(Object.entries(s.cluster_scores).map(([k, v]) => [human(k), v])))}
+    <div class="score-detail" style="margin-top:8px">
+      <strong>Confidence ${conf.score}</strong> —
+      ${Object.entries(conf.components).map(([k, v]) =>
+        `<span style="display:inline-block;margin:1px 14px 1px 0">${esc(human(k))}: <strong>${fmtN(v, 2)}</strong></span>`).join("")}
+      <div style="margin-top:3px">${esc(conf.label)}</div></div>
     ${d.trend_value_tension?.inputs?.quadrant
       ? `<div class="breach" style="color:var(--series-3);margin-top:8px">TVT: ${esc(d.trend_value_tension.inputs.quadrant)}</div>` : ""}
     <h2 style="margin-top:12px">Evidence (${d.evidence.length})</h2>${evid}
     ${sizing}
     <h2 style="margin-top:12px">What am I missing?</h2>
     <div class="score-detail">
-      Clusters missing: ${s.coverage.clusters_missing.join(", ") || "none"} ·
+      Evidence groups without data: ${s.coverage.clusters_missing.map(human).join(", ") || "none"} ·
       shadow items: ${d.missing_information.shadow_evidence}<br>
-      Not ingested: ${d.missing_information.not_ingested.join(", ")}<br>
+      Not yet ingested: ${d.missing_information.not_ingested.join(", ")}<br>
       ${esc(d.missing_information.note)}</div>
     <div class="hashline" style="margin-top:8px">Pre-registered: ${esc(d.ledger.hash)} ·
-      claim: ${esc(d.ledger.claim.type)}${d.ledger.claim.stated_probability
+      claim: ${esc(human(d.ledger.claim.type))}${d.ledger.claim.stated_probability
         ? `, P(hit)=${d.ledger.claim.stated_probability}` : ""} ·
       scores after ${esc(d.ledger.claim.score_after)}</div>`;
 }
@@ -473,8 +537,8 @@ async function viewDashboard() {
       </div>
       <div class="panel span12"><h2>Recent ledger activity (pre-registered, hash-chained)</h2>
         ${recent.map(r => `<div class="metric-row" style="cursor:default">
-          <span class="m-label">${esc(r.kind)} · ${esc(r.company?.ticker || r.company || "")} ·
-            ${esc((r.verdict || r.claim_type || "").replaceAll("_", " "))}</span>
+          <span class="m-label">${esc(human(r.kind))} · ${esc(r.company?.ticker || r.company || "")} ·
+            ${esc(human(r.verdict || r.claim_type || ""))}</span>
           <span class="sub">${esc(r.created_at?.slice(0, 16))}</span>
           <span class="hashline">${esc((r.hash || "").slice(0, 12))}</span></div>`).join("")
           || '<div class="sub">Ledger empty — generate a dossier.</div>'}
@@ -659,8 +723,23 @@ async function renderCompanyDossier(body, id) {
   document.getElementById("gen-dossier").addEventListener("click", async (e) => {
     const out = document.getElementById("dossier-out");
     e.target.disabled = true;
-    out.innerHTML = '<div class="loading">Running engines on live data…</div>';
-    try { out.innerHTML = renderDossier(await api(`/live/dossier/${id}`, { method: "POST" })); }
+    out.innerHTML = skeleton(6);
+    try {
+      out.innerHTML = renderDossier(await api(`/live/dossier/${id}`, { method: "POST" }));
+      const exec = out.querySelector("#paper-exec");
+      if (exec) exec.addEventListener("click", async () => {
+        exec.disabled = true;
+        const msg = out.querySelector("#paper-exec-msg");
+        try {
+          const r = await api("/paper/trade", { method: "POST", body: JSON.stringify({
+            company_id: id, side: "buy",
+            quantity: parseInt(exec.dataset.shares),
+            dossier_hash: exec.dataset.hash })});
+          msg.innerHTML = `filled ${r.quantity} @ ₹${fmtN(r.fill_price, 1)} —
+            <a href="#/portfolio/paper">view paper account</a>`;
+        } catch (err) { msg.textContent = err.message; exec.disabled = false; }
+      });
+    }
     catch (err) { out.innerHTML = `<div class="unavail">${esc(err.message)}</div>`; }
     finally { e.target.disabled = false; }
   });
@@ -679,7 +758,7 @@ async function renderCompanyMemory(body, id) {
           || '<div class="sub">No dossiers issued yet for this name.</div>'}
         <h2 style="margin-top:12px">Scored claims (${m.scored_claims.length})</h2>
         ${m.scored_claims.map(s => `<div class="metric-row" style="cursor:default">
-          <span class="m-label">${esc(s.claim_type || "claim")} → realized ${signed(s.realized_excess_pct)}%</span>
+          <span class="m-label">${esc(human(s.claim_type || "claim"))} → realized ${signed(s.realized_excess_pct)}%</span>
           <span class="m-value">${s.hit === null ? (s.wrongful_abstention ? "wrongful abstention" : "abstention ok")
             : (s.hit ? "hit" : "miss")}</span></div>`).join("")
           || '<div class="sub">No claims have reached their horizon yet.</div>'}
@@ -761,20 +840,48 @@ function wireTxnForm(onSaved) {
   });
 }
 
-async function viewPortfolio() {
-  const [p, risk, companies] = await Promise.all([
-    api("/portfolio"), api("/live/portfolio-risk"), getCompanies()]);
+async function viewPortfolio(sub = "real") {
+  const tabs = [["real", "Real Book"], ["paper", "Paper Trading"], ["profile", "Profile & Limits"]];
+  app.innerHTML = `
+    <h1>Portfolio Desk</h1>
+    <div class="tabs">${tabs.map(([k, l]) =>
+      `<button class="${k === sub ? "active" : ""}" data-tab="${k}">${l}</button>`).join("")}</div>
+    <div id="pf-body">${skeleton(5)}</div>`;
+  app.querySelectorAll("[data-tab]").forEach(b =>
+    b.addEventListener("click", () => location.hash = `#/portfolio/${b.dataset.tab}`));
+  const body = document.getElementById("pf-body");
+  if (sub === "paper") return renderPaperDesk(body);
+  if (sub === "profile") return renderProfileEditor(body);
+  return renderRealBook(body);
+}
+
+async function renderRealBook(body) {
+  const [p, risk, companies, txns] = await Promise.all([
+    api("/portfolio"), api("/live/portfolio-risk"), getCompanies(),
+    api("/transactions")]);
+
+  const txnList = txns.length ? `<div class="panel"><h2>Transaction ledger (source of truth)</h2>
+    <div class="tablewrap"><table><thead><tr><th>Date</th><th>Company</th><th>Side</th>
+      <th class="num">Qty</th><th class="num">Price</th><th class="num">Fees</th><th></th></tr></thead>
+      <tbody>${txns.map(t => `<tr><td>${esc(t.trade_date)}</td><td><strong>${esc(t.ticker)}</strong></td>
+        <td><span class="chip ${t.side === "buy" ? "active" : "invalidated"}">${t.side}</span></td>
+        <td class="num">${fmtN(t.quantity, 0)}</td><td class="num">${fmtN(t.price, 2)}</td>
+        <td class="num">${fmtN(t.fees, 2)}</td>
+        <td><button data-deltx="${t.id}" style="font-size:11px">delete</button></td></tr>`).join("")}
+      </tbody></table></div></div>` : "";
 
   if (!p.holdings.length) {
-    app.innerHTML = `
-      <h1>Portfolio Monitor</h1>
-      <div class="panel" style="margin-top:12px">
-        <div class="empty">No transactions recorded yet. Record your first trade below —
-          positions, P&amp;L, XIRR, concentration, correlation and portfolio heat all
-          derive from the transaction ledger.</div>
+    body.innerHTML = `
+      <div class="panel">
+        <div class="empty">No open positions. Record a trade below — positions, P&amp;L, XIRR,
+          concentration, correlation and portfolio heat all derive from the transaction ledger.
+          Prefer risk-free experimentation? Use the <a href="#/portfolio/paper">Paper Trading</a> desk.</div>
       </div>
-      ${txnFormHtml(companies)}`;
-    wireTxnForm(viewPortfolio);
+      ${txnFormHtml(companies)}${txnList}`;
+    wireTxnForm(() => viewPortfolio("real"));
+    body.querySelectorAll("[data-deltx]").forEach(b => b.addEventListener("click", async () => {
+      await api(`/transactions/${b.dataset.deltx}`, { method: "DELETE" }); viewPortfolio("real");
+    }));
     return;
   }
 
@@ -813,9 +920,9 @@ async function viewPortfolio() {
     </div>` : `<div class="panel"><div class="sub">${esc(risk.note || "No open positions.")}</div></div>`;
 
   const x = p.xirr || {};
-  app.innerHTML = `
-    <h1>Portfolio Monitor <span class="sub">as of ${esc(p.as_of)} · derived from the transaction ledger</span></h1>
-    <div class="tiles" style="margin-top:10px">
+  body.innerHTML = `
+    <div class="sub" style="margin-bottom:8px">As of ${esc(p.as_of)} · derived from the transaction ledger</div>
+    <div class="tiles">
       <div class="tile"><div class="label">Value</div><div class="value">${fmtMoney(p.total_value)}</div></div>
       <div class="tile"><div class="label">Invested</div><div class="value">${fmtMoney(p.total_invested)}</div></div>
       <div class="tile"><div class="label">Unrealized</div><div class="value ${p.unrealized_pnl >= 0 ? "pos" : "neg"}">${fmtMoney(p.unrealized_pnl)}</div></div>
@@ -839,12 +946,191 @@ async function viewPortfolio() {
         ${hbars(p.concentration.by_quality_tier, (k) => "q-" + k)}
         <div class="sub" style="margin-top:6px">Capital in fundamentally fragile businesses — the axis most tools omit.</div></div>
     </div>
-    ${txnFormHtml(companies)}
+    ${txnFormHtml(companies)}${txnList}
     <div class="panel">${aiBlock("pfnarrate", "Brief me on this book (grounded)")}</div>`;
-  app.querySelectorAll("tr[data-company]").forEach(tr =>
+  body.querySelectorAll("tr[data-company]").forEach(tr =>
     tr.addEventListener("click", () => location.hash = `#/companies/${tr.dataset.company}`));
-  wireTxnForm(viewPortfolio);
-  wireAi(app, { pfnarrate: () => api("/ai/narrate/portfolio", { method: "POST" }) });
+  wireTxnForm(() => viewPortfolio("real"));
+  body.querySelectorAll("[data-deltx]").forEach(b => b.addEventListener("click", async () => {
+    await api(`/transactions/${b.dataset.deltx}`, { method: "DELETE" }); viewPortfolio("real");
+  }));
+  wireAi(body, { pfnarrate: () => api("/ai/narrate/portfolio", { method: "POST" }) });
+}
+
+/* --------------------------------------------------------- paper trading */
+
+function equityChart(curve, benchmark) {
+  if (!curve || curve.length < 2) return "";
+  const vals = curve.map(p => p.equity);
+  const min = Math.min(...vals), max = Math.max(...vals), range = max - min || 1;
+  const W = 900, H = 130, PAD = 4, step = (W - 2 * PAD) / (vals.length - 1);
+  const xy = vals.map((v, i) => [PAD + i * step, H - PAD - ((v - min) / range) * (H - 2 * PAD)]);
+  const poly = xy.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const area = `${PAD},${H} ${poly} ${xy[xy.length - 1][0].toFixed(1)},${H}`;
+  return `<div class="spark" style="padding:10px 12px 6px">
+    <div class="t">Account equity — ${esc(curve[0].date)} → ${esc(curve[curve.length - 1].date)}</div>
+    <div class="v">${fmtMoney(vals[vals.length - 1])}
+      <span class="sub" style="font-weight:400">· window ${fmtMoney(min)} – ${fmtMoney(max)}</span></div>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:110px">
+      <polygon class="area" points="${area}"></polygon>
+      <polyline class="line" points="${poly}"></polyline>
+    </svg></div>`;
+}
+
+async function renderPaperDesk(body) {
+  const [a, companies] = await Promise.all([api("/paper"), getCompanies()]);
+  const opts = companies.map(c => `<option value="${c.id}" data-price="${c.price}">${esc(c.ticker)} — ${esc(c.name)}</option>`).join("");
+  const alpha = a.alpha_pct;
+  body.innerHTML = `
+    <div class="sub" style="margin-bottom:8px">Virtual account opened ${esc(a.opened)} ·
+      fills at the latest EOD close · every fill is hash-chain registered and can link to the
+      dossier that motivated it — this is the platform's live validation loop.</div>
+    <div class="tiles">
+      <div class="tile"><div class="label">Equity</div><div class="value">${fmtMoney(a.equity)}</div></div>
+      <div class="tile"><div class="label">Cash</div><div class="value">${fmtMoney(a.cash)}</div></div>
+      <div class="tile"><div class="label">Positions</div><div class="value">${fmtMoney(a.positions_value)}</div></div>
+      <div class="tile"><div class="label">Total return</div>
+        <div class="value ${(a.total_return_pct ?? 0) >= 0 ? "pos" : "neg"}">${signed(a.total_return_pct)}%</div></div>
+      <div class="tile"><div class="label">Alpha vs NIFTY</div>
+        <div class="value ${(alpha ?? 0) >= 0 ? "pos" : "neg"}">${alpha == null ? "—" : signed(alpha) + "%"}</div>
+        <div class="sub">${a.benchmark ? "same cashflows in NIFTY: " + signed(a.benchmark.total_return_pct) + "%" : "trade to activate"}</div></div>
+    </div>
+    ${a.curve ? `<div class="panel">${equityChart(a.curve, a.benchmark)}
+      ${a.alpha_note ? `<div class="sub" style="margin-top:8px">${esc(a.alpha_note)}</div>` : ""}</div>` : ""}
+    <div class="grid2">
+      <div class="panel"><h2>Open positions</h2>
+        ${a.positions.length ? `<div class="tablewrap"><table><thead><tr><th>Company</th>
+          <th class="num">Qty</th><th class="num">Avg</th><th class="num">Price</th>
+          <th class="num">Value</th><th class="num">Unrealized</th><th></th></tr></thead><tbody>
+          ${a.positions.map(p => `<tr><td><strong>${esc(p.ticker)}</strong>
+            <div class="sub">${esc(p.sector)}</div></td>
+            <td class="num">${fmtN(p.quantity, 0)}</td><td class="num">${fmtN(p.avg_cost, 1)}</td>
+            <td class="num">${fmtN(p.price, 1)}</td><td class="num">${fmtMoney(p.value)}</td>
+            <td class="num" style="color:${p.unrealized_pnl >= 0 ? "var(--good-text)" : "var(--critical)"}">${fmtMoney(p.unrealized_pnl)}</td>
+            <td><button data-close="${p.company_id}" data-qty="${p.quantity}" style="font-size:11px">close</button></td>
+          </tr>`).join("")}</tbody></table></div>`
+          : '<div class="empty">No open paper positions — place a trade, or execute a dossier\'s sizing directly from any company\'s Dossier tab.</div>'}
+      </div>
+      <div class="panel"><h2>Place paper trade</h2>
+        <div class="frm">
+          <div><label>Company</label><select id="pp-company">${opts}</select></div>
+          <div><label>Side</label><select id="pp-side"><option value="buy">Buy</option><option value="sell">Sell</option></select></div>
+          <div><label>Quantity</label><input id="pp-qty" type="number" min="1" step="1" placeholder="10"></div>
+        </div>
+        <div class="sub" id="pp-price-hint" style="margin-bottom:8px"></div>
+        <button class="primary" id="pp-save">Execute at last close</button>
+        <div id="pp-msg" class="sub" style="margin-top:6px"></div>
+        <h2 style="margin-top:16px">Account</h2>
+        <div class="frm"><div><label>Reset with starting cash (₹)</label>
+          <input id="pp-cash" type="number" value="1000000" step="10000"></div></div>
+        <button id="pp-reset">Reset paper account</button>
+        <span class="sub" style="margin-left:8px">wipes fills; the ledger record of the reset remains</span>
+      </div>
+    </div>
+    <div class="panel"><h2>Fill history (${a.trades.length})</h2>
+      ${a.trades.length ? `<div class="tablewrap"><table><thead><tr><th>Date</th><th>Company</th>
+        <th>Side</th><th class="num">Qty</th><th class="num">Fill</th><th>From dossier</th></tr></thead><tbody>
+        ${a.trades.map(t => `<tr><td>${esc(t.date)}</td><td><strong>${esc(t.ticker)}</strong></td>
+          <td><span class="chip ${t.side === "buy" ? "active" : "invalidated"}">${t.side}</span></td>
+          <td class="num">${fmtN(t.quantity, 0)}</td><td class="num">${fmtN(t.price, 1)}</td>
+          <td class="hashline">${esc(t.from_dossier || "manual")}</td></tr>`).join("")}
+        </tbody></table></div>` : '<div class="empty">No fills yet.</div>'}
+    </div>`;
+
+  const hint = () => {
+    const sel = document.getElementById("pp-company");
+    const price = sel.selectedOptions[0]?.dataset.price;
+    const qty = parseFloat(document.getElementById("pp-qty").value) || 0;
+    document.getElementById("pp-price-hint").textContent =
+      price ? `Last close ₹${fmtN(parseFloat(price), 1)}` +
+        (qty ? ` · order value ≈ ${fmtMoney(qty * parseFloat(price))}` : "") : "";
+  };
+  document.getElementById("pp-company").addEventListener("change", hint);
+  document.getElementById("pp-qty").addEventListener("input", hint);
+  hint();
+
+  document.getElementById("pp-save").addEventListener("click", async () => {
+    const msg = document.getElementById("pp-msg");
+    try {
+      const r = await api("/paper/trade", { method: "POST", body: JSON.stringify({
+        company_id: parseInt(document.getElementById("pp-company").value),
+        side: document.getElementById("pp-side").value,
+        quantity: parseFloat(document.getElementById("pp-qty").value),
+      })});
+      msg.textContent = `Filled: ${r.side} ${r.quantity} ${r.ticker} @ ₹${fmtN(r.fill_price, 1)}`;
+      viewPortfolio("paper");
+    } catch (e) { msg.textContent = "Rejected: " + e.message; }
+  });
+  body.querySelectorAll("[data-close]").forEach(b => b.addEventListener("click", async () => {
+    await api("/paper/trade", { method: "POST", body: JSON.stringify({
+      company_id: parseInt(b.dataset.close), side: "sell",
+      quantity: parseFloat(b.dataset.qty) })});
+    viewPortfolio("paper");
+  }));
+  document.getElementById("pp-reset").addEventListener("click", async (e) => {
+    if (!confirm("Reset the paper account? All fills are wiped (the ledger keeps the reset record).")) return;
+    await api("/paper/reset", { method: "POST", body: JSON.stringify({
+      starting_cash: parseFloat(document.getElementById("pp-cash").value) || 1000000 })});
+    viewPortfolio("paper");
+  });
+}
+
+/* ------------------------------------------------------- profile editor */
+
+async function renderProfileEditor(body) {
+  const p = await api("/profile");
+  const sel = (id, options, current) => `<select id="${id}">${options.map(o =>
+    `<option value="${o}" ${o === current ? "selected" : ""}>${human(o)}</option>`).join("")}</select>`;
+  const num = (id, val, step = 1) => `<input id="${id}" type="number" value="${val}" step="${step}">`;
+  body.innerHTML = `
+    <div class="sub" style="margin-bottom:8px">Your stated policy — it drives dashboard ordering,
+      the lens system, sizing limits and rule-breach diagnostics. Changes apply immediately.</div>
+    <div class="panel"><h2>Investor profile</h2>
+      <div class="frm">
+        <div><label>Horizon</label>${sel("pr-horizon", ["short", "medium", "long"], p.horizon)}</div>
+        <div><label>Risk tolerance</label>${sel("pr-risk", ["conservative", "moderate", "aggressive"], p.risk_tolerance)}</div>
+        <div><label>Style (0 value ↔ 100 growth)</label>${num("pr-style", p.style)}</div>
+        <div><label>Dividend preference (0–100)</label>${num("pr-div", p.dividend_preference)}</div>
+        <div><label>Quality emphasis (0–100)</label>${num("pr-qual", p.quality_emphasis)}</div>
+        <div><label>Preferred lens</label>${sel("pr-lens", ["balanced", "quality_first", "growth_first", "income_first", "value_first"], p.preferred_lens)}</div>
+      </div>
+      <h2 style="margin-top:14px">Hard limits (drive breach diagnostics & sizing)</h2>
+      <div class="frm">
+        <div><label>Max single position %</label>${num("pr-maxpos", p.max_position_pct, 0.5)}</div>
+        <div><label>Max sector %</label>${num("pr-maxsec", p.max_sector_pct, 1)}</div>
+        <div><label>Max acceptable drawdown %</label>${num("pr-maxdd", p.max_drawdown_pct, 1)}</div>
+      </div>
+      <h2 style="margin-top:14px">Sector preferences</h2>
+      <div class="frm">
+        <div><label>Prefer (comma-separated)</label><input id="pr-prefs" value="${esc(p.sector_preferences.join(", "))}"></div>
+        <div><label>Exclude (comma-separated)</label><input id="pr-excl" value="${esc(p.sector_exclusions.join(", "))}"></div>
+      </div>
+      <h2 style="margin-top:14px">Written investment rules</h2>
+      <textarea id="pr-rules" rows="4">${esc(p.rules.join("\n"))}</textarea>
+      <div style="margin-top:10px"><button class="primary" id="pr-save">Save profile</button>
+        <span class="sub" id="pr-msg" style="margin-left:10px"></span></div>
+    </div>`;
+  document.getElementById("pr-save").addEventListener("click", async () => {
+    const msg = document.getElementById("pr-msg");
+    try {
+      await api("/profile", { method: "PUT", body: JSON.stringify({
+        horizon: document.getElementById("pr-horizon").value,
+        risk_tolerance: document.getElementById("pr-risk").value,
+        style: parseFloat(document.getElementById("pr-style").value),
+        dividend_preference: parseFloat(document.getElementById("pr-div").value),
+        quality_emphasis: parseFloat(document.getElementById("pr-qual").value),
+        preferred_lens: document.getElementById("pr-lens").value,
+        max_position_pct: parseFloat(document.getElementById("pr-maxpos").value),
+        max_sector_pct: parseFloat(document.getElementById("pr-maxsec").value),
+        max_drawdown_pct: parseFloat(document.getElementById("pr-maxdd").value),
+        sector_preferences: document.getElementById("pr-prefs").value.split(",").map(s => s.trim()).filter(Boolean),
+        sector_exclusions: document.getElementById("pr-excl").value.split(",").map(s => s.trim()).filter(Boolean),
+        rules: document.getElementById("pr-rules").value.split("\n").filter(Boolean),
+      })});
+      msg.textContent = "Saved — rankings and limits updated.";
+      document.getElementById("lens").value = document.getElementById("pr-lens").value;
+    } catch (e) { msg.textContent = "Rejected: " + e.message; }
+  });
 }
 
 /* ============================================================= research */
@@ -995,8 +1281,16 @@ async function viewLab(section = "hypotheses") {
       try {
         const r = await api("/live/reg001", { method: "POST" });
         out.innerHTML = `<div class="score-detail" style="margin-top:8px">
-          <strong>Verdict: ${esc(r.verdict)}</strong> — ${esc(r.consequence || "")}<br>
-          ${esc(JSON.stringify(r, null, 1))}</div>`;
+          <strong>Verdict: ${esc(human(r.verdict))}</strong> — ${esc(r.consequence || "")}<br>
+          Out-of-sample Brier: unconditional ${r.brier_unconditional_oos} vs
+          regime-conditioned ${r.brier_conditional_oos}
+          (improvement ${signed(r.improvement, 5)})<br>
+          Training hit rates: overall ${(r.train_hit_rate_unconditional * 100).toFixed(1)}%
+          ${Object.entries(r.train_hit_rate_by_regime || {}).map(([k, v]) =>
+            `· ${esc(human(k))} ${(v * 100).toFixed(1)}%`).join(" ")}<br>
+          Episodes: ${r.train_episodes} train / ${r.test_episodes} test
+          (effective test sample ${r.test_n_eff})<br>
+          <span class="sub">${(r.caveats || []).map(esc).join(" · ")}</span></div>`;
       } catch (err) { out.innerHTML = `<div class="unavail">${esc(err.message)}</div>`; }
       finally { e.target.disabled = false; }
     });
@@ -1028,15 +1322,18 @@ async function viewLab(section = "hypotheses") {
     body.innerHTML = `
       <div class="grid2">
         <div class="panel"><h2>Calibration ledger</h2>
-          <div class="score-detail">${esc(JSON.stringify(cal, null, 1))}</div>
+          ${Object.entries(cal).filter(([k]) => k !== "note").map(([k, v]) =>
+            `<div class="metric-row" style="cursor:default"><span class="m-label">${esc(human(k))}</span>
+             <span class="m-value">${typeof v === "number" ? fmtN(v, 3) : esc(v)}</span></div>`).join("")}
+          <div class="sub" style="margin-top:6px">${esc(cal.note || "")}</div>
           <div style="margin-top:8px"><button class="primary" id="score-claims">Score due claims</button></div>
         </div>
         <div class="panel"><h2>Decision ledger (hash-chained, append-only)</h2>
           <div class="hashline">Chain: ${led.chain.intact ? "✓ intact" : "⚠ BROKEN"} · ${led.chain.records ?? 0} records</div>
           <div style="margin-top:8px">${led.records.slice(-20).reverse().map(r => `
             <div class="metric-row" style="cursor:default">
-              <span class="m-label">${esc(r.kind)} · ${esc(r.company?.ticker || r.company || "")}
-                · ${esc((r.verdict || r.claim_type || "").replaceAll("_", " "))}</span>
+              <span class="m-label">${esc(human(r.kind))} · ${esc(r.company?.ticker || r.company || "")}
+                · ${esc(human(r.verdict || r.claim_type || ""))}</span>
               <span class="sub">${esc((r.created_at || "").slice(0, 16))}</span>
               <span class="hashline">${esc((r.hash || "").slice(0, 12))}</span></div>`).join("")}</div>
         </div>
@@ -1095,7 +1392,7 @@ async function route() {
   try {
     if (name === "companies" && arg) await viewCompanyDetail(parseInt(arg), sub || "overview");
     else if (name === "companies") await viewCompanies();
-    else if (name === "portfolio") await viewPortfolio();
+    else if (name === "portfolio") await viewPortfolio(arg || "real");
     else if (name === "research") await viewResearch();
     else if (name === "lab") await viewLab(arg || "hypotheses");
     else await viewDashboard();

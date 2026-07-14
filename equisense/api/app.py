@@ -263,6 +263,48 @@ def add_transaction(t: TransactionIn, s: Session = Depends(db)):
     return {"id": row.id}
 
 
+@app.delete("/api/transactions/{txn_id}", status_code=204)
+def delete_transaction(txn_id: int, s: Session = Depends(db)):
+    row = s.get(TransactionRow, txn_id)
+    if row:
+        s.delete(row)
+        s.commit()
+
+
+# ------------------------------------------------------------ paper trading
+
+class PaperTradeIn(BaseModel):
+    company_id: int
+    side: str = Field(pattern="^(buy|sell)$")
+    quantity: float = Field(gt=0)
+    dossier_hash: Optional[str] = None
+
+
+class PaperResetIn(BaseModel):
+    starting_cash: float = Field(1_000_000.0, gt=0)
+
+
+@app.get("/api/paper")
+def paper_account(s: Session = Depends(db)):
+    from .paper import account
+    return account(s)
+
+
+@app.post("/api/paper/trade", status_code=201)
+def paper_trade(t: PaperTradeIn, s: Session = Depends(db)):
+    from .paper import place_trade
+    try:
+        return place_trade(s, t.company_id, t.side, t.quantity, t.dossier_hash)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.post("/api/paper/reset")
+def paper_reset(r: PaperResetIn, s: Session = Depends(db)):
+    from .paper import reset_account
+    return reset_account(s, r.starting_cash)
+
+
 # ------------------------------------------------------------------- theses
 
 def _thesis_dict(t: Thesis, ticker: str) -> dict:

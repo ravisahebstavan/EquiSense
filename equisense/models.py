@@ -163,6 +163,21 @@ class TransactionRow(Base):
     fees: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+class PaperTrade(Base):
+    """Paper-trading account fills (the live validation loop): executed at the
+    latest EOD close, optionally linked to the dossier that motivated them —
+    every fill is also pre-registered in the hash-chained ledger."""
+    __tablename__ = "paper_trades"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
+    side: Mapped[str] = mapped_column(String(4))          # buy | sell
+    quantity: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)           # fill = latest EOD close
+    trade_date: Mapped[date] = mapped_column(Date)
+    dossier_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Thesis(Base):
     """Structured, falsifiable thesis (§23.1) with lifecycle (§23.2)."""
     __tablename__ = "theses"
