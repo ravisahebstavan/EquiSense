@@ -9,15 +9,24 @@ its reasoning attached, executable in the paper account at real prices.
 """
 from __future__ import annotations
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..engine.evidence import Evidence, ev, xsec_strength
 from ..engine.sizing import SizingInputs, cost_tax_breakeven, recommend_size
 from ..engine.synthesis import synthesize
+from ..models import PriceObservation
 from ..research.base_rates import get_base_rate
 from ..research.learning import cluster_weights
-from .live import current_regime, universe_signals
+from .live import _corr, current_regime, universe_signals
 from .snapshot import get_universe
+
+# Naive/risk-parity-style concentration heuristic: two names correlated above
+# this on trailing daily returns are treated as one bet, not two — a common
+# threshold in practitioner diversification rules (e.g. Qian's risk-budgeting
+# literature uses similar cutoffs for "effectively duplicate" positions).
+CORRELATION_GATE_THRESHOLD = 0.75
+CORRELATION_LOOKBACK_DAYS = 70
 
 # signal key → (engine, family, cluster, invert, label template)
 SIGNAL_EVIDENCE = [
@@ -26,6 +35,8 @@ SIGNAL_EVIDENCE = [
     ("trend", "technical", "technical.trend", "trend", False, "price {v:+.1f}% vs 200-day average"),
     ("rel_strength", "technical", "technical.trend", "trend", False, "relative strength vs NIFTY {v:+.1f}%"),
     ("mqi", "novel", "novel.mqi", "trend", False, "Momentum Quality {v:+.2f}"),
+    ("sector_rel_mom", "technical", "technical.sector_momentum", "trend", False,
+     "{v:+.1f}pp vs own sector (63d, Moskowitz-Grinblatt)"),
     ("pe_pctile", "novel", "novel.value", "value", True, "P/E at {v:.0f}th percentile of own history"),
     ("exp_gap", "valuation", "valuation.expectations", "value", True, "Expectations Gap {v:+.1f}pp"),
     ("f_score", "quality", "quality.fscore", "quality", False, "Piotroski F {v:.0f}/9"),
@@ -33,8 +44,14 @@ SIGNAL_EVIDENCE = [
     ("ccs", "novel", "novel.ccs", "quality", False, "Cash Conviction {v:.0f}/100"),
     ("fragility", "novel", "novel.fragility", "risk", True, "Fragility {v:.0f}/100"),
     ("heat", "novel", "novel.crowding", "flow", True, "Participation Heat {v:.2f}"),
+    ("max_effect", "behavioral", "behavioral.max_effect", "flow", False,
+     "MAX-effect score {v:+.2f} (low recent extremity, Bali-Cakici-Whitelaw)"),
     ("vol", "risk", "risk.volatility", "risk", True, "realized vol {v:.1f}%"),
 ]
+
+# keys whose base rate comes from a registered study (looked up via br_cache)
+_BASE_RATE_KEYS = {"momentum": "momentum", "mqi": "mqi",
+                   "sector_rel_mom": "sector_rel_mom", "max_effect": "max_effect"}
 
 
 def evidence_from_snapshot(item: dict, sigs: dict, regime_key: str,
@@ -46,14 +63,63 @@ def evidence_from_snapshot(item: dict, sigs: dict, regime_key: str,
         strength = xsec_strength(sigs[key], t, invert=invert)
         if strength is None or raw is None:
             continue
-        base_rate = None
-        if key == "momentum":
-            base_rate = br_cache.get("momentum")
-        elif key == "mqi":
-            base_rate = br_cache.get("mqi")
+        base_rate = br_cache.get(_BASE_RATE_KEYS.get(key, ""))
         out.append(ev(engine, family, cluster, strength,
                       tmpl.format(v=raw), [], base_rate=base_rate))
     return [e for e in out if e is not None]
+
+
+def _fetch_return_series(session: Session, company_ids: list[int],
+                         days: int = CORRELATION_LOOKBACK_DAYS) -> dict[int, list[float]]:
+    """Light bulk fetch — only for the handful of names that already cleared
+    every other gate, never the full universe."""
+    if not company_ids:
+        return {}
+    rows = session.execute(
+        select(PriceObservation.company_id, PriceObservation.obs_date,
+               PriceObservation.close)
+        .where(PriceObservation.company_id.in_(company_ids))
+        .order_by(PriceObservation.company_id, PriceObservation.obs_date)).all()
+    closes: dict[int, list[float]] = {}
+    for cid, _d, c in rows:
+        closes.setdefault(cid, []).append(c)
+    out: dict[int, list[float]] = {}
+    for cid, cl in closes.items():
+        cl = cl[-days:]
+        if len(cl) >= 20:
+            out[cid] = [cl[i] / cl[i - 1] - 1 for i in range(1, len(cl)) if cl[i - 1]]
+    if not out:
+        return out
+    n = min(len(v) for v in out.values())  # equal-length series for _corr
+    return {cid: v[-n:] for cid, v in out.items()}
+
+
+def _apply_diversification_gate(session: Session, candidates: list[dict]) -> None:
+    """Greedy, rank-respecting: walk candidates in priority order; the first
+    occurrence of a correlated cluster stays tradable, later ones are failed
+    with the specific name and correlation shown — never a silent drop."""
+    tradable_ids = [c["id"] for c in candidates if c["tradable"]][:15]
+    if len(tradable_ids) < 2:
+        return
+    rets = _fetch_return_series(session, tradable_ids)
+    ticker_by_id = {c["id"]: c["ticker"] for c in candidates}
+    selected: list[int] = []
+    for c in candidates:
+        if not c["tradable"] or c["id"] not in rets:
+            continue
+        worst_corr, worst_with = 0.0, None
+        for sid in selected:
+            corr = _corr(rets[c["id"]], rets[sid])
+            if corr is not None and corr > worst_corr:
+                worst_corr, worst_with = corr, sid
+        if worst_with is not None and worst_corr > CORRELATION_GATE_THRESHOLD:
+            c["gates"].append(
+                f"failed: concentration — {worst_corr:.2f} correlated (63d daily "
+                f"returns) with higher-ranked {ticker_by_id[worst_with]}, already "
+                "prioritized; taking both is one bet twice-sized, not two bets")
+            c["tradable"] = False
+        else:
+            selected.append(c["id"])
 
 
 def qualified_candidates(session: Session, top_n: int = 8,
@@ -66,6 +132,9 @@ def qualified_candidates(session: Session, top_n: int = 8,
     br_cache = {
         "momentum": get_base_rate(session, "momentum_12_1_top_quintile", 126, rk),
         "mqi": get_base_rate(session, "momentum_quality_top_quintile", 126, rk),
+        "sector_rel_mom": get_base_rate(session, "sector_relative_momentum_top_quintile",
+                                        126, rk),
+        "max_effect": get_base_rate(session, "low_max_effect_top_quintile", 63, rk),
     }
     weights, weights_status = cluster_weights()
 
@@ -129,6 +198,9 @@ def qualified_candidates(session: Session, top_n: int = 8,
         })
 
     candidates.sort(key=lambda c: (-c["tradable"], -c["net_score"]))
+    _apply_diversification_gate(session, candidates)
+    candidates.sort(key=lambda c: (-c["tradable"], -c["net_score"]))  # re-sort post-gate
+
     return {
         "as_of": universe.get("as_of"),
         "regime": regime["label"],
@@ -139,7 +211,9 @@ def qualified_candidates(session: Session, top_n: int = 8,
         "discipline_note": (
             f"{scanned} companies scanned; {verdicts['abstain']} abstained — "
             "abstention is the modal, correct output. Candidates shown cleared "
-            "synthesis + liquidity + cost gates and are sized for the paper "
-            "account at real, executable prices. Every gate and every driver "
-            "is shown; nothing is a black box."),
+            "synthesis + liquidity + cost gates, a "
+            f"{CORRELATION_GATE_THRESHOLD:.0%} concentration gate (correlated "
+            "picks are flagged and demoted, never silently both taken), and "
+            "are sized for the paper account at real, executable prices. Every "
+            "gate and every driver is shown; nothing is a black box."),
     }

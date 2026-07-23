@@ -546,8 +546,11 @@ def live_base_rates(s: Session = Depends(db)):
             "records": [{
                 "study_key": r.study_key, "registry_ref": r.registry_ref,
                 "regime": r.regime_filter, "horizon_days": r.horizon_days,
-                "n": r.n, "hit_rate": round(r.hit_rate, 3),
+                "n": r.n, "n_eff": r.n_eff, "hit_rate": round(r.hit_rate, 3),
                 "median_excess_pct": round(r.median_excess_pct, 2),
+                "net_median_excess_pct": None if r.net_median_excess_pct is None
+                else round(r.net_median_excess_pct, 2),
+                "cohort_breadth_pct": r.cohort_breadth_pct,
                 "ci95": None if r.median_ci95_lo_pct is None else f"{r.median_ci95_lo_pct}, {r.median_ci95_hi_pct}",
                 "iqr": [round(r.q25_excess_pct, 2), round(r.q75_excess_pct, 2)],
                 "computed_at": r.computed_at.isoformat(),

@@ -62,7 +62,7 @@ _SIG_CACHE: dict = {"key": None, "signals": None}
 
 SIGNAL_KEYS = ["momentum", "dist_52w", "trend", "rel_strength", "mqi", "vol",
                "heat", "f_score", "z_score", "ccs", "fragility", "exp_gap",
-               "pe_pctile"]
+               "pe_pctile", "sector_rel_mom", "max_effect"]
 
 
 def universe_signals(session: Session) -> dict[str, dict[str, Optional[float]]]:
@@ -170,6 +170,20 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                 f"Momentum Quality Index {mqi.value:+.2f}" if mqi.value is not None else "",
                 [mqi], base_rate=get_base_rate(session, "momentum_quality_top_quintile",
                                                126, regime_key)))
+    srm = sig["sector_rel_mom"].get(t)
+    if srm is not None:
+        from ..engine.types import Metric
+        srm_m = Metric(key="sector_rel_momentum", label="63d Return vs Own Sector",
+                       value=srm, unit="pp",
+                       formula=f"Company 63d return minus {company.sector} sector's "
+                               f"mean 63d return",
+                       inputs={"sector": company.sector}, period=period, family="technical",
+                       caveat="Moskowitz & Grinblatt (1999), J. Finance — distinct from, "
+                              "not a restatement of, NIFTY-relative momentum above.")
+        E.append(ev("technical", "technical.sector_momentum", "trend", S("sector_rel_mom"),
+                    f"{srm:+.1f}pp vs {company.sector} sector (63d)", [srm_m],
+                    base_rate=get_base_rate(session, "sector_relative_momentum_top_quintile",
+                                            126, regime_key)))
 
     # ---- value cluster ----
     pe_pct = novel.pe_percentile_vs_history(closes, dates, stmts, period)
@@ -217,6 +231,22 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                     f"Participation Heat {heat.value:.2f}", [heat],
                     base_rate=get_base_rate(session, "participation_heat_top_decile",
                                             21, regime_key) if heat.value > 4 else None))
+    max5 = sig["max_effect"].get(t)
+    if max5 is not None:
+        from ..engine.types import Metric
+        max_m = Metric(key="max_effect", label="Lottery-Demand (MAX) Score",
+                       value=max5, unit="score",
+                       formula="Negated mean of the 5 highest daily returns in the "
+                               "trailing 21 sessions — higher score = lower recent "
+                               "single-day extremity",
+                       inputs={}, period=period, family="behavioral",
+                       caveat="Bali, Cakici & Whitelaw (2011), J. Financial Economics — "
+                              "extreme recent daily upside attracts lottery-seeking "
+                              "demand and has historically preceded underperformance.")
+        E.append(ev("behavioral", "behavioral.max_effect", "flow", S("max_effect"),
+                    f"MAX-effect score {max5:+.2f} (low recent single-day extremity)",
+                    [max_m], base_rate=get_base_rate(session, "low_max_effect_top_quintile",
+                                                     63, regime_key)))
 
     # ---- risk cluster ----
     vol = technical.realized_vol(closes, period=period)

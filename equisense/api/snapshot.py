@@ -22,7 +22,7 @@ from ..models import (AppSnapshot, Company, FilingPeriod, MacroObservation,
                       PriceObservation)
 
 UNIVERSE_KEY = "universe"
-SNAP_VERSION = 3  # bump when the item schema changes → forces a rebuild
+SNAP_VERSION = 4  # bump when the item schema changes → forces a rebuild
 
 
 def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list]]:
@@ -74,6 +74,24 @@ def _r(v, d=2):
     return None if v is None else round(v, d)
 
 
+def _ret_n(closes: list[float], n: int) -> Optional[float]:
+    if len(closes) < n + 1 or not closes[-n - 1]:
+        return None
+    return closes[-1] / closes[-n - 1] - 1
+
+
+def _max5_21d(closes: list[float]) -> Optional[float]:
+    """Mean of the top-5 daily returns in the trailing 21 sessions — the raw
+    MAX-effect input (Bali, Cakici & Whitelaw 2011); see research/base_rates.py."""
+    window = closes[-21:]
+    if len(window) < 15:
+        return None
+    daily = [window[i] / window[i - 1] - 1 for i in range(1, len(window)) if window[i - 1]]
+    if len(daily) < 5:
+        return None
+    return sum(sorted(daily)[-5:]) / 5
+
+
 def build_universe_snapshot(session: Session) -> dict:
     """The one heavy pass: 3 bulk queries + pure CPU. Runs at refresh time."""
     companies = session.scalars(select(Company)).all()
@@ -82,12 +100,15 @@ def build_universe_snapshot(session: Session) -> dict:
     nifty = _nifty(session)
 
     items = []
+    ret63_by_ticker: dict[str, Optional[float]] = {}
     for c in companies:
         dates, closes, volumes = prices.get(c.id, ([], [], []))
         if len(closes) < 60:
             continue
         stmts = statements.get(c.id, [])
         price = closes[-1]
+        max5 = _max5_21d(closes)
+        ret63_by_ticker[c.ticker] = _ret_n(closes, 63)
         sig: dict[str, Optional[float]] = {
             "momentum": _r(technical.momentum_12_1(closes).value),
             "dist_52w": _r(technical.pct_from_52w_high(closes).value),
@@ -96,6 +117,8 @@ def build_universe_snapshot(session: Session) -> dict:
             "mqi": _r(novel.momentum_quality(closes).value),
             "vol": _r(technical.realized_vol(closes).value),
             "heat": _r(novel.crowding_proxy(closes, volumes).value),
+            "max_effect": None if max5 is None else _r(-max5 * 100),  # negated: low actual MAX scores high
+            "sector_rel_mom": None,  # filled below, needs the full cross-section first
             "f_score": None, "z_score": None, "z_zone": None, "ccs": None,
             "fragility": None, "exp_gap": None, "pe_pctile": None,
             "revenue_cagr_pct": None, "roic_pct": None, "pe": None,
@@ -140,6 +163,21 @@ def build_universe_snapshot(session: Session) -> dict:
             "spark": [round(v, 1) for v in window[::step]][-40:],
             "signals": sig,
         })
+
+    # Sector-relative momentum (Moskowitz & Grinblatt 1999) needs the full
+    # cross-section's 63d returns before each company's sector average is known.
+    from collections import defaultdict
+    sector_rets: dict[str, list[float]] = defaultdict(list)
+    for item in items:
+        r = ret63_by_ticker.get(item["ticker"])
+        if r is not None:
+            sector_rets[item["sector"]].append(r)
+    sector_avg = {s: sum(v) / len(v) for s, v in sector_rets.items() if v}
+    for item in items:
+        r = ret63_by_ticker.get(item["ticker"])
+        avg = sector_avg.get(item["sector"])
+        if r is not None and avg is not None:
+            item["signals"]["sector_rel_mom"] = round((r - avg) * 100, 2)
 
     as_of = max((prices[cid][0][-1] for cid in prices), default=None)
     snap = {"as_of": str(as_of), "version": SNAP_VERSION,

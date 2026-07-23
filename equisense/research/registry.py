@@ -32,6 +32,8 @@ FAMILY_HYPOTHESIS: dict[str, str] = {
     "novel.fragility": "HYP-006",
     "novel.crowding": "HYP-007",
     "technical.vol": "HYP-008",
+    "technical.sector_momentum": "HYP-010",
+    "behavioral.max_effect": "HYP-011",
 }
 
 DEFAULT_UNVALIDATED_CAP = 0.25
@@ -152,6 +154,36 @@ REGISTRY: dict[str, dict] = {
                       "as the price-only leg of the Fragility hypothesis.",
         "spec": "Monthly: bottom quintile of 126d realized vol; forward 126d excess "
                 "vs universe median.",
+        "status": "registered",
+    },
+    "HYP-010": {
+        "name": "sector_relative_momentum_top_quintile",
+        "family": "technical.sector_momentum",
+        "motivation": "Moskowitz & Grinblatt (1999) 'Do Industries Explain "
+                      "Momentum?' (J. Finance): momentum measured relative to a "
+                      "stock's own industry/sector average is often a distinct "
+                      "and stronger signal than momentum relative to the broad "
+                      "index — a stock quietly beating its sector peers may be "
+                      "missed by NIFTY-relative measures alone.",
+        "spec": "Monthly: rank universe by 63d return minus own-sector mean 63d "
+                "return; top quintile; forward 63d & 126d excess vs universe "
+                "median.",
+        "status": "registered",
+    },
+    "HYP-011": {
+        "name": "low_max_effect_top_quintile",
+        "family": "behavioral.max_effect",
+        "motivation": "Bali, Cakici & Whitelaw (2011) 'Maxing Out: Stocks as "
+                      "Lotteries and the Cross-Section of Expected Returns' (J. "
+                      "Financial Economics): stocks with extreme recent single-day "
+                      "upside attract gambling-like retail demand (lottery "
+                      "preference) and subsequently underperform. A genuinely "
+                      "distinct behavioral/microstructure signal from the "
+                      "platform's existing crowding proxy (HYP-007, which is "
+                      "volume-based, not return-extremity-based).",
+        "spec": "Monthly: rank universe by the negative of (mean of the 5 highest "
+                "daily returns in the trailing 21 days) — i.e. select LOW-MAX "
+                "names; top quintile; forward 21d & 63d excess vs universe median.",
         "status": "registered",
     },
 }

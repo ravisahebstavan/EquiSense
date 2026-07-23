@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from functools import partial
 
 import pandas as pd
 from sqlalchemy import delete, select
@@ -65,6 +66,10 @@ def load_nifty(session: Session) -> pd.Series:
     return pd.Series({d: c for d, c in rows}).sort_index()
 
 
+def load_sector_map(session: Session) -> dict[str, str]:
+    return {c.ticker: c.sector for c in session.scalars(select(Company)).all()}
+
+
 # ---------------------------------------------------------- feature builders
 # Each returns a DataFrame aligned to `closes` using ONLY past data.
 
@@ -100,6 +105,32 @@ def feat_low_vol(closes: pd.DataFrame, volumes) -> pd.DataFrame:
     return -(closes.pct_change().rolling(126, min_periods=100).std() * (252 ** 0.5))
 
 
+def feat_sector_relative_momentum(closes: pd.DataFrame, volumes,
+                                  sector_map: dict[str, str]) -> pd.DataFrame:
+    """Industry-relative momentum (Moskowitz & Grinblatt 1999, J. Finance,
+    'Do Industries Explain Momentum?'): 63d return relative to the stock's
+    OWN sector average, distinct from — and historically often stronger
+    than — momentum measured against the broad index."""
+    r63 = closes / closes.shift(63) - 1
+    sectors = pd.Series({t: sector_map.get(t, "Unknown") for t in r63.columns})
+    sector_mean = r63.T.groupby(sectors).transform("mean").T
+    return r63 - sector_mean
+
+
+def feat_max_effect(closes: pd.DataFrame, volumes) -> pd.DataFrame:
+    """Lottery-demand / MAX effect (Bali, Cakici & Whitelaw 2011, J. Financial
+    Economics, 'Maxing out: Stocks as lotteries and the cross-section of
+    expected returns'): stocks with extreme recent single-day upside attract
+    gambling-like retail demand and subsequently UNDERPERFORM. Negated here
+    so the top quantile (via _top_quantile) selects LOW-MAX names — the
+    expected-outperformance direction — consistent with every other feature's
+    selection convention."""
+    rets = closes.pct_change()
+    max5 = rets.rolling(21, min_periods=15).apply(
+        lambda x: pd.Series(x).nlargest(5).mean(), raw=False)
+    return -max5
+
+
 # selector: how a feature frame becomes a boolean "in cohort" mask at date t
 def _top_quantile(feat_row: pd.Series, q: float) -> pd.Series:
     valid = feat_row.dropna()
@@ -126,8 +157,8 @@ STUDIES: dict[str, dict] = {
 
 
 def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
-              regimes: pd.Series, hyp_id: str) -> list[dict]:
-    cfg = STUDIES[hyp_id]
+              regimes: pd.Series, hyp_id: str, cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or STUDIES[hyp_id]
     feat = cfg["feature"](closes, volumes)
     month_ends = closes.index[::21]  # ~monthly sampling
     results = []
@@ -202,11 +233,21 @@ def run_all_studies(session: Session) -> dict:
     nifty = load_nifty(session)
     regimes = pd.Series(regime_series(nifty.tolist()), index=nifty.index)
     regimes = regimes.reindex(closes.index, method="ffill").fillna("unknown")
+    sector_map = load_sector_map(session)
+
+    # Studies needing extra bound context (sector map) are built here rather
+    # than in the static STUDIES dict, which stays session-independent.
+    all_studies = dict(STUDIES)
+    all_studies["HYP-010"] = {
+        "feature": partial(feat_sector_relative_momentum, sector_map=sector_map),
+        "select": ("quantile", 0.2), "horizons": [63, 126]}
+    all_studies["HYP-011"] = {
+        "feature": feat_max_effect, "select": ("quantile", 0.2), "horizons": [21, 63]}
 
     session.execute(delete(BaseRateRecord))  # full recompute; records are cache, ledger is truth
     total = 0
-    for hyp_id in STUDIES:
-        for rec in run_study(closes, volumes, regimes, hyp_id):
+    for hyp_id, cfg in all_studies.items():
+        for rec in run_study(closes, volumes, regimes, hyp_id, cfg=cfg):
             session.add(BaseRateRecord(**rec, computed_at=datetime.utcnow()))
             total += 1
     session.commit()
