@@ -167,3 +167,39 @@ def test_bootstrap_ci_small_sample_is_nan():
     from equisense.research.backtest import moving_block_bootstrap_ci
     lo, hi = moving_block_bootstrap_ci([1.0, 2.0], block_len=1)
     assert lo != lo and hi != hi  # NaN — no fake certainty from n=2
+
+
+# ----------------------------------------------------- vol-managed overlay
+
+def test_vol_overlay_delevers_after_stress():
+    """Barroso-Santa-Clara cuts both ways: dead-calm stretches get scaled UP
+    (capped), and the period immediately AFTER a vol spike gets scaled DOWN —
+    because the scale factor uses only PRIOR (trailing) realized vol, never
+    the current period's own return. Check the mechanism where it actually
+    applies: the post-stress factor, not the all-period average."""
+    from equisense.research.backtest import vol_managed_overlay, SCALE_BOUNDS
+    calm = [1.0, 1.2, 0.8, 1.1, 1.0, 0.9]
+    violent = [40.0]           # huge single-period swing → trailing vol spikes
+    post_stress = [1.0]        # this period's factor reflects the violent one
+    rets = calm + violent + post_stress
+    r = vol_managed_overlay(rets, hold_days=21)
+    assert r["current_scale_factor"] == pytest.approx(SCALE_BOUNDS[0], abs=1e-6), \
+        "the period right after a vol spike must be de-levered to the floor"
+    assert SCALE_BOUNDS[0] <= r["mean_scale_factor"] <= SCALE_BOUNDS[1]
+    assert r["citation"].startswith("Barroso")
+
+
+def test_vol_overlay_early_periods_unscaled():
+    from equisense.research.backtest import vol_managed_overlay
+    r = vol_managed_overlay([2.0, -1.0], hold_days=21)  # < 3 trailing obs anywhere
+    assert r["baseline"]["mean_period_pct"] == r["vol_managed"]["mean_period_pct"]
+
+
+def test_vol_overlay_reports_both_variants_honestly():
+    from equisense.research.backtest import vol_managed_overlay
+    import random
+    rng = random.Random(3)
+    rets = [rng.gauss(1.0, 3.0) for _ in range(40)]
+    r = vol_managed_overlay(rets, hold_days=21)
+    assert "baseline" in r and "vol_managed" in r
+    assert r["verdict"]  # always states a verdict, win or not — never silent

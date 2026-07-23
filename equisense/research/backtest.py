@@ -127,6 +127,9 @@ def strategy_backtest(session: Session, top_n: int = 3,
 
     result = {
         "computed_at": datetime.utcnow().isoformat(),
+        "cache_version": BACKTEST_CACHE_VERSION,
+        "vol_managed_overlay": vol_managed_overlay([p["ret_net_pct"] for p in period_rets],
+                                                    hold_days),
         "spec": f"monthly top-{top_n} by price-cluster percentile composite "
                 f"(momentum, MQI, trend, low-vol, low-crowding), {hold_days}d hold, "
                 f"{DEFAULT_ROUND_TRIP_COST_PCT}% round-trip cost",
@@ -153,12 +156,73 @@ def strategy_backtest(session: Session, top_n: int = 3,
     return result
 
 
+BACKTEST_CACHE_VERSION = 2  # bump whenever the result schema changes → forces recompute
+TARGET_ANNUAL_VOL = 0.15   # typical equity vol target (Barroso-Santa-Clara use ~12%)
+VOL_LOOKBACK_PERIODS = 6   # trailing periods of the STRATEGY's own returns
+SCALE_BOUNDS = (0.3, 1.5)  # de-lever in stress, cap leverage in calm — never full off/on
+
+
+def vol_managed_overlay(period_rets_pct: list[float], hold_days: int) -> dict:
+    """HYP-009: Barroso & Santa-Clara (2015) vol targeting, applied to the
+    STRATEGY's own trailing realized volatility (not the underlying stocks' —
+    that's already MQI/HYP-004, a different mechanism). Periods before enough
+    trailing history exists run unscaled (factor 1.0), exactly as the
+    published method does at the start of a track record.
+    """
+    ann_factor = (252 / hold_days) ** 0.5
+    scaled: list[float] = []
+    factors: list[float] = []
+    for i, r in enumerate(period_rets_pct):
+        window = period_rets_pct[max(0, i - VOL_LOOKBACK_PERIODS):i]
+        if len(window) < 3:
+            factors.append(1.0)
+            scaled.append(r)
+            continue
+        mean_w = sum(window) / len(window)
+        var_w = sum((x - mean_w) ** 2 for x in window) / max(1, len(window) - 1)
+        realized_ann_vol = (var_w ** 0.5) / 100 * ann_factor
+        factor = (TARGET_ANNUAL_VOL / realized_ann_vol) if realized_ann_vol > 1e-6 else 1.0
+        factor = max(SCALE_BOUNDS[0], min(SCALE_BOUNDS[1], factor))
+        factors.append(factor)
+        scaled.append(r * factor)
+
+    def stats(xs: list[float]) -> dict:
+        m = sum(xs) / len(xs)
+        v = sum((x - m) ** 2 for x in xs) / max(1, len(xs) - 1)
+        sharpe = (m / (v ** 0.5) * ann_factor) if v > 0 else None
+        # illustrative compounded drawdown across overlapping periods (display
+        # only — periods overlap, so this is not a true daily drawdown series)
+        curve, peak, mdd = 100.0, 100.0, 0.0
+        for x in xs:
+            curve *= (1 + x / 100)
+            peak = max(peak, curve)
+            mdd = min(mdd, curve / peak - 1)
+        return {"mean_period_pct": round(m, 2), "worst_period_pct": round(min(xs), 2),
+                "sharpe_naive": None if sharpe is None else round(sharpe, 2),
+                "max_drawdown_display_pct": round(mdd * 100, 2)}
+
+    return {
+        "hypothesis": "HYP-009", "target_annual_vol_pct": TARGET_ANNUAL_VOL * 100,
+        "lookback_periods": VOL_LOOKBACK_PERIODS, "scale_bounds": list(SCALE_BOUNDS),
+        "baseline": stats(period_rets_pct), "vol_managed": stats(scaled),
+        "mean_scale_factor": round(sum(factors) / len(factors), 3),
+        "current_scale_factor": round(factors[-1], 3) if factors else None,
+        "verdict": ("vol targeting improves risk-adjusted return here"
+                    if (stats(scaled)["sharpe_naive"] or 0) > (stats(period_rets_pct)["sharpe_naive"] or 0)
+                    else "no measurable improvement in this sample — reported anyway"),
+        "citation": "Barroso & Santa-Clara (2015), J. Financial Economics; "
+                    "Daniel & Moskowitz (2016), J. Financial Economics",
+    }
+
+
 def cached_strategy_backtest(session: Session, refresh: bool = False) -> dict:
     from ..models import AppSnapshot
     KEY = "strategy_backtest"
     row = session.get(AppSnapshot, KEY)
     if row is not None and not refresh:
-        return json.loads(row.payload)
+        cached = json.loads(row.payload)
+        if cached.get("cache_version") == BACKTEST_CACHE_VERSION:
+            return cached
     result = strategy_backtest(session)
     if row is None:
         from datetime import date

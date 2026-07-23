@@ -5,6 +5,49 @@
 
 const app = document.getElementById("app");
 
+
+/* ============================================================== theme */
+
+function applyTheme(mode) {
+  document.documentElement.setAttribute("data-theme", mode);
+  document.getElementById("theme-btn").textContent = mode === "dark" ? "\u25d0" : "\u25d1";
+  localStorage.setItem("eqs_theme", mode);
+}
+function initTheme() {
+  const saved = localStorage.getItem("eqs_theme");
+  applyTheme(saved || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+}
+document.getElementById("theme-btn").addEventListener("click", () => {
+  applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark");
+});
+
+/* ============================================================== toasts */
+
+function toast(message, kind = "") {
+  const host = document.getElementById("toasts");
+  const el = document.createElement("div");
+  el.className = "toast" + (kind ? " " + kind : "");
+  el.textContent = message;
+  host.appendChild(el);
+  setTimeout(() => { el.classList.add("fade"); setTimeout(() => el.remove(), 260); }, 4200);
+}
+
+/* ------------------------------------------------------ shortcut help */
+
+const SHORTCUTS = [
+  ["Ctrl K", "Open command palette"], ["g d", "Go to Dashboard"],
+  ["g c", "Go to Companies"], ["g p", "Go to Portfolio"], ["g t", "Go to Trading Desk"],
+  ["g r", "Go to Research"], ["g l", "Go to Lab"], ["r", "Open refresh drawer"],
+  ["/", "Also opens the command palette"],
+  ["?", "This help"], ["Esc", "Close any overlay"],
+];
+function openHelp() {
+  palette.hidden = true;
+  const box = document.getElementById("help-overlay");
+  box.hidden = false;
+}
+document.getElementById("help-btn").addEventListener("click", openHelp);
+
 /* ================================================================ utils */
 
 const fmtN = (v, d = 2) =>
@@ -66,6 +109,11 @@ function qClass(q) { return q >= 85 ? "ok" : q >= 60 ? "mid" : "bad"; }
 
 let autoRefreshing = false;
 
+function isEditingForm() {
+  const t = document.activeElement?.tagName;
+  return t === "INPUT" || t === "TEXTAREA" || t === "SELECT";
+}
+
 async function maybeAutoRefresh(st) {
   /* Stay-fresh policy: if prices are stale beyond a weekend and we haven't
      auto-refreshed in the last 6 hours, run the pipeline silently in the
@@ -81,7 +129,7 @@ async function maybeAutoRefresh(st) {
     await api("/live/refresh", { method: "POST" });
     cache.companies = null;
     await refreshStatusStrip();
-    route();
+    if (!isEditingForm()) route();  // never yank the DOM out from under an in-progress edit
   } catch { /* surfaced via status warnings on next poll */ }
   finally { autoRefreshing = false; }
 }
@@ -251,7 +299,9 @@ document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); return; }
   if (typing) return;
   if (e.key === "/") { e.preventDefault(); openPalette(); return; }
-  if (e.key === "Escape") { closePalette(); drawer.hidden = true; return; }
+  if (e.key === "Escape") { closePalette(); drawer.hidden = true;
+    document.getElementById("help-overlay").hidden = true; return; }
+  if (e.key === "?") { e.preventDefault(); openHelp(); return; }
   if (pendingG) {
     pendingG = false;
     const map = { d: "dashboard", c: "companies", p: "portfolio", t: "trading", r: "research", l: "lab" };
@@ -455,6 +505,57 @@ function renderDossier(d) {
       claim: ${esc(human(d.ledger.claim.type))}${d.ledger.claim.stated_probability
         ? `, P(hit)=${d.ledger.claim.stated_probability}` : ""} ·
       scores after ${esc(d.ledger.claim.score_after)}</div>`;
+}
+
+
+/* ------------------------------------------------------- interactive chart */
+
+function renderPriceChart(containerId, rows, height = 320) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (typeof LightweightCharts === "undefined" || !rows || rows.length < 5) {
+    el.innerHTML = sparkline("Price", rows.map(r => ({ period: r.time, value: r.value })), "");
+    return; // graceful fallback — CDN blocked or thin data, never a blank panel
+  }
+  el.innerHTML = "";
+  const styles = getComputedStyle(document.documentElement);
+  const cssvar = (name) => styles.getPropertyValue(name).trim();
+  const chart = LightweightCharts.createChart(el, {
+    width: el.clientWidth, height,
+    layout: { background: { color: "transparent" }, textColor: cssvar("--ink-2"),
+             fontSize: 11, fontFamily: "system-ui" },
+    grid: { vertLines: { color: cssvar("--grid") }, horzLines: { color: cssvar("--grid") } },
+    rightPriceScale: { borderColor: cssvar("--grid") },
+    timeScale: { borderColor: cssvar("--grid") },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const series = chart.addAreaSeries({
+    lineColor: cssvar("--series-1"), topColor: "rgba(57,135,229,0.28)",
+    bottomColor: "rgba(57,135,229,0)", lineWidth: 2,
+  });
+  series.setData(rows);
+  chart.timeScale().fitContent();
+  const ro = new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth }));
+  ro.observe(el);
+  el._chart = chart;
+  return chart;
+}
+
+function chartRangeButtons(containerId, allRows) {
+  const ranges = [["3M", 63], ["6M", 126], ["1Y", 252], ["3Y", 756], ["All", allRows.length]];
+  return `<div class="chart-range">${ranges.map(([label, n], i) =>
+    `<button data-range="${n}" class="${i === 2 ? "active" : ""}">${label}</button>`).join("")}</div>
+    <div class="pricechart-wrap"><div id="${containerId}" class="pricechart"></div></div>`;
+}
+function wireChartRanges(root, containerId, allRows) {
+  root.querySelectorAll("[data-range]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      root.querySelectorAll("[data-range]").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      const n = parseInt(btn.dataset.range);
+      renderPriceChart(containerId, allRows.slice(-n));
+    });
+  });
 }
 
 /* ============================================================ dashboard */
@@ -698,8 +799,20 @@ function renderCompanyOverview(body, d, id) {
          <span class="m-value">${fmtN(a.value, 1)}</span><span class="m-unit">${esc(a.unit)}</span></div>`).join("")}</div>` : "";
 
   body.innerHTML = `<div class="sub" style="margin-bottom:8px">Cards ordered by your lens.
-    Every number expands to its formula, inputs, and caveats.</div>${cardsHtml}${sectorAttrs}`;
+    Every number expands to its formula, inputs, and caveats.</div>
+    <div class="panel"><h2>Price</h2><div id="price-chart-panel">${skeleton(3)}</div></div>
+    ${cardsHtml}${sectorAttrs}`;
   wireToggles(body); wireSparks(body);
+  api(`/companies/${id}/prices`).then(rows => {
+    const panel = document.getElementById("price-chart-panel");
+    if (!panel) return;
+    panel.innerHTML = chartRangeButtons("price-chart", rows);
+    renderPriceChart("price-chart", rows.slice(-252));
+    wireChartRanges(panel, "price-chart", rows);
+  }).catch(() => {
+    const panel = document.getElementById("price-chart-panel");
+    if (panel) panel.innerHTML = '<div class="empty">Price history unavailable.</div>';
+  });
   body.querySelectorAll("tr.clickable[data-company]").forEach(tr =>
     tr.addEventListener("click", () => location.hash = `#/companies/${tr.dataset.company}`));
   const btn = body.querySelector("#recompute-val");
@@ -883,7 +996,7 @@ async function renderRealBook(body) {
       ${txnFormHtml(companies)}${txnList}`;
     wireTxnForm(() => viewPortfolio("real"));
     body.querySelectorAll("[data-deltx]").forEach(b => b.addEventListener("click", async () => {
-      await api(`/transactions/${b.dataset.deltx}`, { method: "DELETE" }); viewPortfolio("real");
+      await api(`/transactions/${b.dataset.deltx}`, { method: "DELETE" }); toast("Transaction deleted."); viewPortfolio("real");
     }));
     return;
   }
@@ -955,7 +1068,7 @@ async function renderRealBook(body) {
     tr.addEventListener("click", () => location.hash = `#/companies/${tr.dataset.company}`));
   wireTxnForm(() => viewPortfolio("real"));
   body.querySelectorAll("[data-deltx]").forEach(b => b.addEventListener("click", async () => {
-    await api(`/transactions/${b.dataset.deltx}`, { method: "DELETE" }); viewPortfolio("real");
+    await api(`/transactions/${b.dataset.deltx}`, { method: "DELETE" }); toast("Transaction deleted."); viewPortfolio("real");
   }));
   wireAi(body, { pfnarrate: () => api("/ai/narrate/portfolio", { method: "POST" }) });
 }
@@ -1144,7 +1257,8 @@ async function viewTrading() {
     </div>`;
 
   document.getElementById("ap-toggle").addEventListener("click", async () => {
-    await api("/autopilot", { method: "PUT", body: JSON.stringify({ enabled: !ap.config.enabled }) });
+    const updated = await api("/autopilot", { method: "PUT", body: JSON.stringify({ enabled: !ap.config.enabled }) });
+    toast(updated.enabled ? "Autopilot enabled." : "Autopilot disabled.", "ok");
     viewTrading();
   });
   document.getElementById("ap-save").addEventListener("click", async () => {
@@ -1153,7 +1267,7 @@ async function viewTrading() {
       max_open_positions: parseInt(document.getElementById("ap-open").value),
       cash_reserve_pct: parseFloat(document.getElementById("ap-cash").value),
       time_exit_days: parseInt(document.getElementById("ap-days").value) }) });
-    document.getElementById("ap-msg").textContent = "Policy saved.";
+    toast("Autopilot policy saved.", "ok");
   });
   document.getElementById("ap-run").addEventListener("click", async (e) => {
     e.target.disabled = true; e.target.textContent = "Running…";
@@ -1167,12 +1281,12 @@ async function viewTrading() {
   body.querySelectorAll("[data-exec-cid]").forEach(b => b.addEventListener("click", async () => {
     b.disabled = true;
     try {
-      await api("/paper/trade", { method: "POST", body: JSON.stringify({
+      const r = await api("/paper/trade", { method: "POST", body: JSON.stringify({
         company_id: parseInt(b.dataset.execCid), side: "buy",
         quantity: parseInt(b.dataset.execQty) })});
+      toast(`Filled: bought ${r.quantity} ${r.ticker} @ ₹${fmtN(r.fill_price, 1)}`, "ok");
       viewTrading();
-    } catch (e) { b.after(Object.assign(document.createElement("span"),
-      { className: "sub", textContent: " " + e.message })); b.disabled = false; }
+    } catch (e) { toast("Order rejected: " + e.message, "err"); b.disabled = false; }
   }));
   const hint = () => {
     const sel = document.getElementById("pp-company");
@@ -1194,21 +1308,23 @@ async function viewTrading() {
         side: document.getElementById("pp-side").value,
         quantity: parseFloat(document.getElementById("pp-qty").value),
       })});
-      msg.textContent = `Filled: ${r.side} ${r.quantity} ${r.ticker} @ ₹${fmtN(r.fill_price, 1)}`;
-      viewPortfolio("paper");
-    } catch (e) { msg.textContent = "Rejected: " + e.message; }
+      toast(`Filled: ${r.side} ${r.quantity} ${r.ticker} @ ₹${fmtN(r.fill_price, 1)}`, "ok");
+      viewTrading();
+    } catch (e) { msg.textContent = "Rejected: " + e.message; toast("Order rejected: " + e.message, "err"); }
   });
   body.querySelectorAll("[data-close]").forEach(b => b.addEventListener("click", async () => {
-    await api("/paper/trade", { method: "POST", body: JSON.stringify({
+    const r = await api("/paper/trade", { method: "POST", body: JSON.stringify({
       company_id: parseInt(b.dataset.close), side: "sell",
       quantity: parseFloat(b.dataset.qty) })});
-    viewPortfolio("paper");
+    toast(`Closed: sold ${r.quantity} ${r.ticker} @ ₹${fmtN(r.fill_price, 1)}`, "ok");
+    viewTrading();
   }));
   document.getElementById("pp-reset").addEventListener("click", async (e) => {
     if (!confirm("Reset the paper account? All fills are wiped (the ledger keeps the reset record).")) return;
     await api("/paper/reset", { method: "POST", body: JSON.stringify({
       starting_cash: parseFloat(document.getElementById("pp-cash").value) || 1000000 })});
-    viewPortfolio("paper");
+    toast("Paper account reset.", "ok");
+    viewTrading();
   });
 }
 
@@ -1264,7 +1380,7 @@ async function renderProfileEditor(body) {
         sector_exclusions: document.getElementById("pr-excl").value.split(",").map(s => s.trim()).filter(Boolean),
         rules: document.getElementById("pr-rules").value.split("\n").filter(Boolean),
       })});
-      msg.textContent = "Saved — rankings and limits updated.";
+      toast("Profile saved — rankings and limits updated.", "ok");
       document.getElementById("lens").value = document.getElementById("pr-lens").value;
     } catch (e) { msg.textContent = "Rejected: " + e.message; }
   });
@@ -1343,7 +1459,7 @@ async function viewResearch() {
   app.querySelectorAll("[data-unwatch]").forEach(btn =>
     btn.addEventListener("click", async () => {
       await api(`/watchlist/${btn.dataset.unwatch}`, { method: "DELETE" });
-      viewResearch();
+      toast("Removed from watchlist."); viewResearch();
     }));
   document.getElementById("th-save").addEventListener("click", async () => {
     try {
@@ -1482,7 +1598,9 @@ async function viewLab(section = "hypotheses") {
     });
   } else if (section === "backtest") {
     const bt = await api("/backtest/strategy");
-    body.innerHTML = bt.error ? `<div class="panel"><div class="empty">${esc(bt.error)}</div></div>` : `
+    body.innerHTML = (bt.error || !bt.vol_managed_overlay)
+      ? `<div class="panel"><div class="empty">${esc(bt.error || "Backtest cache outdated — click Recompute.")}</div>
+         <button id="bt-refresh" style="margin-top:8px">Recompute</button></div>` : `
       <div class="panel"><h2>Strategy backtest — the live price-cluster rule, simulated</h2>
         <div class="sub" style="margin-bottom:8px">${esc(bt.spec)}</div>
         <div class="tiles">
@@ -1500,6 +1618,28 @@ async function viewLab(section = "hypotheses") {
           bt.curve.map(p => ({ date: p.date, equity: p.strategy })), null) : ""}
         <div class="sub" style="margin-top:8px">${bt.caveats.map(esc).join(" · ")}</div>
         <div style="margin-top:10px"><button id="bt-refresh">Recompute</button></div>
+      </div>
+      <div class="panel"><h2>Volatility-managed overlay (HYP-009)</h2>
+        <div class="sub" style="margin-bottom:8px">${esc(bt.vol_managed_overlay.citation)} —
+          scales exposure by target vol (${bt.vol_managed_overlay.target_annual_vol_pct}%) ÷
+          the STRATEGY'S OWN trailing ${bt.vol_managed_overlay.lookback_periods}-period realized
+          vol, bounded [${bt.vol_managed_overlay.scale_bounds}]×. Distinct from stock-level
+          scaling (MQI) — this targets the portfolio's own vol, the actual
+          Barroso-Santa-Clara mechanism.</div>
+        <div class="grid2">
+          <div class="tile"><div class="label">Baseline (equal-weight)</div>
+            <div class="value">Sharpe ${fmtN(bt.vol_managed_overlay.baseline.sharpe_naive, 2)}</div>
+            <div class="sub">worst period ${signed(bt.vol_managed_overlay.baseline.worst_period_pct)}% ·
+              illustrative max DD ${signed(bt.vol_managed_overlay.baseline.max_drawdown_display_pct)}%</div></div>
+          <div class="tile"><div class="label">Vol-managed</div>
+            <div class="value">Sharpe ${fmtN(bt.vol_managed_overlay.vol_managed.sharpe_naive, 2)}</div>
+            <div class="sub">worst period ${signed(bt.vol_managed_overlay.vol_managed.worst_period_pct)}% ·
+              illustrative max DD ${signed(bt.vol_managed_overlay.vol_managed.max_drawdown_display_pct)}%</div></div>
+        </div>
+        <div class="score-detail">Current scale factor: <strong>${bt.vol_managed_overlay.current_scale_factor}×</strong>
+          (mean across sample: ${bt.vol_managed_overlay.mean_scale_factor}×)<br>
+          <strong>${esc(human(bt.vol_managed_overlay.verdict))}</strong> — measured on this sample,
+          not asserted.</div>
       </div>`;
     const btn = document.getElementById("bt-refresh");
     if (btn) btn.addEventListener("click", async (e) => {
@@ -1574,9 +1714,16 @@ async function quoteLoop() {
     const q = await api("/live/quotes", { method: "POST" });
     cache.market = q.market;
     cache.quotes = q.prices;
-    if ((location.hash || "").includes("trading")) route();
+    if ((location.hash || "").includes("trading") && !isEditingForm()) route();
   } catch { /* quotes are best-effort; status strip reports staleness */ }
 }
+
+document.getElementById("help-grid").innerHTML = SHORTCUTS.map(([k, d]) =>
+  `<span>${k.split(" ").map(p => `<kbd>${p}</kbd>`).join(" ")}</span><span>${d}</span>`).join("");
+document.getElementById("help-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "help-overlay") e.target.hidden = true;
+});
+initTheme();
 
 window.addEventListener("hashchange", route);
 refreshStatusStrip();

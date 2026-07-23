@@ -48,6 +48,26 @@ def admission_cap(family: str) -> tuple[float, str]:
 
 
 REGISTRY: dict[str, dict] = {
+    "HYP-009": {
+        "name": "vol_managed_momentum_overlay",
+        "family": "meta.risk_management",
+        "motivation": "Barroso & Santa-Clara (2015) 'Momentum Has Its Moments' "
+                      "(J. Financial Economics) show momentum's worst drawdowns "
+                      "coincide with spikes in the STRATEGY's own realized "
+                      "volatility (post-crash reversals — see also Daniel & "
+                      "Moskowitz 2016 'Momentum Crashes', JFE); scaling exposure "
+                      "inversely to trailing strategy vol, targeting a constant "
+                      "annualized vol, historically improves Sharpe and cuts tail "
+                      "risk versus constant-capital weighting. Distinct from the "
+                      "platform's existing stock-level vol scaling (MQI, HYP-004): "
+                      "this targets the PORTFOLIO's own trailing realized vol.",
+        "spec": "Backtest the top-N price-cluster composite two ways: (a) equal "
+                "weight each period (baseline), (b) scale period exposure by "
+                "target_vol / trailing realized vol of the strategy's own prior "
+                "6 periods, capped to [0.3x, 1.5x]. Compare Sharpe, worst period, "
+                "and max drawdown, net of costs, over the full stored history.",
+        "status": "registered",
+    },
     "REG-001": {
         "name": "regime_conditioning_value",
         "family": "meta.regime",
