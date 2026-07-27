@@ -101,7 +101,3 @@ prices/macro, recomputes base rates, and scores any due claims daily.
 | Yahoo may throttle cloud IPs | Occasional refresh failures | Failures surface in the drawer; retry; adapters are isolated for future provider swaps |
 | SSE streaming through serverless | If your plan buffers streams, the drawer may show stages late or error | The cron endpoint and `POST /api/live/refresh` do the same work without streaming |
 | Vercel Cron (Hobby) runs are best-effort daily | Refresh time may drift | Fine for EOD data |
-
-A `Dockerfile` is kept in the repo purely as portability insurance — the app
-is a standard container + standard Postgres and can move anywhere in minutes
-if these free tiers ever change. It is not needed for the Neon + Vercel path.
