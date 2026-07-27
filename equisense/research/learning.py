@@ -25,6 +25,10 @@ from .. import ledger
 UNLOCK_N = 150          # scored alignments per cluster before weights unlock
 CAL_MIN = 30            # scored claims before probability calibration engages
 ALIGN_THRESHOLD = 0.1   # |cluster score| above which a cluster "voted"
+MAG_MIN = 30            # same-direction scored claims before magnitude calibration engages
+PROVISIONAL_MAG_SCALE = 8.0  # pp of excess return at |net_score|=1, 126d horizon —
+# deliberately modest until real history exists, exactly like _stated_probability's
+# founding-era linear map for direction confidence
 
 
 def _scored_pairs(records: list[dict] | None = None) -> list[tuple[dict, dict]]:
@@ -112,14 +116,47 @@ def calibrated_probability(net_score: float,
     return round((hits + 5) / (len(b) + 10), 3), f"calibrated from {len(pairs)} scored claims"
 
 
+def calibrated_magnitude(net_score: float, horizon_days: int = 126,
+                         records: list[dict] | None = None) -> tuple[float, str]:
+    """Predicted excess-return MAGNITUDE for a new claim — the counterpart to
+    calibrated_probability, answering 'how big a move, not just which way'.
+    Below MAG_MIN same-direction scored claims: a deliberately modest linear
+    map, scaled to the claim's own horizon. At/above: the empirical mean
+    realized excess return within the matching |net score| tercile, computed
+    separately for long-side and short-side claims so the two populations
+    never get averaged into each other."""
+    default = round(net_score * PROVISIONAL_MAG_SCALE * (horizon_days / 126.0), 2)
+    pairs = _scored_pairs(records)
+    same_side = sorted(
+        ((abs(d["net_score"]), s["realized_excess_pct"]) for d, s in pairs
+         if (d["net_score"] >= 0) == (net_score >= 0)),
+        key=lambda r: r[0])
+    if len(same_side) < MAG_MIN:
+        return default, f"provisional linear map ({len(same_side)}/{MAG_MIN} same-direction scored claims)"
+    k = len(same_side) // 3 or 1
+    bins = [same_side[:k], same_side[k:2 * k], same_side[2 * k:]]
+    x = abs(net_score)
+    basis = f"calibrated from {len(same_side)} same-direction scored claims"
+    for b in bins:
+        if b and x <= b[-1][0]:
+            return round(sum(r[1] for r in b) / len(b), 2), basis
+    b = bins[-1] or same_side
+    return round(sum(r[1] for r in b) / len(b), 2), basis
+
+
 def learning_state(records: list[dict] | None = None) -> dict:
     records = records if records is not None else ledger.read_all()
     weights, status = cluster_weights(records)
     pairs = _scored_pairs(records)
     recent = [{"company": s["company"], "realized_excess_pct": s["realized_excess_pct"],
+               "predicted_excess_pct": s.get("predicted_excess_pct"),
+               "forecast_error_pct": s.get("forecast_error_pct"),
                "hit": s["hit"], "stated_probability": s["stated_probability"],
                "brier": s["brier"],
                "verdict": d["verdict"]} for d, s in pairs[-12:]][::-1]
+    mag_errors = [s["abs_forecast_error_pct"] for d, s in pairs
+                 if s.get("abs_forecast_error_pct") is not None]
+    checkpoints = [r for r in records if r["kind"] == "checkpoint"][-12:][::-1]
     return {
         "cluster_posteriors": cluster_posteriors(records),
         "weights": weights, "weights_status": status,
@@ -129,14 +166,27 @@ def learning_state(records: list[dict] | None = None) -> dict:
                              if len(pairs) >= CAL_MIN else
                              f"{len(pairs)}/{CAL_MIN} scored claims until the "
                              "probability map is fitted from real outcomes"),
+        "mean_abs_forecast_error_pct": (round(sum(mag_errors) / len(mag_errors), 2)
+                                        if mag_errors else None),
+        "magnitude_calibration_note": (
+            f"magnitude map calibrated from history" if len(pairs) >= MAG_MIN else
+            f"{len(pairs)}/{MAG_MIN} same-direction scored claims until predicted "
+            "excess magnitude is fitted from real outcomes"),
         "unlock_n": UNLOCK_N,
         "recent_outcomes": recent,
+        "recent_checkpoints": checkpoints,
         "how_it_learns": (
             "Every non-abstain dossier and every paper fill is a pre-registered, "
-            "hash-chained claim. When a claim's horizon expires it is scored "
-            "against realized universe-relative returns. Scored outcomes update "
-            "per-cluster Beta-Binomial posteriors (which clusters actually call "
-            "direction right?) and refit the probability calibration. Influence "
-            "unlocks only past pre-registered sample gates — the system refines "
-            "itself from its own trade history without ever running on noise."),
+            "hash-chained claim: a DIRECTION, a stated PROBABILITY, and a "
+            "predicted excess-return MAGNITUDE, all fixed before the outcome is "
+            "known. An interim checkpoint fires partway through the horizon "
+            "(T so-far vs the pro-rated prediction) so drift is visible early, "
+            "and the full claim is scored when its horizon expires against "
+            "realized universe-relative returns — direction (hit/Brier) AND "
+            "magnitude (predicted vs realized excess, forecast error). Scored "
+            "outcomes update per-cluster Beta-Binomial posteriors, refit the "
+            "probability calibration, and refit the magnitude calibration. "
+            "Influence unlocks only past pre-registered sample gates — the "
+            "system refines itself from its own trade history without ever "
+            "running on noise."),
     }

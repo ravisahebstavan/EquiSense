@@ -82,6 +82,12 @@ const LABELS = {
   wrongful_threshold_pct: "Wrongful threshold", mean_abstained_excess_pct: "Mean abstained excess",
   conditioning_helps: "Conditioning helps", no_measurable_value: "No measurable value",
   conditioning_hurts: "Conditioning hurts", insufficient_data: "Insufficient data",
+  mean_abs_forecast_error_pct: "Mean abs. forecast error (magnitude)",
+  rmse_forecast_error_pct: "RMSE forecast error (magnitude)",
+  interim_on_track_rate: "Interim checkpoints on-track rate",
+  mean_abs_interim_forecast_error_pct: "Mean abs. interim forecast error",
+  interim_checkpoints: "Interim checkpoints scored", checkpoint: "Interim checkpoint",
+  predicted_excess_pct: "Predicted excess return", forecast_error_pct: "Forecast error",
 };
 const human = (s) => LABELS[s] ?? String(s ?? "")
   .replaceAll("_", " ").replace(/\b[a-z]/g, c => c.toUpperCase());
@@ -1148,11 +1154,22 @@ async function viewTrading() {
   const outcomes = learn.recent_outcomes.length ? learn.recent_outcomes.map(o => `
     <div class="metric-row" style="cursor:default">
       <span class="m-label">${esc(o.company)} · ${esc(human(o.verdict))} →
-        realized ${signed(o.realized_excess_pct)}%</span>
+        realized ${signed(o.realized_excess_pct)}%${o.predicted_excess_pct != null
+          ? ` (predicted ${signed(o.predicted_excess_pct)}%, error ${signed(o.forecast_error_pct)}pp)` : ""}</span>
       <span class="m-value" style="color:${o.hit ? "var(--good-text)" : "var(--critical)"}">
         ${o.hit ? "hit" : "miss"}</span>
       <span class="m-unit">B ${fmtN(o.brier, 2)}</span></div>`).join("")
     : '<div class="empty">Outcomes appear here as claim horizons expire (126 trading days).</div>';
+
+  const checkpoints = (learn.recent_checkpoints || []).length ? learn.recent_checkpoints.map(c => `
+    <div class="metric-row" style="cursor:default">
+      <span class="m-label">${esc(c.company)} · T+${c.elapsed_days}d of ${c.horizon_days}d →
+        realized-so-far ${signed(c.realized_so_far_pct)}%
+        vs expected ${c.expected_so_far_pct == null ? "—" : signed(c.expected_so_far_pct) + "%"}</span>
+      <span class="m-value" style="color:${c.on_track ? "var(--good-text)" : "var(--critical)"}">
+        ${c.on_track == null ? "—" : c.on_track ? "on track" : "off track"}</span>
+      <span class="m-unit">err ${c.forecast_error_pct == null ? "—" : signed(c.forecast_error_pct) + "pp"}</span></div>`).join("")
+    : '<div class="empty">Interim checkpoints fire ~1/4 of the way through a claim\'s horizon — an early read on prediction drift, well before the full claim matures.</div>';
 
   body.innerHTML = `
     <h1>Trading Desk
@@ -1240,6 +1257,15 @@ async function viewTrading() {
           ${esc(learn.calibration_note)}</div>
         <h2>Recent scored outcomes (${learn.scored_claims} total)</h2>
         ${outcomes}
+        ${learn.mean_abs_forecast_error_pct != null ? `<div class="sub" style="margin-top:4px">
+          Mean absolute forecast error (magnitude): ${learn.mean_abs_forecast_error_pct}pp ·
+          ${esc(learn.magnitude_calibration_note)}</div>` : ""}
+        <h2 style="margin-top:12px">Prediction tracking — T vs T+checkpoint</h2>
+        <div class="sub" style="margin-bottom:8px">Every claim is scored twice: an interim
+          checkpoint partway through its horizon (predicted-so-far vs realized-so-far), then
+          the full outcome at maturity. This is the model checking its own work continuously,
+          not just once every six months.</div>
+        ${checkpoints}
         <h2 style="margin-top:12px">Account</h2>
         <div class="frm"><div><label>Reset with starting cash (₹)</label>
           <input id="pp-cash" type="number" value="1000000" step="10000"></div></div>

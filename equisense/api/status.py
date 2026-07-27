@@ -173,7 +173,9 @@ def refresh_stream(session: Session):
 
         yield sse("scoring_claims", "running")
         scored = ledger.score_due_claims(session)
-        yield sse("scoring_claims", "done", scored=scored["scored"])
+        checkpointed = ledger.score_interim_checkpoints(session)
+        yield sse("scoring_claims", "done", scored=scored["scored"],
+                  checkpoints_scored=checkpointed["checkpointed"])
 
         yield sse("publishing", "running")
         from .snapshot import build_universe_snapshot
@@ -256,6 +258,8 @@ def company_memory(session: Session, company: Company) -> dict:
     d_hashes = {d["hash"] for d in dossiers}
     scores = [r for r in records if r["kind"] == "score"
               and r.get("scores_dossier_hash") in d_hashes]
+    checkpoints = [r for r in records if r["kind"] == "checkpoint"
+                  and r.get("scores_dossier_hash") in d_hashes]
     return {
         "ticker": company.ticker,
         "theses": [{"id": t.id, "status": t.status, "statement": t.statement,
@@ -272,4 +276,5 @@ def company_memory(session: Session, company: Company) -> dict:
                              "hash": d["hash"][:16],
                              "claim": d.get("claim")} for d in dossiers],
         "scored_claims": scores,
+        "interim_checkpoints": checkpoints,
     }

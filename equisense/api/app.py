@@ -585,7 +585,9 @@ def live_ledger():
 @app.post("/api/live/score")
 def live_score(s: Session = Depends(db)):
     from .. import ledger
-    return ledger.score_due_claims(s)
+    due = ledger.score_due_claims(s)
+    checkpoints = ledger.score_interim_checkpoints(s)
+    return {**due, "checkpoints_scored": checkpoints["checkpointed"]}
 
 
 @app.get("/api/live/calibration")
@@ -645,11 +647,13 @@ def cron_refresh(s: Session = Depends(db)):
     macro = ingest_macro(s, years=1)
     studies = run_all_studies(s)["records"]
     scored = L.score_due_claims(s)["scored"]
+    checkpointed = L.score_interim_checkpoints(s)["checkpointed"]
     snap = build_universe_snapshot(s)
     from .autopilot import get_config, run_autopilot
     auto = run_autopilot(s) if get_config(s)["enabled"] else None
     return {"price_rows": prices, "macro_rows": macro,
             "base_rate_records": studies, "claims_scored": scored,
+            "checkpoints_scored": checkpointed,
             "snapshot_companies": len(snap["companies"]),
             "autopilot": None if auto is None else
             {"entries": len(auto["entries"]), "exits": len(auto["exits"])}}

@@ -86,14 +86,23 @@ def register_dossier(dossier: dict) -> dict:
     horizon_days = dossier.get("claim_horizon_days", 126)
     score_after = (date.today() + timedelta(days=int(horizon_days * 1.5))).isoformat()
     if synth["verdict"] in ("long_candidate", "avoid_short_candidate"):
-        from .research.learning import calibrated_probability
+        from .research.learning import calibrated_magnitude, calibrated_probability
         p, p_basis = calibrated_probability(synth["net_score"])
+        pred_mag, mag_basis = calibrated_magnitude(synth["net_score"], horizon_days)
+        # interim checkpoint: an early read on the same claim, roughly a quarter
+        # of the way to the horizon (min 21 trading days) — "T vs T+checkpoint"
+        # tracking, scored well before the full claim matures (see
+        # score_interim_checkpoints below)
+        checkpoint_days = max(21, round(horizon_days / 4))
         claim = {
             "type": "directional_excess",
             "direction": 1 if synth["verdict"] == "long_candidate" else -1,
             "horizon_days": horizon_days,
+            "checkpoint_days": checkpoint_days,
             "stated_probability": p,
             "probability_basis": p_basis,
+            "predicted_excess_pct": pred_mag,
+            "magnitude_basis": mag_basis,
             "benchmark": "universe_median_forward_return",
             "score_after": score_after,
             "entry_price": dossier["company"].get("price"),
@@ -173,17 +182,78 @@ def score_due_claims(session: Session, as_of: date | None = None) -> dict:
             hit = (realized > 0) == (direction > 0)
             p = rec["claim"]["stated_probability"]
             brier = (p - (1.0 if hit else 0.0)) ** 2
+            realized_pct = round(realized * 100, 2)
+            predicted_pct = rec["claim"].get("predicted_excess_pct")
+            forecast_error = (None if predicted_pct is None
+                              else round(realized_pct - predicted_pct, 2))
             score_rec = _write({
                 "kind": "score",
                 "claim_type": "directional_excess",
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "scores_dossier_hash": rec["hash"],
                 "company": rec["company"]["ticker"],
-                "realized_excess_pct": round(realized * 100, 2),
+                "realized_excess_pct": realized_pct,
                 "hit": hit, "stated_probability": p, "brier": round(brier, 4),
+                "predicted_excess_pct": predicted_pct,
+                "forecast_error_pct": forecast_error,
+                "abs_forecast_error_pct": None if forecast_error is None else abs(forecast_error),
             })
         results.append(score_rec)
     return {"scored": len(results), "results": results}
+
+
+def score_interim_checkpoints(session: Session, as_of: date | None = None) -> dict:
+    """Early read on open directional claims: at ~checkpoint_days (roughly a
+    quarter of the way to the claim's horizon), compare realized-so-far excess
+    against the horizon prediction pro-rated to the elapsed fraction. This is
+    the literal 'prediction made at T for T+checkpoint, compared once T+
+    checkpoint actually arrives' loop — a much earlier, more frequent signal
+    than waiting for the full horizon (score_due_claims) to elapse, so drift
+    from a stale regime or a broken thesis shows up fast instead of six
+    months later. Never overwrites or substitutes for the final score."""
+    as_of = as_of or date.today()
+    records = read_all()
+    checkpointed = {r["scores_dossier_hash"] for r in records if r["kind"] == "checkpoint"}
+    tickers = {c.ticker: c.id for c in session.scalars(select(Company)).all()}
+    results = []
+    for rec in records:
+        if rec["kind"] != "dossier" or not rec.get("claim"):
+            continue
+        claim = rec["claim"]
+        if claim.get("type") != "directional_excess" or rec["hash"] in checkpointed:
+            continue
+        created = date.fromisoformat(rec["created_at"][:10])
+        checkpoint_days = claim.get("checkpoint_days") or max(21, round(claim["horizon_days"] / 4))
+        checkpoint_target = created + timedelta(days=int(checkpoint_days * 1.45))
+        if as_of < checkpoint_target:
+            continue
+        cid = tickers.get(rec["company"]["ticker"])
+        if cid is None:
+            continue
+        realized = _excess_return(session, cid, created, checkpoint_target, tickers.values())
+        if realized is None:
+            continue
+        realized_pct = round(realized * 100, 2)
+        predicted_pct = claim.get("predicted_excess_pct")
+        expected_so_far_pct = (None if predicted_pct is None else
+                               round(predicted_pct * (checkpoint_days / claim["horizon_days"]), 2))
+        forecast_error = (None if expected_so_far_pct is None
+                          else round(realized_pct - expected_so_far_pct, 2))
+        direction = claim["direction"]
+        on_track = (realized_pct > 0) == (direction > 0) if direction != 0 else None
+        results.append(_write({
+            "kind": "checkpoint",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "scores_dossier_hash": rec["hash"],
+            "company": rec["company"]["ticker"],
+            "elapsed_days": checkpoint_days,
+            "horizon_days": claim["horizon_days"],
+            "realized_so_far_pct": realized_pct,
+            "expected_so_far_pct": expected_so_far_pct,
+            "forecast_error_pct": forecast_error,
+            "on_track": on_track,
+        }))
+    return {"checkpointed": len(results), "results": results}
 
 
 def _excess_return(session: Session, cid: int, start: date, end: date,
@@ -218,6 +288,7 @@ def calibration_report() -> dict:
     directional = [s for s in scores if s.get("claim_type") != "abstention_counterfactual"
                    and s.get("hit") is not None]
     abstentions = [s for s in scores if s.get("claim_type") == "abstention_counterfactual"]
+    checkpoints = [r for r in read_all() if r["kind"] == "checkpoint"]
     out = {"scored_claims": len(directional),
            "scored_abstentions": len(abstentions)}
     if directional:
@@ -226,13 +297,34 @@ def calibration_report() -> dict:
                    mean_stated_probability=round(
                        sum(s["stated_probability"] for s in directional) / len(directional), 3),
                    mean_brier=round(sum(s["brier"] for s in directional) / len(directional), 4))
+        mag_errors = [s["abs_forecast_error_pct"] for s in directional
+                     if s.get("abs_forecast_error_pct") is not None]
+        if mag_errors:
+            out.update(
+                mean_abs_forecast_error_pct=round(sum(mag_errors) / len(mag_errors), 2),
+                rmse_forecast_error_pct=round(
+                    (sum(e ** 2 for e in mag_errors) / len(mag_errors)) ** 0.5, 2))
+    if checkpoints:
+        on_track = [c for c in checkpoints if c.get("on_track") is not None]
+        if on_track:
+            out["interim_on_track_rate"] = round(
+                sum(1 for c in on_track if c["on_track"]) / len(on_track), 3)
+        checkpoint_errors = [c["forecast_error_pct"] for c in checkpoints
+                             if c.get("forecast_error_pct") is not None]
+        if checkpoint_errors:
+            out["mean_abs_interim_forecast_error_pct"] = round(
+                sum(abs(e) for e in checkpoint_errors) / len(checkpoint_errors), 2)
+        out["interim_checkpoints"] = len(checkpoints)
     if abstentions:
         wrongful = sum(1 for s in abstentions if s.get("wrongful_abstention"))
         out.update(wrongful_abstention_rate=round(wrongful / len(abstentions), 3),
                    wrongful_threshold_pct=WRONGFUL_ABSTENTION_PCT,
                    mean_abstained_excess_pct=round(
                        sum(s["realized_excess_pct"] for s in abstentions) / len(abstentions), 2))
-    out["note"] = ("Calibrated when hit_rate ≈ mean_stated_probability. Weights "
+    out["note"] = ("Calibrated when hit_rate ≈ mean_stated_probability, and when "
+                   "mean_abs_forecast_error_pct trends down over time. Weights "
                    "unlock at ≥150 scored claims per family (N_eff-counted). "
-                   "Abstention now has a price: the wrongful-abstention rate.")
+                   "Interim checkpoints (~1/4 horizon) surface prediction drift "
+                   "long before a claim's full horizon matures. Abstention now "
+                   "has a price: the wrongful-abstention rate.")
     return out
