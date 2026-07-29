@@ -393,8 +393,8 @@ def dashboard(session: Session, profile: pers.InvestorProfile) -> dict:
     reviews_due = []
     for t in session.scalars(select(Thesis)).all():
         if t.status == "active" and t.review_date and t.review_date <= today:
-            c = next((x for x in companies if x.id == t.company_id), None)
-            reviews_due.append({"thesis_id": t.id, "ticker": c.ticker if c else "?",
+            c = next((x for x in universe["companies"] if x["id"] == t.company_id), None)
+            reviews_due.append({"thesis_id": t.id, "ticker": c["ticker"] if c else "?",
                                 "statement": t.statement,
                                 "review_date": t.review_date.isoformat()})
 

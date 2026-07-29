@@ -1560,7 +1560,10 @@ async function viewLab(section = "hypotheses") {
       out.innerHTML = '<div class="loading">Splitting a decade of momentum episodes…</div>';
       try {
         const r = await api("/live/reg001", { method: "POST" });
-        out.innerHTML = `<div class="score-detail" style="margin-top:8px">
+        out.innerHTML = r.verdict === "insufficient_data" ? `<div class="score-detail" style="margin-top:8px">
+          <strong>Verdict: ${esc(human(r.verdict))}</strong><br>
+          Only ${r.episodes} momentum-top-quintile episodes so far — need at least 200
+          before a train/test split is meaningful.</div>` : `<div class="score-detail" style="margin-top:8px">
           <strong>Verdict: ${esc(human(r.verdict))}</strong> — ${esc(r.consequence || "")}<br>
           Out-of-sample Brier: unconditional ${r.brier_unconditional_oos} vs
           regime-conditioned ${r.brier_conditional_oos}
