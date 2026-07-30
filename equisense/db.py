@@ -69,6 +69,8 @@ _SOFT_MIGRATIONS = [
     ("companies", "is_financial", "BOOLEAN DEFAULT FALSE"),
     ("companies", "is_index_member", "BOOLEAN DEFAULT TRUE"),
     ("companies", "last_seen_in_index", "DATE"),
+    ("filing_periods", "interest_income", "FLOAT"),
+    ("filing_periods", "net_interest_income", "FLOAT"),
     ("filing_periods", "source", "VARCHAR(20) DEFAULT 'manual'"),
     ("filing_periods", "pit_grade", "VARCHAR(20) DEFAULT 'reconstructed'"),
     ("price_observations", "volume", "FLOAT"),

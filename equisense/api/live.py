@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import ledger
-from ..engine import novel, quality, ratios, technical, valuation
+from ..engine import banking, novel, quality, ratios, technical, valuation
 from ..engine.evidence import Evidence, ev, xsec_strength
 from ..engine.portfolio import positions_from_ledger
 from ..engine.regime import classify_regime
@@ -235,7 +235,42 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                         caveats=[c for c in (rd["implied_growth"].caveat,
                                              hist.caveat, beta_m.caveat) if c]))
 
-    # ---- quality cluster (F/Z exploratory-capped; CCS/Fragility SHADOW) ----
+    # ---- quality cluster: banking model for financials ----
+    # Previously financials emitted NO fundamental evidence at all, so 11 of the
+    # NIFTY-50 could never reach the 3-cluster coverage floor and abstained by
+    # construction rather than on the merits.
+    if stmts and company.is_financial:
+        bank = banking.bank_summary(stmts)
+        if bank.get("analyzable"):
+            bm = {m["key"]: m for m in bank["metrics"]}
+            roa = bm.get("bank_roa", {}).get("value")
+            nim = bm.get("net_interest_margin", {}).get("value")
+            lev = bm.get("equity_multiplier", {}).get("value")
+            from ..engine.types import Metric as _M
+            if roa is not None:
+                # ROA is the bank profitability measure that is NOT flattered by
+                # leverage; ranking on ROE would reward balance-sheet risk.
+                E.append(ev("banking", "banking.profitability", "quality",
+                            _bank_strength(session, company, "roa", roa),
+                            f"Bank ROA {roa:.2f}%"
+                            + (f" on {lev:.1f}x leverage" if lev else ""),
+                            [_M(key="bank_roa", label="Return on Assets", value=roa,
+                                unit="%", formula=bm["bank_roa"]["formula"],
+                                inputs=bm["bank_roa"]["inputs"], period=period,
+                                family="banking",
+                                caveat=bm["bank_roa"].get("caveat"))],
+                            caveats=[banking.BANK_CAVEAT]))
+            if nim is not None:
+                E.append(ev("banking", "banking.spread", "quality",
+                            _bank_strength(session, company, "nim", nim),
+                            f"Net interest margin {nim:.2f}% (on assets)",
+                            [_M(key="net_interest_margin", label="Net Interest Margin",
+                                value=nim, unit="%",
+                                formula=bm["net_interest_margin"]["formula"],
+                                inputs=bm["net_interest_margin"]["inputs"],
+                                period=period, family="banking",
+                                caveat=bm["net_interest_margin"].get("caveat"))]))
+
     if stmts and not company.is_financial:
         curr, prev = stmts[-1], (stmts[-2] if len(stmts) >= 2 else None)
         if prev:
@@ -393,3 +428,44 @@ def build_dossier(session: Session, company: Company, book_value: float = 1_000_
                          "registered_at": ledger_rec["created_at"],
                          "claim": ledger_rec["claim"]}
     return dossier
+
+
+_BANK_METRIC_CACHE: dict = {"key": None, "values": None}
+
+
+def _bank_strength(session: Session, company: Company, metric: str,
+                   value: float) -> Optional[float]:
+    """Percentile strength for a bank metric, ranked against OTHER BANKS ONLY.
+
+    Ranking a bank's ROA against industrials would be meaningless — a 1.9% ROA
+    is best-in-class for a bank and near-failure for a manufacturer. The peer set
+    is therefore the financial-sector cohort, and with fewer than 5 peers the
+    function returns None rather than manufacture a percentile from noise.
+    """
+    from .snapshot import get_universe
+    from ..engine import banking as _b
+    from . import services as _svc
+
+    universe = get_universe(session)
+    key = (universe.get("as_of"), metric)
+    if _BANK_METRIC_CACHE["key"] != key:
+        vals: dict[str, float] = {}
+        for row in session.scalars(
+                select(Company).where(Company.is_financial == True,      # noqa: E712
+                                      Company.is_index_member == True)).all():  # noqa: E712
+            st = _svc.latest_statements(session, row.id)
+            if not st or not _b.is_bank_analyzable(st[-1]):
+                continue
+            cur = st[-1]
+            if metric == "roa" and cur.net_income is not None and cur.total_assets:
+                vals[row.ticker] = cur.net_income / cur.total_assets * 100
+            elif metric == "nim":
+                nii = _b.net_interest_income(cur)
+                if nii is not None and cur.total_assets:
+                    vals[row.ticker] = nii / cur.total_assets * 100
+        _BANK_METRIC_CACHE.update(key=key, values=vals)
+    peers = _BANK_METRIC_CACHE["values"] or {}
+    if len(peers) < 5:
+        return None
+    rank = sum(1 for v in peers.values() if v <= value) / len(peers)
+    return 2 * (rank - 0.5)

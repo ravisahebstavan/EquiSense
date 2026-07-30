@@ -266,6 +266,8 @@ _IS_MAP = {
     "pbt": ["Pretax Income"],
     "tax_expense": ["Tax Provision"],
     "net_income": ["Net Income", "Net Income Common Stockholders"],
+    "interest_income": ["Interest Income"],
+    "net_interest_income": ["Net Interest Income"],
     "depreciation": ["Reconciled Depreciation"],
 }
 _BS_MAP = {
@@ -297,14 +299,19 @@ def _fiscal_year(end: date) -> int:
 
 def ingest_fundamentals(session: Session, ids: dict[str, int],
                         pause: float = 0.4) -> int:
-    """Annual statements per company. Financial-sector companies are skipped —
-    bank statements don't fit the industrial canonical schema (flagged in the
-    Company row rather than ingested wrong)."""
+    """Annual statements per company.
+
+    Financial-sector companies are NO LONGER skipped. Their industrial line
+    items (EBIT, gross profit, inventory, capex) are genuinely meaningless and
+    stay null, but Yahoo does serve Interest Income, Interest Expense, Net
+    Interest Income, assets and equity for banks — which is enough for the
+    banking engine. Skipping them entirely left 11 of the NIFTY-50 with zero
+    fundamental analysis; ingesting the fields that ARE meaningful and analysing
+    them with a bank-appropriate model is strictly better than blindness.
+    """
     added = 0
     companies = {t: session.get(Company, cid) for t, cid in ids.items()}
     for ticker, comp in companies.items():
-        if comp.is_financial:
-            continue
         try:
             tk = yf.Ticker(yahoo_symbol(ticker))
             inc, bal, cf = tk.income_stmt, tk.balance_sheet, tk.cashflow

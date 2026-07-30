@@ -11,7 +11,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..engine import personalization as pers
+from ..engine import banking, personalization as pers
 from ..engine import portfolio as pf
 from ..engine import quality, ratios, valuation
 from ..engine.types import Metric, StatementData
@@ -138,11 +138,16 @@ def company_analysis(session: Session, company: Company,
     def md(ms: list[Metric]) -> list[dict]:
         return [m.to_dict() for m in ms]
 
-    f = quality.piotroski_f(curr, prev, price) if prev else None
-    z = quality.altman_z(curr, price)
-    z_em = quality.altman_z_em(curr)
+    # Financial-sector names get the banking model instead of the industrial
+    # one: gross margin, inventory turns, Altman Z and a reverse DCF are all
+    # meaningless for a leveraged spread business (see engine/banking.py).
+    bank = banking.bank_summary(stmts) if company.is_financial else None
+    f = (quality.piotroski_f(curr, prev, price)
+         if prev and not company.is_financial else None)
+    z = None if company.is_financial else quality.altman_z(curr, price)
+    z_em = None if company.is_financial else quality.altman_z_em(curr)
     rd = (valuation.reverse_dcf(curr, price, dcf_assumptions, statements=stmts)
-          if price else None)
+          if price and not company.is_financial else None)
     hist_fcf = valuation.historical_fcf_cagr(stmts)
     per_share = ratios.per_share_ratios(curr, price)
     ps_map = {m.key: m for m in per_share}
@@ -166,18 +171,27 @@ def company_analysis(session: Session, company: Company,
 
     cards = {
         "quality_scores": {
-            "title": "Quality & Distress",
-            "metrics": md([m for m in [f, z_em, z] if m]),
-            "extras": {"z_zone": quality.altman_zone(z.value),
-                       "z_em_zone": quality.altman_zone_em(z_em.value),
-                       "quality_tier": quality.quality_tier(
-                           f.value if f else None,
-                           int(f.inputs.get("signals_available", 0)) if f else None)},
+            "title": "Banking Model" if company.is_financial else "Quality & Distress",
+            "metrics": (bank["metrics"] + [bank["quality"]]
+                        if bank and bank.get("analyzable")
+                        else md([m for m in [f, z_em, z] if m])),
+            "extras": ({"model": "banking", "data_gaps": bank["data_gaps"],
+                        "not_applicable": bank["not_applicable"],
+                        "note": bank["model_note"]}
+                       if bank and bank.get("analyzable") else
+                       {"model": "banking",
+                        "unavailable": bank.get("reason")} if bank else
+                       {"z_zone": quality.altman_zone(z.value) if z else None,
+                        "z_em_zone": quality.altman_zone_em(z_em.value) if z_em else None,
+                        "quality_tier": quality.quality_tier(
+                            f.value if f else None,
+                            int(f.inputs.get("signals_available", 0)) if f else None)}),
         },
         "profitability": {
-            "title": "Profitability & Returns",
-            "metrics": md(ratios.profitability_ratios(curr, prev)
-                          + [ratios.roic(curr, prev=prev)]),
+            "title": "Spread & Returns" if company.is_financial else "Profitability & Returns",
+            "metrics": (md(banking.banking_ratios(curr, prev)) if company.is_financial
+                        else md(ratios.profitability_ratios(curr, prev)
+                                + [ratios.roic(curr, prev=prev)])),
         },
         "growth_trends": {
             "title": "Growth & Trajectory",

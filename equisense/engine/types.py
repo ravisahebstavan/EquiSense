@@ -58,6 +58,9 @@ class StatementData:
     depreciation: Optional[float] = None
     ebit: Optional[float] = None
     interest_expense: Optional[float] = None
+    # Banking-specific (financial-sector filings; None for industrials)
+    interest_income: Optional[float] = None
+    net_interest_income: Optional[float] = None
     pbt: Optional[float] = None
     tax_expense: Optional[float] = None
     net_income: Optional[float] = None

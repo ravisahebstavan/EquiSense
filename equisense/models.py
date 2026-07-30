@@ -65,6 +65,10 @@ class FilingPeriod(Base):
     depreciation: Mapped[float | None] = mapped_column(Float)
     ebit: Mapped[float | None] = mapped_column(Float)
     interest_expense: Mapped[float | None] = mapped_column(Float)
+    # Banking-specific: a bank's revenue engine is the interest spread, which the
+    # industrial schema has nowhere to put. Null for non-financials.
+    interest_income: Mapped[float | None] = mapped_column(Float)
+    net_interest_income: Mapped[float | None] = mapped_column(Float)
     pbt: Mapped[float | None] = mapped_column(Float)
     tax_expense: Mapped[float | None] = mapped_column(Float)
     net_income: Mapped[float | None] = mapped_column(Float)
