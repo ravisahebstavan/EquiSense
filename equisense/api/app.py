@@ -678,6 +678,79 @@ def company_memory_view(company_id: int, s: Session = Depends(db)):
     return company_memory(s, _get_company(s, company_id))
 
 
+# ------------------------------------------------------- markets (multi-asset)
+# Derivatives, flow and valuation-regime endpoints. Each returns
+# {"available": false, "reason": ...} rather than raising when the underlying
+# dataset has not been ingested yet — an empty dataset is an ordinary state and
+# the UI has to be able to say which one it is.
+
+
+@app.get("/api/markets/derivatives/{symbol}")
+def markets_derivatives(symbol: str, s: Session = Depends(db)):
+    """Futures term structure (implied financing rate) + option chain with a
+    solved IV surface, 25-delta skew, PCR and OI structure."""
+    from .markets import derivative_snapshot
+    return derivative_snapshot(s, symbol)
+
+
+class PositionLeg(BaseModel):
+    kind: str = Field(description="call | put | future")
+    strike: float = 0.0
+    quantity: int = Field(description="lots; negative is short")
+    premium: float = 0.0
+
+
+class PositionRiskRequest(BaseModel):
+    symbol: str = "NIFTY"
+    account_equity: float = Field(default=100_000.0, gt=0)
+    legs: list[PositionLeg]
+
+
+@app.post("/api/markets/position-risk")
+def markets_position_risk(req: PositionRiskRequest, s: Session = Depends(db)):
+    """Net greeks, expiry payoff, scenario margin estimate and the leverage
+    reality-check (with SEBI's published individual F&O loss rate attached)."""
+    from .markets import position_risk
+    if not req.legs:
+        raise HTTPException(400, "at least one leg is required")
+    return position_risk(s, req.symbol, [l.model_dump() for l in req.legs],
+                         req.account_equity)
+
+
+@app.get("/api/markets/delivery/{ticker}")
+def markets_delivery(ticker: str, s: Session = Depends(db)):
+    """Delivery percentage vs the stock's own history — real accumulation
+    versus intraday churn, from NSE's published MTO file."""
+    from .markets import delivery_profile
+    return delivery_profile(s, ticker)
+
+
+@app.get("/api/markets/valuation")
+def markets_valuation(index: str = "Nifty 50", s: Session = Depends(db)):
+    """Index P/E vs its own history, plus the large/mid/small multiple spread."""
+    from .markets import market_valuation, valuation_spread
+    return {"index": market_valuation(s, index), "segments": valuation_spread(s)}
+
+
+@app.get("/api/markets/simulate")
+def markets_simulate(horizon_days: int = 21, paths: int = 20000,
+                     s: Session = Depends(db)):
+    """Monte Carlo VaR / Expected Shortfall / drawdown on the actual book,
+    under Gaussian, Student-t AND a bootstrap of real history."""
+    from .markets import portfolio_simulation
+    return portfolio_simulation(s, horizon_days=horizon_days,
+                                n_paths=max(1000, min(paths, 60000)))
+
+
+@app.get("/api/markets/sources")
+def markets_sources():
+    """Data-source reachability. Exists because every archive fetch fails closed
+    (returns empty), so an unreachable source is otherwise indistinguishable
+    from a quiet market day."""
+    from ..ingestion.nse_archive import health_check
+    return health_check()
+
+
 # ---------------------------------------------------------------- static UI
 
 if WEB_DIR.exists():

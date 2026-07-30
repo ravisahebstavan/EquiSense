@@ -245,3 +245,39 @@ def test_option_chain_reports_when_nothing_is_stored(session_with_chain):
     out = NA.option_chain(session_with_chain, "NOSUCH", date(2025, 7, 24))
     assert out["rows"] == 0
     assert "reason" in out
+
+
+def test_index_underlyings_survive_a_symbol_filter():
+    """Observed: backfill filtered derivatives to the EQUITY universe, which has
+    no "NIFTY" row, so 24k derivative rows were ingested and the NIFTY chain
+    still reported "no F&O data". Index contracts are the most liquid in the
+    file and must never be filtered out."""
+    assert "NIFTY" in NA.INDEX_UNDERLYINGS
+    assert "BANKNIFTY" in NA.INDEX_UNDERLYINGS
+
+
+def test_retention_defaults_fit_a_free_tier():
+    """The F&O bhavcopy is ~35k rows/day (~9.5 MB); unbounded retention fills a
+    0.5 GB Postgres in about six weeks."""
+    assert NA.RETAIN_DERIVATIVE_DAYS <= 90
+    assert NA.RETAIN_INDEX_DAYS > NA.RETAIN_DERIVATIVE_DAYS, \
+        "index valuation history is small and its value IS the long history"
+
+
+def test_prune_removes_only_rows_past_the_window(session_with_chain):
+    from datetime import timedelta
+    from equisense.models import DerivativeQuote
+    s = session_with_chain
+    old = date.today() - timedelta(days=NA.RETAIN_DERIVATIVE_DAYS + 10)
+    s.bulk_insert_mappings(DerivativeQuote, [{
+        "trade_date": old, "symbol": "NIFTY", "instrument_type": "IDF",
+        "expiry": old + timedelta(days=7), "close": 1.0, "settlement_price": 1.0}])
+    s.commit()
+    before = s.query(DerivativeQuote).count()
+    out = NA.prune(s)
+    after = s.query(DerivativeQuote).count()
+    assert out["derivative_quotes"]["deleted"] >= 1
+    assert after == before - out["derivative_quotes"]["deleted"]
+    assert s.query(DerivativeQuote).filter(
+        DerivativeQuote.trade_date == date(2025, 7, 24)).count() > 0, \
+        "in-window rows must be untouched"

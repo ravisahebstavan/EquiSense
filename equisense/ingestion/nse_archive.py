@@ -333,19 +333,28 @@ def _existing_dates(session: Session, model, col) -> set:
     return {r[0] for r in session.execute(select(col).distinct()).all()}
 
 
+# Index underlyings are ALWAYS kept, whatever equity symbol filter is applied.
+# They are not in the equity universe (there is no "NIFTY" company row), so a
+# naive ticker filter silently discards exactly the most liquid and most useful
+# contracts in the file — observed: 24k derivative rows ingested and the NIFTY
+# chain still reported "no F&O data".
+INDEX_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
+                     "NIFTYNXT50", "NIFTYIT"}
+
+
 def ingest_derivatives(session: Session, d: date,
                        symbols: Optional[Iterable[str]] = None) -> int:
     """One trading day of F&O. Idempotent: re-ingesting a date replaces it.
 
     `symbols` restricts to a watchlist — the full file is ~35k rows/day, which
     is fine locally but wasteful on a free hosted Postgres if only a handful of
-    underlyings are ever analysed.
+    underlyings are ever analysed. Index underlyings are always retained.
     """
     rows = fetch_fo_bhavcopy(d)
     if not rows:
         return 0
     if symbols:
-        keep = {s.upper() for s in symbols}
+        keep = {s.upper() for s in symbols} | INDEX_UNDERLYINGS
         rows = [r for r in rows if r["symbol"].upper() in keep]
     if not rows:
         return 0
@@ -383,7 +392,8 @@ def ingest_index_close(session: Session, d: date) -> int:
 
 def backfill(session: Session, days: int = 30, end: Optional[date] = None,
              symbols: Optional[Iterable[str]] = None,
-             include_derivatives: bool = True) -> dict:
+             include_derivatives: bool = True,
+             derivative_symbols: Optional[Iterable[str]] = None) -> dict:
     """Walk back `days` calendar days, skipping weekends and missing files.
 
     Deliberately sequential and unthreaded: this is someone else's free
@@ -405,7 +415,12 @@ def backfill(session: Session, days: int = 30, end: Optional[date] = None,
             got += (n := ingest_index_close(session, d))
             stats["index_rows"] += n
         if include_derivatives and d not in have_deriv:
-            got += (n := ingest_derivatives(session, d, symbols))
+            # Default to INDEX UNDERLYINGS ONLY. The full F&O file is ~35k
+            # rows/day (~9.5 MB) and fills a free-tier Postgres in six weeks;
+            # index contracts are ~4.4k rows and carry most of the liquidity.
+            got += (n := ingest_derivatives(
+                session, d, derivative_symbols if derivative_symbols is not None
+                else list(INDEX_UNDERLYINGS)))
             stats["derivative_rows"] += n
         n = ingest_delivery(session, d, symbols)
         stats["delivery_rows"] += n
@@ -530,3 +545,70 @@ def fetch_index_constituents(index_key: str = "nifty50") -> list[dict]:
     can fall back to its pinned snapshot rather than starting with no universe."""
     raw = _get(index_constituents_url(index_key))
     return parse_constituents(raw.decode("utf-8", "replace")) if raw else []
+
+
+# ------------------------------------------------------------ retention
+# Free-tier Neon is ~0.5 GB. The F&O bhavcopy alone is ~35k rows/day (~9.5 MB),
+# which fills the tier in about six weeks. These are the defaults that keep the
+# hosted database inside its budget indefinitely; a local SQLite install can
+# raise them freely.
+RETAIN_DERIVATIVE_DAYS = 45      # ~1.2 MB/day at index-only scope
+RETAIN_DELIVERY_DAYS = 400       # tiny rows, and the history is the signal
+RETAIN_INDEX_DAYS = 4000         # ~160 rows/day, keep for valuation percentiles
+VAULT_MAX_BLOBS = 500            # raw payload archive, largest single consumer
+
+
+def prune(session: Session,
+          derivative_days: int = RETAIN_DERIVATIVE_DAYS,
+          delivery_days: int = RETAIN_DELIVERY_DAYS,
+          index_days: int = RETAIN_INDEX_DAYS) -> dict:
+    """Enforce the retention window. Safe to run on every refresh.
+
+    Derivatives age out fastest and are pruned hardest: an option chain is only
+    decision-relevant while its expiry is live, and the historical OI surface is
+    not something the platform currently studies. Delivery and index valuation
+    are kept long because their VALUE is the percentile history.
+    """
+    today = date.today()
+    out = {}
+    for name, model, col, days in (
+            ("derivative_quotes", DerivativeQuote, DerivativeQuote.trade_date, derivative_days),
+            ("delivery_stats", DeliveryStat, DeliveryStat.trade_date, delivery_days),
+            ("index_observations", IndexObservation, IndexObservation.obs_date, index_days)):
+        cutoff = today - timedelta(days=days)
+        res = session.execute(delete(model).where(col < cutoff))
+        out[name] = {"deleted": res.rowcount or 0, "cutoff": cutoff.isoformat()}
+    session.commit()
+    out["policy"] = (f"derivatives {derivative_days}d, delivery {delivery_days}d, "
+                     f"index {index_days}d — sized for a ~0.5 GB free tier")
+    return out
+
+
+def storage_report(session: Session) -> dict:
+    """Row counts and, on Postgres, real on-disk size per table."""
+    from sqlalchemy import func as _f
+    counts = {}
+    for name, model in (("derivative_quotes", DerivativeQuote),
+                        ("delivery_stats", DeliveryStat),
+                        ("index_observations", IndexObservation)):
+        counts[name] = session.scalar(select(_f.count()).select_from(model)) or 0
+    out = {"rows": counts, "retention": {
+        "derivative_days": RETAIN_DERIVATIVE_DAYS,
+        "delivery_days": RETAIN_DELIVERY_DAYS,
+        "index_days": RETAIN_INDEX_DAYS}}
+    try:
+        from ..db import IS_SQLITE
+        if not IS_SQLITE:
+            from sqlalchemy import text as _t
+            out["database_size"] = session.execute(
+                _t("select pg_size_pretty(pg_database_size(current_database()))")).scalar()
+            out["largest_tables"] = [
+                {"table": r[0], "rows": r[1], "size": r[2]}
+                for r in session.execute(_t(
+                    "select relname, n_live_tup, "
+                    "pg_size_pretty(pg_total_relation_size(relid)) "
+                    "from pg_stat_user_tables "
+                    "order by pg_total_relation_size(relid) desc limit 6")).all()]
+    except Exception:                              # noqa: BLE001 - reporting only
+        pass
+    return out
