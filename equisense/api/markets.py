@@ -43,19 +43,34 @@ def latest_derivative_date(session: Session,
 # ------------------------------------------------------------- derivatives
 
 def derivative_snapshot(session: Session, symbol: str = "NIFTY",
-                        risk_free: float = DEFAULT_RISK_FREE) -> dict:
+                        risk_free: float = DEFAULT_RISK_FREE,
+                        live: bool = True) -> dict:
     """Full derivatives view for one underlying: futures curve + option chain.
 
-    Returns a `available: False` payload with the reason rather than raising,
-    because "no F&O data ingested yet" is an ordinary state on a fresh database
-    and the UI needs to say so plainly.
+    LIVE BY DEFAULT — nothing is persisted. An option chain is decision-relevant
+    only while its expiry is running: no engine here studies historical open
+    interest or a past IV surface, so storing 35k rows per day bought nothing and
+    was the single largest consumer of a free-tier database (23 MB of 58 MB).
+    The whole file is one HTTP request, so the honest design is to fetch it when
+    asked and throw it away.
+
+    Contrast with delivery % and index valuation, which ARE persisted: their
+    value is the percentile-vs-own-history, the exchange publishes one file per
+    day, and rebuilding a year of history live would mean ~250 requests.
+
+    `live=False` falls back to stored rows, which is what tests and offline use
+    want.
     """
     symbol = symbol.upper()
+    if live:
+        snap = _live_derivative_snapshot(symbol, risk_free)
+        if snap.get("available"):
+            return snap
     td = latest_derivative_date(session, symbol)
     if td is None:
         return {"available": False, "symbol": symbol,
-                "reason": "no F&O bhavcopy ingested for this symbol yet",
-                "hint": "run: python -m equisense.ingestion --nse-days 5"}
+                "reason": "F&O archive unreachable and nothing stored for this symbol",
+                "hint": "check /api/markets/sources"}
 
     out: dict = {"available": True, "symbol": symbol, "trade_date": td.isoformat()}
 
@@ -123,24 +138,19 @@ def position_risk(session: Session, symbol: str, legs: list[dict],
     `legs` = [{kind: call|put|future, strike, quantity (lots, +long/-short),
                premium}]
     """
-    td = latest_derivative_date(session, symbol)
-    if td is None:
-        return {"available": False, "reason": "no F&O data for this symbol"}
-    chain = NA.option_chain(session, symbol, td)
-    spot = chain.get("underlying") or _underlying_price(session, symbol, td)
-    lot = chain.get("lot_size") or 1
-    dte = max(chain.get("days_to_expiry") or 7, 1)
+    # Reuses the LIVE snapshot (and its cache) so a proposed position is priced
+    # off the same chain the user is looking at, with nothing persisted.
+    snap = derivative_snapshot(session, symbol, risk_free)
+    if not snap.get("available"):
+        return {"available": False, "reason": snap.get("reason", "no F&O data")}
+    oc = snap.get("option_chain", {})
+    td = date.fromisoformat(snap["trade_date"])
+    spot = oc.get("underlying") or _underlying_price(session, symbol, td)
+    lot = oc.get("lot_size") or 1
+    dte = max(oc.get("days_to_expiry") or 7, 1)
     if not spot:
         return {"available": False, "reason": "no underlying reference price"}
-
-    # ATM implied vol drives both the greeks and the margin scan
-    quotes = [D.OptionQuote(strike=q["strike"], kind=q["kind"], price=q["price"],
-                            open_interest=q["open_interest"])
-              for q in chain.get("quotes", []) if q["price"]]
-    atm_iv = None
-    if quotes:
-        a = D.option_chain_analytics(quotes, spot, dte, risk_free, lot)
-        atm_iv = a.get("atm_iv_pct")
+    atm_iv = oc.get("atm_iv_pct")
     sigma = (atm_iv / 100.0) if atm_iv else 0.15
 
     T = dte / D.CALENDAR_DAYS
@@ -368,3 +378,86 @@ def portfolio_simulation(session: Session, horizon_days: int = 21,
     return {"available": True, "basis": basis, "risk": risk,
             "drawdown": dd if dd.get("computable") else None,
             "book_value": round(book.get("book_value", 0.0), 2)}
+
+
+# --------------------------------------------------- live (unstored) chains
+
+_LIVE_CACHE: dict[str, tuple[float, dict]] = {}
+LIVE_TTL_SECONDS = 900          # EOD archives change once a day; 15 min is ample
+
+
+def _recent_trading_days(n: int = 5) -> list[date]:
+    out, d = [], date.today()
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d -= timedelta(days=1)
+    return out
+
+
+def _live_derivative_snapshot(symbol: str, risk_free: float) -> dict:
+    """Fetch and analyse today's F&O file without storing a single row.
+
+    Process-memory cached for LIVE_TTL_SECONDS: the underlying archive is an
+    end-of-day file that changes once per trading day, so re-downloading 1.2 MB
+    per page view would be pure waste and unkind to a free source.
+    """
+    import time as _t
+
+    key = symbol.upper()
+    hit = _LIVE_CACHE.get(key)
+    if hit and (_t.time() - hit[0]) < LIVE_TTL_SECONDS:
+        return hit[1]
+
+    rows: list[dict] = []
+    td: Optional[date] = None
+    for d in _recent_trading_days(5):
+        rows = [r for r in NA.fetch_fo_bhavcopy(d)
+                if r["symbol"].upper() == key]
+        if rows:
+            td = d
+            break
+    if not rows or td is None:
+        return {"available": False, "symbol": key,
+                "reason": "no F&O rows for this symbol in the last 5 trading files"}
+
+    futures = sorted((r["expiry"], r["settlement_price"] or r["close"])
+                     for r in rows
+                     if r["instrument_type"] in ("IDF", "STF")
+                     and (r["settlement_price"] or r["close"]))
+    spot = next((r["underlying_price"] for r in rows if r["underlying_price"]), None)
+    out: dict = {"available": True, "symbol": key, "trade_date": td.isoformat(),
+                 "source": "live NSE archive (not stored)"}
+    out["term_structure"] = (D.term_structure(spot, futures, as_of=td) if futures and spot
+                             else {"contracts": [], "reason": "no futures rows"})
+
+    opts = [r for r in rows if r["instrument_type"] in ("IDO", "STO")
+            and r["strike"] and r["option_type"]]
+    live_expiries = sorted({r["expiry"] for r in opts if r["expiry"] > td})
+    if not opts or not live_expiries:
+        out["option_chain"] = {"computable": False,
+                               "reason": "no options with a live expiry"}
+    else:
+        expiry = live_expiries[0]
+        sel = [r for r in opts if r["expiry"] == expiry]
+        lot = next((r["lot_size"] for r in sel if r["lot_size"]), 1)
+        quotes = [D.OptionQuote(
+            strike=r["strike"],
+            kind="call" if r["option_type"] == "CE" else "put",
+            # settlement price exists for untraded strikes where close is 0;
+            # using close there would make IV unsolvable across the wings
+            price=r["settlement_price"] or r["close"] or 0.0,
+            open_interest=r["open_interest"] or 0.0,
+            change_in_oi=r["change_in_oi"] or 0.0,
+            volume=r["volume"] or 0.0) for r in sel]
+        quotes = [q for q in quotes if q.price > 0]
+        analytics = D.option_chain_analytics(
+            quotes, spot or 0.0, (expiry - td).days, risk_free=risk_free,
+            lot_size=lot or 1, period=td.isoformat())
+        analytics["expiry"] = expiry.isoformat()
+        analytics["expiries_available"] = [e.isoformat() for e in live_expiries]
+        analytics["iv_surface"] = analytics.get("iv_surface", [])[:400]
+        out["option_chain"] = analytics
+
+    _LIVE_CACHE[key] = (_t.time(), out)
+    return out

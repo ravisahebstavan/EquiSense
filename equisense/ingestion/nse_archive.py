@@ -579,8 +579,14 @@ def prune(session: Session,
         res = session.execute(delete(model).where(col < cutoff))
         out[name] = {"deleted": res.rowcount or 0, "cutoff": cutoff.isoformat()}
     session.commit()
+    try:
+        from .vault import prune_vault
+        out["vault"] = prune_vault(session)
+    except Exception as exc:                       # noqa: BLE001 - housekeeping
+        out["vault"] = {"error": str(exc)[:80]}
     out["policy"] = (f"derivatives {derivative_days}d, delivery {delivery_days}d, "
-                     f"index {index_days}d — sized for a ~0.5 GB free tier")
+                     f"index {index_days}d, vault rolling window — sized for a "
+                     f"~0.5 GB free tier")
     return out
 
 

@@ -686,11 +686,11 @@ def company_memory_view(company_id: int, s: Session = Depends(db)):
 
 
 @app.get("/api/markets/derivatives/{symbol}")
-def markets_derivatives(symbol: str, s: Session = Depends(db)):
+def markets_derivatives(symbol: str, live: bool = True, s: Session = Depends(db)):
     """Futures term structure (implied financing rate) + option chain with a
     solved IV surface, 25-delta skew, PCR and OI structure."""
     from .markets import derivative_snapshot
-    return derivative_snapshot(s, symbol)
+    return derivative_snapshot(s, symbol, live=live)
 
 
 class PositionLeg(BaseModel):

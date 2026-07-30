@@ -112,3 +112,50 @@ def vault_stats() -> dict:
     return {"artifacts": len(entries), "unique_blobs": len(blobs),
             "bytes": sum(e["bytes"] for e in entries),
             "providers": sorted({e["provider"] for e in entries})}
+
+
+# ------------------------------------------------------------- retention
+# The vault archives raw provider payloads so a normalized number can always be
+# traced back to what the source actually said. That is worth real storage — but
+# a daily refresh of ~50 tickers writes ~1.4 MB/day, which is ~500 MB/year and
+# would consume a free-tier Postgres on its own. On a hosted database the vault
+# therefore keeps a rolling window of the most recent fetches; locally (file
+# storage) it stays unbounded, because disk is free there.
+VAULT_MAX_FETCHES = 400
+
+
+def prune_vault(session=None, max_fetches: int = VAULT_MAX_FETCHES) -> dict:
+    """Keep the most recent `max_fetches` fetch records and drop orphan blobs.
+
+    Blobs are content-addressed and shared between fetches, so a blob is only
+    deleted once NO retained fetch references it.
+    """
+    from ..db import STORAGE
+    if STORAGE != "db":
+        return {"pruned": 0, "reason": "file storage — vault is unbounded locally"}
+    from sqlalchemy import delete, select
+
+    from ..db import get_session
+    from ..models import VaultBlob, VaultFetch
+
+    own = session is None
+    s = session or get_session()
+    try:
+        keep = [r[0] for r in s.execute(
+            select(VaultFetch.id).order_by(VaultFetch.id.desc())
+            .limit(max_fetches)).all()]
+        removed = 0
+        if keep:
+            res = s.execute(delete(VaultFetch).where(VaultFetch.id.notin_(keep)))
+            removed = res.rowcount or 0
+        live_hashes = {r[0] for r in s.execute(select(VaultFetch.hash).distinct()).all()}
+        orphans = [r[0] for r in s.execute(select(VaultBlob.hash)).all()
+                   if r[0] not in live_hashes]
+        if orphans:
+            s.execute(delete(VaultBlob).where(VaultBlob.hash.in_(orphans)))
+        s.commit()
+        return {"fetches_removed": removed, "orphan_blobs_removed": len(orphans),
+                "retained": len(keep), "policy": f"most recent {max_fetches} fetches"}
+    finally:
+        if own:
+            s.close()
