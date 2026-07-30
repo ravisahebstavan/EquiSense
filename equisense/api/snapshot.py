@@ -123,27 +123,36 @@ def build_universe_snapshot(session: Session) -> dict:
             "fragility": None, "exp_gap": None, "pe_pctile": None,
             "revenue_cagr_pct": None, "roic_pct": None, "pe": None,
             "dividend_yield_pct": None, "debt_to_equity": None,
-            "implied_growth_gap_pct": None,
+            "implied_growth_gap_pct": None, "f_signals_available": None,
+            "z_score_em": None,
         }
         if stmts and not c.is_financial:
             curr = stmts[-1]
             prev = stmts[-2] if len(stmts) >= 2 else None
             years = curr.fiscal_year - stmts[0].fiscal_year
             sig["revenue_cagr_pct"] = _cagr(stmts[0].revenue, curr.revenue, years)
-            sig["roic_pct"] = _r(ratios.roic(curr).value)
+            sig["roic_pct"] = _r(ratios.roic(curr, prev=prev).value)
             ps = {m.key: m for m in ratios.per_share_ratios(curr, price)}
             sig["pe"] = _r(ps["pe"].value) if "pe" in ps else None
             sig["dividend_yield_pct"] = _r(ps["dividend_yield"].value) if "dividend_yield" in ps else None
             lev = {m.key: m for m in ratios.leverage_ratios(curr)}
             sig["debt_to_equity"] = _r(lev["debt_to_equity"].value)
             if prev:
-                sig["f_score"] = quality.piotroski_f(curr, prev, price).value
+                f = quality.piotroski_f(curr, prev, price)
+                sig["f_score"] = f.value
+                # carried so quality_tier() can refuse to tier on sparse data
+                sig["f_signals_available"] = int(f.inputs.get("signals_available", 0))
             z = quality.altman_z(curr, price)
+            z_em = quality.altman_z_em(curr)
             sig["z_score"] = _r(z.value)
-            sig["z_zone"] = quality.altman_zone(z.value)
+            sig["z_score_em"] = _r(z_em.value)
+            # zone prefers the EM variant: price-invariant and calibrated for
+            # non-manufacturers, which most of this universe is
+            sig["z_zone"] = (quality.altman_zone_em(z_em.value)
+                             or quality.altman_zone(z.value))
             sig["ccs"] = _r(novel.cash_conviction(stmts).value)
             sig["fragility"] = _r(novel.fragility(stmts, closes).value)
-            rd = valuation.reverse_dcf(curr, price)
+            rd = valuation.reverse_dcf(curr, price, statements=stmts)
             hist = valuation.historical_fcf_cagr(stmts)
             if rd["implied_growth"].value is not None and hist and hist.value is not None:
                 sig["exp_gap"] = _r(rd["implied_growth"].value - hist.value)

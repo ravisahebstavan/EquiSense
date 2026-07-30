@@ -70,6 +70,19 @@ _SOFT_MIGRATIONS = [
     ("base_rates", "net_median_excess_pct", "FLOAT"),
     ("base_rates", "median_ci95_lo_pct", "FLOAT"),
     ("base_rates", "median_ci95_hi_pct", "FLOAT"),
+    # Wave S — cluster-robust inference + multiple-testing control
+    ("base_rates", "n_clusters", "INTEGER"),
+    ("base_rates", "icc", "FLOAT"),
+    ("base_rates", "design_effect", "FLOAT"),
+    ("base_rates", "mean_se_pct", "FLOAT"),
+    ("base_rates", "t_stat", "FLOAT"),
+    ("base_rates", "df", "INTEGER"),
+    ("base_rates", "p_value", "FLOAT"),
+    ("base_rates", "q_value", "FLOAT"),
+    ("base_rates", "admissible", "BOOLEAN DEFAULT 0"),
+    ("base_rates", "admissibility_reason", "TEXT"),
+    ("base_rates", "multiplicity_verdict", "TEXT"),
+    ("base_rates", "survives_multiplicity", "BOOLEAN DEFAULT 0"),
 ]
 
 

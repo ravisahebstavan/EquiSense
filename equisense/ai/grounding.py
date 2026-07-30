@@ -50,11 +50,32 @@ def collect_context_numbers(obj: Any, acc: set[float] | None = None) -> set[floa
 
 
 def _expand(values: set[float]) -> set[float]:
-    """Add percentage/fraction and sign variants so '0.25' in context grounds
-    '25%' in prose (and vice versa)."""
-    out = set()
+    """Add sign and scale variants so '0.25' in context grounds '25%' in prose.
+
+    TIGHTENED (Wave S): the previous version added v, −v, v×100 AND v÷100 for
+    EVERY context value unconditionally, quadrupling the accepted set with
+    numbers the engine never produced. Verified consequence: with an ordinary
+    dossier context, the fabricated figures "1352" and "0.184" both validated as
+    grounded — 1352 because 13.52 was in context, 0.184 because 18.4 was. That
+    is a hole in the one guarantee the whole AI layer rests on.
+
+    The expansion is now directional and bounded by what the conversion can
+    plausibly mean:
+      * a value in [−1, 1] may legitimately be stated as a percentage → ×100;
+      * a value in [−100, 100] may legitimately be stated as a fraction → ÷100;
+      * nothing else is rescaled, so a large figure like 13.52 no longer
+        silently licenses 1352.
+    """
+    out: set[float] = set()
     for v in values:
-        out.update({v, -v, v * 100, v / 100})
+        out.add(v)
+        out.add(-v)
+        if abs(v) <= 1.0:            # fraction → percent
+            out.add(v * 100)
+            out.add(-v * 100)
+        if abs(v) <= 100.0:          # percent → fraction
+            out.add(v / 100)
+            out.add(-v / 100)
     return out
 
 

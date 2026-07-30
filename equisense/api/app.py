@@ -543,16 +543,29 @@ def live_base_rates(s: Session = Depends(db)):
     from ..research.registry import REGISTRY
     rows = s.scalars(select(BaseRateRecord).order_by(BaseRateRecord.study_key)).all()
     return {"registry": REGISTRY,
+            "inference_note": (
+                "N_eff is design-effect corrected: N observations collapse to "
+                "n_clusters independent date blocks at the estimated ICC. "
+                "t/p are cluster-robust (Liang–Zeger) on G−1 df; q is "
+                "Benjamini–Hochberg FDR across the run. A cell with "
+                "admissible=false was measured but is not usable as evidence."),
             "records": [{
                 "study_key": r.study_key, "registry_ref": r.registry_ref,
                 "regime": r.regime_filter, "horizon_days": r.horizon_days,
                 "n": r.n, "n_eff": r.n_eff, "hit_rate": round(r.hit_rate, 3),
+                "n_clusters": r.n_clusters, "icc": r.icc,
+                "design_effect": r.design_effect,
                 "median_excess_pct": round(r.median_excess_pct, 2),
                 "net_median_excess_pct": None if r.net_median_excess_pct is None
                 else round(r.net_median_excess_pct, 2),
                 "cohort_breadth_pct": r.cohort_breadth_pct,
                 "ci95": None if r.median_ci95_lo_pct is None else f"{r.median_ci95_lo_pct}, {r.median_ci95_hi_pct}",
                 "iqr": [round(r.q25_excess_pct, 2), round(r.q75_excess_pct, 2)],
+                "t_stat": r.t_stat, "p_value": r.p_value, "q_value": r.q_value,
+                "admissible": bool(r.admissible),
+                "admissibility_reason": r.admissibility_reason,
+                "multiplicity_verdict": r.multiplicity_verdict,
+                "survives_multiplicity": bool(r.survives_multiplicity),
                 "computed_at": r.computed_at.isoformat(),
             } for r in rows]}
 

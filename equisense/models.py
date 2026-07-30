@@ -108,11 +108,24 @@ class BaseRateRecord(Base):
     horizon_days: Mapped[int] = mapped_column(Integer)
     regime_filter: Mapped[str] = mapped_column(String(30), default="all")
     n: Mapped[int] = mapped_column(Integer)
-    n_eff: Mapped[int | None] = mapped_column(Integer)               # overlap-corrected (§8 Phase II, A1 fix)
+    n_eff: Mapped[int | None] = mapped_column(Integer)               # design-effect corrected (Wave S)
+    n_clusters: Mapped[int | None] = mapped_column(Integer)          # independent date blocks
+    icc: Mapped[float | None] = mapped_column(Float)                 # estimated intraclass correlation
+    design_effect: Mapped[float | None] = mapped_column(Float)       # Kish variance inflation
     cohort_breadth_pct: Mapped[float | None] = mapped_column(Float)  # avg % of universe selected (A5)
     net_median_excess_pct: Mapped[float | None] = mapped_column(Float)  # after round-trip cost model
-    median_ci95_lo_pct: Mapped[float | None] = mapped_column(Float)     # moving-block bootstrap (PHASE2 §8)
+    median_ci95_lo_pct: Mapped[float | None] = mapped_column(Float)     # cluster bootstrap (Wave S)
     median_ci95_hi_pct: Mapped[float | None] = mapped_column(Float)
+    # cluster-robust inference + multiple-testing control (Wave S)
+    mean_se_pct: Mapped[float | None] = mapped_column(Float)         # Liang–Zeger cluster-robust SE
+    t_stat: Mapped[float | None] = mapped_column(Float)
+    df: Mapped[int | None] = mapped_column(Integer)                  # G−1, not N−1
+    p_value: Mapped[float | None] = mapped_column(Float)             # exact Student-t
+    q_value: Mapped[float | None] = mapped_column(Float)             # Benjamini–Hochberg FDR
+    admissible: Mapped[bool] = mapped_column(Boolean, default=False)
+    admissibility_reason: Mapped[str | None] = mapped_column(Text)
+    multiplicity_verdict: Mapped[str | None] = mapped_column(Text)
+    survives_multiplicity: Mapped[bool] = mapped_column(Boolean, default=False)
     hit_rate: Mapped[float | None] = mapped_column(Float)            # P(excess return > 0)
     mean_excess_pct: Mapped[float | None] = mapped_column(Float)
     median_excess_pct: Mapped[float | None] = mapped_column(Float)

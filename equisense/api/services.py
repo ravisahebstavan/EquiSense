@@ -91,9 +91,15 @@ def company_signals(session: Session, company: Company) -> pers.CompanySignals:
         sig.f_score = f.value
         sig.revenue_cagr_pct = cagr(stmts[0].revenue, curr.revenue,
                                     curr.fiscal_year - stmts[0].fiscal_year)
-    z = quality.altman_z(curr, price)
-    sig.z_zone = quality.altman_zone(z.value)
-    sig.roic_pct = ratios.roic(curr).value
+    prev = stmts[-2] if len(stmts) >= 2 else None
+    # Z''-EM is the calibration-appropriate variant for Indian non-manufacturers
+    # and does not move with the share price; keep the 1968 zone as a fallback.
+    z_em = quality.altman_z_em(curr)
+    if z_em.value is not None:
+        sig.z_zone = quality.altman_zone_em(z_em.value)
+    else:
+        sig.z_zone = quality.altman_zone(quality.altman_z(curr, price).value)
+    sig.roic_pct = ratios.roic(curr, prev=prev).value
     ps = {m.key: m for m in ratios.per_share_ratios(curr, price)}
     sig.pe = ps.get("pe").value if "pe" in ps else None
     sig.pb = ps.get("pb").value if "pb" in ps else None
@@ -101,7 +107,7 @@ def company_signals(session: Session, company: Company) -> pers.CompanySignals:
     lev = {m.key: m for m in ratios.leverage_ratios(curr)}
     sig.debt_to_equity = lev["debt_to_equity"].value
     if price is not None:
-        rd = valuation.reverse_dcf(curr, price)
+        rd = valuation.reverse_dcf(curr, price, statements=stmts)
         hist = valuation.historical_fcf_cagr(stmts)
         if rd["implied_growth"].value is not None and hist and hist.value is not None:
             sig.implied_growth_gap_pct = rd["implied_growth"].value - hist.value
@@ -134,7 +140,9 @@ def company_analysis(session: Session, company: Company,
 
     f = quality.piotroski_f(curr, prev, price) if prev else None
     z = quality.altman_z(curr, price)
-    rd = valuation.reverse_dcf(curr, price, dcf_assumptions) if price else None
+    z_em = quality.altman_z_em(curr)
+    rd = (valuation.reverse_dcf(curr, price, dcf_assumptions, statements=stmts)
+          if price else None)
     hist_fcf = valuation.historical_fcf_cagr(stmts)
     per_share = ratios.per_share_ratios(curr, price)
     ps_map = {m.key: m for m in per_share}
@@ -144,7 +152,9 @@ def company_analysis(session: Session, company: Company,
         "net_income": _series(stmts, lambda s: s.net_income),
         "operating_margin": _series(stmts, lambda s: None if not s.revenue or s.ebit is None
                                     else s.ebit / s.revenue * 100),
-        "roic": _series(stmts, lambda s: ratios.roic(s).value),
+        "roic": [{"period": st.period, "fiscal_year": st.fiscal_year,
+                  "value": ratios.roic(st, prev=(stmts[i - 1] if i else None)).rounded(2)}
+                 for i, st in enumerate(stmts)],
         "fcf": _series(stmts, lambda s: None if s.cfo is None or s.capex is None
                        else s.cfo - s.capex),
         "eps": _series(stmts, lambda s: None if not s.shares_outstanding or s.net_income is None
@@ -157,13 +167,17 @@ def company_analysis(session: Session, company: Company,
     cards = {
         "quality_scores": {
             "title": "Quality & Distress",
-            "metrics": md([m for m in [f, z] if m]),
+            "metrics": md([m for m in [f, z_em, z] if m]),
             "extras": {"z_zone": quality.altman_zone(z.value),
-                       "quality_tier": quality.quality_tier(f.value if f else None)},
+                       "z_em_zone": quality.altman_zone_em(z_em.value),
+                       "quality_tier": quality.quality_tier(
+                           f.value if f else None,
+                           int(f.inputs.get("signals_available", 0)) if f else None)},
         },
         "profitability": {
             "title": "Profitability & Returns",
-            "metrics": md(ratios.profitability_ratios(curr) + [ratios.roic(curr)]),
+            "metrics": md(ratios.profitability_ratios(curr, prev)
+                          + [ratios.roic(curr, prev=prev)]),
         },
         "growth_trends": {
             "title": "Growth & Trajectory",
@@ -202,7 +216,7 @@ def company_analysis(session: Session, company: Company,
         },
         "efficiency": {
             "title": "Efficiency",
-            "metrics": md(ratios.efficiency_ratios(curr)),
+            "metrics": md(ratios.efficiency_ratios(curr, prev)),
         },
         "peer_comparison": {
             "title": "Peer Comparison",
@@ -248,11 +262,12 @@ def peer_table(session: Session, company: Company) -> list[dict]:
             "revenue_cagr_pct": cagr(stmts[0].revenue, curr.revenue, years),
             "operating_margin_pct": None if not curr.revenue or curr.ebit is None
             else round(curr.ebit / curr.revenue * 100, 1),
-            "roic_pct": ratios.roic(curr).rounded(1),
+            "roic_pct": ratios.roic(curr, prev=prev).rounded(1),
             "pe": ps["pe"].rounded(1) if "pe" in ps else None,
             "ev_ebitda": ps["ev_ebitda"].rounded(1) if "ev_ebitda" in ps else None,
             "f_score": f.value if f else None,
-            "z_zone": quality.altman_zone(z.value),
+            "z_zone": (quality.altman_zone_em(quality.altman_z_em(curr).value)
+                       or quality.altman_zone(z.value)),
         })
     rows.sort(key=lambda r: -(r["revenue"] or 0))
     return rows
@@ -285,7 +300,8 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
     for cid in positions:
         snap = universe.get(cid)
         f = snap["signals"].get("f_score") if snap else None
-        quality_tiers[cid] = quality.quality_tier(f)
+        n_sig = snap["signals"].get("f_signals_available") if snap else None
+        quality_tiers[cid] = quality.quality_tier(f, n_sig)
 
     conc = pf.concentration(
         positions, prices,

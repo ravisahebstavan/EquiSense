@@ -191,16 +191,32 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                 f"P/E at {pe_pct.value:.0f}th percentile of own history"
                 if pe_pct.value is not None else "", [pe_pct]))
     if stmts and price and not company.is_financial:
-        rd = valuation.reverse_dcf(stmts[-1], price)
+        # Beta is ESTIMATED from this name's own history against NIFTY and shrunk
+        # toward 1.0 (Vasicek), instead of the previous hardcoded 1.0. Beta drives
+        # Ke → WACC → the entire reverse-DCF solve, so assuming 1.0 for every
+        # company injected a large, one-directional error into the headline
+        # valuation output.
+        beta_m = valuation.estimate_beta(closes, _macro(session, "^NSEI", 600), period=period)
+        wacc_a = valuation.WaccAssumptions()
+        if beta_m.value is not None:
+            wacc_a.beta = beta_m.value
+        rd = valuation.reverse_dcf(
+            stmts[-1], price,
+            valuation.ReverseDcfAssumptions(wacc=wacc_a),
+            statements=stmts)
         hist = valuation.historical_fcf_cagr(stmts)
         if rd["implied_growth"].value is not None and hist and hist.value is not None:
             gap = rd["implied_growth"].value - hist.value
+            metrics = [rd["implied_growth"], hist, rd["wacc"]]
+            if beta_m.value is not None:
+                metrics.append(beta_m)
             E.append(ev("valuation", "valuation.expectations", "value",
                         S("exp_gap", invert=True),
                         f"Expectations Gap {gap:+.1f}pp (implied {rd['implied_growth'].value:.1f}% "
                         f"vs delivered {hist.value:.1f}%)",
-                        [rd["implied_growth"], hist],
-                        caveats=[rd["implied_growth"].caveat or ""]))
+                        metrics,
+                        caveats=[c for c in (rd["implied_growth"].caveat,
+                                             hist.caveat, beta_m.caveat) if c]))
 
     # ---- quality cluster (F/Z exploratory-capped; CCS/Fragility SHADOW) ----
     if stmts and not company.is_financial:
@@ -208,10 +224,24 @@ def build_evidence(session: Session, company: Company, regime_key: str,
         if prev:
             f = quality.piotroski_f(curr, prev, price)
             if f.value is not None:
+                n_avail = int(f.inputs.get("signals_available", 0))
                 E.append(ev("quality", "quality.fscore", "quality", S("f_score"),
-                            f"Piotroski F {f.value:.0f}/9", [f]))
+                            f"Piotroski F {f.value:.1f}/9"
+                            + ("" if n_avail >= 9 else f" ({n_avail}/9 signals disclosed)"),
+                            [f], caveats=[f.caveat] if f.caveat else None))
+        # Both distress models are emitted: Z''-EM is the calibration-appropriate
+        # one here and is price-invariant, while the 1968 Z is retained for
+        # comparability. Only the EM variant carries evidence weight, so a share
+        # price fall cannot circularly become "distress evidence" about itself.
         z = quality.altman_z(curr, price)
-        if z.value is not None:
+        z_em = quality.altman_z_em(curr)
+        if z_em.value is not None:
+            E.append(ev("quality", "quality.zscore", "quality", S("z_score"),
+                        f"Altman Z''-EM {z_em.value:.2f} "
+                        f"({quality.altman_zone_em(z_em.value)})",
+                        [z_em] + ([z] if z.value is not None else []),
+                        caveats=[c for c in (z_em.caveat,) if c]))
+        elif z.value is not None:
             E.append(ev("quality", "quality.zscore", "quality", S("z_score"),
                         f"Altman Z {z.value:.2f} ({quality.altman_zone(z.value)})",
                         [z], caveats=[z.caveat or ""]))

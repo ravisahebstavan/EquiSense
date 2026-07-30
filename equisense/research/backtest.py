@@ -63,7 +63,9 @@ def strategy_backtest(session: Session, top_n: int = 3,
     mom = closes.shift(21) / closes.shift(252) - 1
     vol = rets.rolling(126, min_periods=100).std()
     up = (rets > 0).rolling(231, min_periods=180).mean()
-    mqi = (mom / vol.replace(0, pd.NA)) * (0.5 + up)
+    # trend-direction agreement, matching engine.novel.momentum_quality and
+    # research.base_rates.feat_momentum_quality (Wave S directional fix)
+    mqi = (mom / vol.replace(0, pd.NA)) * (0.5 + up.where(mom >= 0, 1.0 - up))
     trend = closes / closes.rolling(200, min_periods=200).mean() - 1
     vsurge = volumes.rolling(21, min_periods=15).mean() / \
         volumes.rolling(126, min_periods=100).mean()

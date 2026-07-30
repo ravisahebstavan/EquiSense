@@ -18,6 +18,60 @@ def _m(key, label, value, unit, formula, inputs, period, family, caveat=None) ->
                   inputs=inputs, period=period, family=family, caveat=caveat)
 
 
+# India's headline corporate rate under the concessional regime (22% + surcharge
+# + cess). Used only as a documented fallback when a filing's implied effective
+# rate is not economically meaningful.
+STATUTORY_TAX_RATE = 0.2517
+# Plausible band for a derived effective tax rate. Outside this, the ratio is
+# being driven by exceptional items, loss carry-forwards or a refund year, and
+# propagating it produces impossible NOPAT (see effective_tax_rate).
+EFF_TAX_MIN, EFF_TAX_MAX = 0.0, 0.60
+
+AVERAGE_BALANCE_NOTE = ("Return denominators use the AVERAGE of opening and "
+                        "closing balances. Period-end denominators bias returns "
+                        "downward for a growing balance sheet, which is the "
+                        "common case.")
+ENDING_BALANCE_NOTE = ("Prior-period balance sheet unavailable, so the "
+                       "period-END denominator is used. For a company whose "
+                       "balance sheet grew during the year this understates the "
+                       "return; compare across years with that in mind.")
+
+
+def effective_tax_rate(s: StatementData,
+                       override: Optional[float] = None) -> tuple[Optional[float], Optional[str]]:
+    """(rate, caveat) — a usable effective tax rate, or the statutory fallback.
+
+    A raw tax_expense/PBT ratio is routinely outside [0, 1]: refund years make it
+    negative, and near-breakeven PBT makes it explode. Feeding that straight into
+    NOPAT = EBIT x (1 - t) produces arithmetic that cannot be true — a negative
+    rate makes NOPAT EXCEED EBIT, and a rate above 1 makes NOPAT negative while
+    EBIT is positive. Both were previously possible and both were verified.
+    """
+    if override is not None:
+        return override, None
+    if s.tax_expense is None or s.pbt in (None, 0):
+        return STATUTORY_TAX_RATE, (
+            f"Effective tax rate not derivable from this filing; using India's "
+            f"statutory {STATUTORY_TAX_RATE:.2%} as a stated assumption.")
+    raw = s.tax_expense / s.pbt
+    if EFF_TAX_MIN <= raw <= EFF_TAX_MAX:
+        return raw, None
+    return STATUTORY_TAX_RATE, (
+        f"Filing-implied effective tax rate {raw:.1%} is outside the plausible "
+        f"{EFF_TAX_MIN:.0%}–{EFF_TAX_MAX:.0%} band (refund year, loss "
+        f"carry-forward or near-zero PBT), so the statutory "
+        f"{STATUTORY_TAX_RATE:.2%} is used instead. Raw ratio retained in inputs.")
+
+
+def _avg(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
+    """Average balance when both periods are present, else the current one."""
+    if curr is None:
+        return None
+    if prev is None:
+        return curr
+    return (curr + prev) / 2.0
+
+
 # ---------------------------------------------------------------- liquidity
 
 def liquidity_ratios(s: StatementData) -> list[Metric]:
@@ -78,7 +132,11 @@ def leverage_ratios(s: StatementData) -> list[Metric]:
 
 # ------------------------------------------------------------- profitability
 
-def profitability_ratios(s: StatementData) -> list[Metric]:
+def profitability_ratios(s: StatementData,
+                         prev: Optional[StatementData] = None) -> list[Metric]:
+    """Margins plus returns. Return denominators (equity, assets) average
+    opening and closing balances when `prev` is supplied — see
+    AVERAGE_BALANCE_NOTE for why period-end denominators bias returns down."""
     out = []
     gm = safe_div(s.gross_profit, s.revenue)
     out.append(_m("gross_margin", "Gross Margin", None if gm is None else gm * 100, "%",
@@ -100,89 +158,157 @@ def profitability_ratios(s: StatementData) -> list[Metric]:
                   f"Net income {fmt(s.net_income)} / Revenue {fmt(s.revenue)}",
                   {"net_income": s.net_income, "revenue": s.revenue},
                   s.period, "profitability"))
-    roe = safe_div(s.net_income, s.total_equity)
+    eq_prev = prev.total_equity if prev else None
+    ta_prev = prev.total_assets if prev else None
+    eq_avg, ta_avg = _avg(s.total_equity, eq_prev), _avg(s.total_assets, ta_prev)
+    eq_averaged, ta_averaged = eq_prev is not None, ta_prev is not None
+
+    roe = safe_div(s.net_income, eq_avg)
     out.append(_m("roe", "Return on Equity", None if roe is None else roe * 100, "%",
-                  f"Net income {fmt(s.net_income)} / Total equity {fmt(s.total_equity)}",
-                  {"net_income": s.net_income, "total_equity": s.total_equity},
-                  s.period, "profitability"))
-    roa = safe_div(s.net_income, s.total_assets)
+                  f"Net income {fmt(s.net_income)} / {'average' if eq_averaged else 'closing'} "
+                  f"equity {fmt(eq_avg)}",
+                  {"net_income": s.net_income, "total_equity": eq_avg,
+                   "equity_opening": eq_prev, "equity_closing": s.total_equity,
+                   "denominator": "average" if eq_averaged else "closing"},
+                  s.period, "profitability",
+                  caveat=AVERAGE_BALANCE_NOTE if eq_averaged else ENDING_BALANCE_NOTE))
+    roa = safe_div(s.net_income, ta_avg)
     out.append(_m("roa", "Return on Assets", None if roa is None else roa * 100, "%",
-                  f"Net income {fmt(s.net_income)} / Total assets {fmt(s.total_assets)}",
-                  {"net_income": s.net_income, "total_assets": s.total_assets},
-                  s.period, "profitability"))
-    out.extend(dupont_decomposition(s))
+                  f"Net income {fmt(s.net_income)} / {'average' if ta_averaged else 'closing'} "
+                  f"assets {fmt(ta_avg)}",
+                  {"net_income": s.net_income, "total_assets": ta_avg,
+                   "assets_opening": ta_prev, "assets_closing": s.total_assets,
+                   "denominator": "average" if ta_averaged else "closing"},
+                  s.period, "profitability",
+                  caveat=AVERAGE_BALANCE_NOTE if ta_averaged else ENDING_BALANCE_NOTE))
+    out.extend(dupont_decomposition(s, prev))
     return out
 
 
-def dupont_decomposition(s: StatementData) -> list[Metric]:
-    """3-way DuPont: ROE = Net margin × Asset turnover × Equity multiplier."""
+def dupont_decomposition(s: StatementData,
+                         prev: Optional[StatementData] = None) -> list[Metric]:
+    """3-way DuPont: ROE = Net margin × Asset turnover × Equity multiplier.
+
+    Uses the same average denominators as `profitability_ratios`, which keeps the
+    identity exact: NI/avgE = (NI/Rev)·(Rev/avgA)·(avgA/avgE). Mixing averaged
+    ROE with period-end DuPont terms would silently break the decomposition — the
+    product would not reconcile to the ROE shown one card above it.
+    """
+    ta_avg = _avg(s.total_assets, prev.total_assets if prev else None)
+    eq_avg = _avg(s.total_equity, prev.total_equity if prev else None)
+    averaged = prev is not None
+    label_suffix = " (avg)" if averaged else ""
     nm = safe_div(s.net_income, s.revenue)
-    at = safe_div(s.revenue, s.total_assets)
-    em = safe_div(s.total_assets, s.total_equity)
+    at = safe_div(s.revenue, ta_avg)
+    em = safe_div(ta_avg, eq_avg)
+    note = (AVERAGE_BALANCE_NOTE if averaged else ENDING_BALANCE_NOTE) + \
+        " Net margin x Asset turnover x Equity multiplier reconciles exactly to the ROE above."
     out = [
         _m("dupont_net_margin", "DuPont · Net Margin", None if nm is None else nm * 100, "%",
            f"Net income {fmt(s.net_income)} / Revenue {fmt(s.revenue)}",
            {"net_income": s.net_income, "revenue": s.revenue}, s.period, "profitability"),
-        _m("dupont_asset_turnover", "DuPont · Asset Turnover", at, "x",
-           f"Revenue {fmt(s.revenue)} / Total assets {fmt(s.total_assets)}",
-           {"revenue": s.revenue, "total_assets": s.total_assets}, s.period, "profitability"),
-        _m("dupont_equity_multiplier", "DuPont · Equity Multiplier", em, "x",
-           f"Total assets {fmt(s.total_assets)} / Total equity {fmt(s.total_equity)}",
-           {"total_assets": s.total_assets, "total_equity": s.total_equity}, s.period, "profitability"),
+        _m("dupont_asset_turnover", f"DuPont · Asset Turnover{label_suffix}", at, "x",
+           f"Revenue {fmt(s.revenue)} / {'average' if averaged else 'closing'} assets {fmt(ta_avg)}",
+           {"revenue": s.revenue, "total_assets": ta_avg,
+            "denominator": "average" if averaged else "closing"},
+           s.period, "profitability", caveat=note),
+        _m("dupont_equity_multiplier", f"DuPont · Equity Multiplier{label_suffix}", em, "x",
+           f"{'Average' if averaged else 'Closing'} assets {fmt(ta_avg)} / "
+           f"{'average' if averaged else 'closing'} equity {fmt(eq_avg)}",
+           {"total_assets": ta_avg, "total_equity": eq_avg,
+            "denominator": "average" if averaged else "closing"},
+           s.period, "profitability", caveat=note),
     ]
     return out
 
 
-def roic(s: StatementData, tax_rate: Optional[float] = None) -> Metric:
-    """ROIC = NOPAT / invested capital.
+def roic(s: StatementData, tax_rate: Optional[float] = None,
+         prev: Optional[StatementData] = None) -> Metric:
+    """ROIC = NOPAT / average invested capital.
 
     NOPAT = EBIT × (1 − effective tax rate); invested capital = total debt +
-    total equity − cash (§10.3). Effective tax rate from the filing when
-    derivable, else the supplied assumption.
+    total equity − cash (§10.3). The tax rate is sanity-bounded (see
+    `effective_tax_rate`) and the denominator averages opening and closing
+    invested capital when the prior period is available, which is standard
+    practice: NOPAT is a flow earned across the year, so charging it against the
+    year-end capital base understates the return of any growing company.
     """
-    eff_tax = tax_rate
-    if eff_tax is None and s.tax_expense is not None and s.pbt not in (None, 0):
-        eff_tax = s.tax_expense / s.pbt
+    eff_tax, tax_caveat = effective_tax_rate(s, tax_rate)
     nopat = None if (s.ebit is None or eff_tax is None) else s.ebit * (1 - eff_tax)
-    ic = None
-    if s.total_debt is not None and s.total_equity is not None and s.cash is not None:
-        ic = s.total_debt + s.total_equity - s.cash
+
+    def ic_of(x: Optional[StatementData]) -> Optional[float]:
+        if x is None or x.total_debt is None or x.total_equity is None or x.cash is None:
+            return None
+        return x.total_debt + x.total_equity - x.cash
+
+    ic_curr, ic_prev = ic_of(s), ic_of(prev)
+    ic = _avg(ic_curr, ic_prev)
+    averaged = ic_curr is not None and ic_prev is not None
     val = safe_div(nopat, ic)
+    caveats = [c for c in (tax_caveat,
+                           AVERAGE_BALANCE_NOTE if averaged else ENDING_BALANCE_NOTE) if c]
+    raw_eff = (s.tax_expense / s.pbt) if (s.tax_expense is not None
+                                          and s.pbt not in (None, 0)) else None
     return _m("roic", "Return on Invested Capital", None if val is None else val * 100, "%",
               f"NOPAT (EBIT {fmt(s.ebit)} × (1 − tax {fmt(None if eff_tax is None else eff_tax * 100)}%)) "
-              f"/ Invested capital (debt {fmt(s.total_debt)} + equity {fmt(s.total_equity)} − cash {fmt(s.cash)})",
-              {"ebit": s.ebit, "effective_tax_rate": eff_tax, "total_debt": s.total_debt,
+              f"/ {'average' if averaged else 'closing'} invested capital {fmt(ic)} "
+              f"(debt {fmt(s.total_debt)} + equity {fmt(s.total_equity)} − cash {fmt(s.cash)})",
+              {"ebit": s.ebit, "effective_tax_rate": eff_tax,
+               "effective_tax_rate_raw": raw_eff,
+               "nopat": nopat, "invested_capital": ic,
+               "invested_capital_opening": ic_prev, "invested_capital_closing": ic_curr,
+               "denominator": "average" if averaged else "closing",
+               "total_debt": s.total_debt,
                "total_equity": s.total_equity, "cash": s.cash},
-              s.period, "profitability")
+              s.period, "profitability", caveat=" ".join(caveats) or None)
 
 
 # ---------------------------------------------------------------- efficiency
 
-def efficiency_ratios(s: StatementData) -> list[Metric]:
+def efficiency_ratios(s: StatementData,
+                      prev: Optional[StatementData] = None) -> list[Metric]:
+    """Turnover and working-capital days.
+
+    Working-capital days compare a period-END stock against a FULL-YEAR flow, so
+    an average stock is the methodologically correct numerator; a year-end
+    receivables spike otherwise reads as a permanent collections problem.
+    """
     out = []
-    at = safe_div(s.revenue, s.total_assets)
+    averaged = prev is not None
+    denom_label = "average" if averaged else "closing"
+    note = AVERAGE_BALANCE_NOTE if averaged else ENDING_BALANCE_NOTE
+    ta_avg = _avg(s.total_assets, prev.total_assets if prev else None)
+    inv_avg = _avg(s.inventory, prev.inventory if prev else None)
+    rec_avg = _avg(s.receivables, prev.receivables if prev else None)
+    pay_avg = _avg(s.payables, prev.payables if prev else None)
+
+    at = safe_div(s.revenue, ta_avg)
     out.append(_m("asset_turnover", "Asset Turnover", at, "x",
-                  f"Revenue {fmt(s.revenue)} / Total assets {fmt(s.total_assets)}",
-                  {"revenue": s.revenue, "total_assets": s.total_assets},
-                  s.period, "efficiency"))
+                  f"Revenue {fmt(s.revenue)} / {denom_label} assets {fmt(ta_avg)}",
+                  {"revenue": s.revenue, "total_assets": ta_avg,
+                   "denominator": denom_label},
+                  s.period, "efficiency", caveat=note))
     cogs = None
     if s.revenue is not None and s.gross_profit is not None:
         cogs = s.revenue - s.gross_profit
-    inv_days = safe_div(s.inventory, cogs)
+    inv_days = safe_div(inv_avg, cogs)
     inv_days = None if inv_days is None else inv_days * 365
     out.append(_m("inventory_days", "Inventory Days", inv_days, "days",
-                  f"Inventory {fmt(s.inventory)} / COGS {fmt(cogs)} × 365",
-                  {"inventory": s.inventory, "cogs": cogs}, s.period, "efficiency"))
-    rec_days = safe_div(s.receivables, s.revenue)
+                  f"{denom_label.capitalize()} inventory {fmt(inv_avg)} / COGS {fmt(cogs)} × 365",
+                  {"inventory": inv_avg, "cogs": cogs}, s.period, "efficiency",
+                  caveat=note))
+    rec_days = safe_div(rec_avg, s.revenue)
     rec_days = None if rec_days is None else rec_days * 365
     out.append(_m("receivable_days", "Receivable Days", rec_days, "days",
-                  f"Receivables {fmt(s.receivables)} / Revenue {fmt(s.revenue)} × 365",
-                  {"receivables": s.receivables, "revenue": s.revenue}, s.period, "efficiency"))
-    pay_days = safe_div(s.payables, cogs)
+                  f"{denom_label.capitalize()} receivables {fmt(rec_avg)} / Revenue {fmt(s.revenue)} × 365",
+                  {"receivables": rec_avg, "revenue": s.revenue}, s.period, "efficiency",
+                  caveat=note))
+    pay_days = safe_div(pay_avg, cogs)
     pay_days = None if pay_days is None else pay_days * 365
     out.append(_m("payable_days", "Payable Days", pay_days, "days",
-                  f"Payables {fmt(s.payables)} / COGS {fmt(cogs)} × 365",
-                  {"payables": s.payables, "cogs": cogs}, s.period, "efficiency"))
+                  f"{denom_label.capitalize()} payables {fmt(pay_avg)} / COGS {fmt(cogs)} × 365",
+                  {"payables": pay_avg, "cogs": cogs}, s.period, "efficiency",
+                  caveat=note))
     ccc = None
     if inv_days is not None and rec_days is not None and pay_days is not None:
         ccc = inv_days + rec_days - pay_days
@@ -238,6 +364,11 @@ def per_share_ratios(s: StatementData, price: Optional[float] = None) -> list[Me
     return out
 
 
-def all_ratios(s: StatementData, price: Optional[float] = None) -> list[Metric]:
-    return (liquidity_ratios(s) + leverage_ratios(s) + profitability_ratios(s)
-            + [roic(s)] + efficiency_ratios(s) + per_share_ratios(s, price))
+def all_ratios(s: StatementData, price: Optional[float] = None,
+               prev: Optional[StatementData] = None) -> list[Metric]:
+    """Every ratio family for one period. Pass `prev` (the immediately preceding
+    period) to get average-balance return and turnover denominators; without it
+    the closing balance is used and every affected Metric says so in its caveat."""
+    return (liquidity_ratios(s) + leverage_ratios(s) + profitability_ratios(s, prev)
+            + [roic(s, prev=prev)] + efficiency_ratios(s, prev)
+            + per_share_ratios(s, price))

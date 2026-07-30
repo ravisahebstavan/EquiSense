@@ -179,13 +179,72 @@ def test_base_rates_endpoint_serializes_n_eff_and_net():
     """Regression: /api/live/base-rates silently dropped n_eff and
     net_median_excess_pct even though the DB and the frontend both expect
     them (caught by a full visual pass — the Lab table showed bare '—' in
-    every N_eff cell despite real values in the database)."""
+    every N_eff cell despite real values in the database).
+
+    This test used to be ORDER-DEPENDENT: it ran the study pipeline against the
+    app's shared database and only passed when some earlier test happened to
+    leave price history behind. On a fresh database it produced no records and
+    failed. It now seeds its own history, so it tests the serializer rather than
+    the test-execution order.
+    """
+    import random
+
     from fastapi.testclient import TestClient
+
+    from sqlalchemy import select
+
     from equisense.api.app import app
+    from equisense.db import ensure_schema, get_session
+    from equisense.models import MacroObservation
+
+    ensure_schema()
+    s = get_session()
+    try:
+        rng = random.Random(23)
+        d0, n_days = date(2019, 1, 1), 1000
+        existing = {c.ticker for c in s.scalars(select(Company)).all()}
+        for i in range(12):
+            ticker = f"BRT{i:02d}"
+            if ticker in existing:
+                continue
+            c = Company(ticker=ticker, name=f"BaseRate{i}",
+                        sector=["IT", "FMCG", "Energy", "Auto"][i % 4])
+            s.add(c)
+            s.flush()
+            price = 100.0
+            rows = []
+            for d in range(n_days):
+                price *= (1 + rng.gauss(0.0004 if i % 2 else 0.0002, 0.018))
+                rows.append({"company_id": c.id, "obs_date": d0 + timedelta(days=d),
+                             "close": price,
+                             "volume": abs(rng.gauss(1e6, 2e5))})
+            s.bulk_insert_mappings(PriceObservation, rows)
+        nifty = 10000.0
+        if not s.scalars(select(MacroObservation)
+                         .where(MacroObservation.symbol == "^NSEI")).first():
+            mrows = []
+            for d in range(n_days):
+                nifty *= (1 + rng.gauss(0.0003, 0.010))
+                mrows.append({"symbol": "^NSEI", "role": "index",
+                              "obs_date": d0 + timedelta(days=d), "close": nifty})
+            s.bulk_insert_mappings(MacroObservation, mrows)
+        s.commit()
+    finally:
+        s.close()
+
     with TestClient(app) as c:
-        c.post("/api/live/studies/run")
+        run = c.post("/api/live/studies/run").json()
         r = c.get("/api/live/base-rates").json()
+    assert run["records"], f"study pipeline published nothing: {run}"
     assert r["records"], "expected published base-rate records"
     with_n_eff = [rec for rec in r["records"] if rec.get("n_eff") is not None]
     assert with_n_eff, "no record exposed n_eff — the API is dropping it again"
     assert any(rec.get("net_median_excess_pct") is not None for rec in r["records"])
+    # Wave S: the inference decomposition and multiplicity verdict must survive
+    # serialization too, or the Lab shows a bare number with no provenance.
+    for rec in with_n_eff:
+        assert rec["n_clusters"] is not None
+        assert rec["design_effect"] is not None
+        assert rec["multiplicity_verdict"]
+        assert rec["n_eff"] <= rec["n"], "N_eff can never exceed N"
+        break

@@ -28,12 +28,23 @@ def momentum_quality(closes: Sequence[float], period: str = "") -> Metric:
     """Momentum Quality Index (MQI) — EquiSense original.
 
     Rewards *smooth* trend over violent trend: identical 12-1 returns score
-    higher when achieved with lower volatility and more persistent daily
-    progress. Construction:
+    higher in magnitude when achieved with lower volatility and more consistent
+    daily progress in the trend's own direction. Construction:
         MQI = risk_adjusted_momentum × persistence_multiplier
         risk-adj momentum = (12-1 return %) / (annualized vol %)
-        persistence = fraction of up days over the momentum window
+        persistence = fraction of days moving WITH the sign of momentum
         multiplier = 0.5 + persistence  (range 0.5–1.5)
+
+    DIRECTIONAL FIX (Wave S): persistence was previously the raw up-day fraction,
+    regardless of trend direction. In a downtrend the up-day fraction is low, so
+    the multiplier fell below 1 and *shrank* the bearish score — meaning a smooth,
+    relentless decline was scored as WEAKER evidence than a choppy one, the exact
+    inverse of the construction's stated intent. Verified before the fix: a smooth
+    decline (−19.8% momentum) and a choppy decline (−44.0%) ranked in the wrong
+    order relative to their path quality. Persistence is now measured as agreement
+    with the direction of momentum, so path consistency amplifies the signal
+    symmetrically on both sides.
+
     Hypothesis (registered: HYP-004): smooth momentum decays slower than raw
     momentum — path quality carries information about holder composition.
     """
@@ -41,22 +52,32 @@ def momentum_quality(closes: Sequence[float], period: str = "") -> Metric:
     vol = realized_vol(closes, 126).value
     window = closes[-(TRADING_DAYS - 21):-21] if len(closes) >= TRADING_DAYS else closes
     ups = sum(1 for i in range(1, len(window)) if window[i] > window[i - 1])
-    persistence = ups / max(1, len(window) - 1)
+    n_moves = max(1, len(window) - 1)
+    up_fraction = ups / n_moves
+    # agreement with the trend's own direction, not "went up"
+    if mom is None:
+        persistence = up_fraction
+    else:
+        persistence = up_fraction if mom >= 0 else (1.0 - up_fraction)
     if mom is None or vol in (None, 0):
         value = None
         formula = "insufficient history"
     else:
         value = (mom / vol) * (0.5 + persistence)
         formula = (f"({fmt(mom)}% mom / {fmt(vol)}% vol) × "
-                   f"(0.5 + persistence {persistence:.2f})")
+                   f"(0.5 + trend-agreement {persistence:.2f})")
     return Metric(
         key="momentum_quality", label="Momentum Quality Index (MQI)",
         value=value, unit="score", formula=formula,
         inputs={"momentum_12_1_pct": mom, "vol_126d_pct": vol,
-                "up_day_fraction": round(persistence, 3)},
+                "up_day_fraction": round(up_fraction, 3),
+                "trend_agreement_fraction": round(persistence, 3)},
         period=period, family="novel",
         caveat="EquiSense-original composite; hypothesis HYP-004 in the registry. "
-               "Not a validated standalone signal until its base-rate table says so.")
+               "Persistence measures agreement with the direction of momentum, so "
+               "the score is symmetric: a smooth decline is strongly negative, not "
+               "weakly negative. Not a validated standalone signal until its "
+               "base-rate table says so.")
 
 
 # ---------------------------------------------------------------- CCS
