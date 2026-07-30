@@ -174,12 +174,30 @@ def fragility(stmts: list[StatementData], closes: Sequence[float],
 # ------------------------------------------------------- valuation history
 
 def pe_percentile_vs_history(closes: Sequence[float], close_dates: Sequence[date],
-                             stmts: list[StatementData], period: str = "") -> Metric:
+                             stmts: list[StatementData], period: str = "",
+                             nominal_closes: Optional[Sequence[float]] = None) -> Metric:
     """Current trailing P/E's percentile within its own multi-year P/E history.
 
     Historical P/E at each month-end uses the latest fiscal year EPS *known at
     that time* (PIT-honest within the reconstructed-fundamentals caveat).
+
+    PRICE CONVENTION (Wave S): pass `nominal_closes` — the split-adjusted but
+    NOT dividend-adjusted series. A total-return series back-deflates historical
+    prices while leaving the most recent bar alone, so dividing it by nominal
+    filing EPS understates every historical P/E and leaves today's P/E at full
+    value. The percentile then reads systematically "expensive", and because that
+    percentile is inverted into the value cluster it applied a standing bearish
+    tilt. At ~1.3% dividend yield over 10 years the oldest bar is deflated ~12%.
+
+    When `nominal_closes` is absent the function still computes, but says in its
+    caveat that the series may be dividend-adjusted and the level may be biased.
     """
+    price_series = nominal_closes if nominal_closes else closes
+    using_nominal = bool(nominal_closes)
+    if len(price_series) != len(close_dates):
+        price_series = closes
+        using_nominal = False
+    closes = price_series
     eps_by_fy_end: list[tuple[date, float]] = []
     for s in stmts:
         if s.net_income and s.shares_outstanding:
@@ -216,10 +234,17 @@ def pe_percentile_vs_history(closes: Sequence[float], close_dates: Sequence[date
                 f"observations of own history",
         inputs={"pe_now": pe_now, "pe_history_min": min(pes),
                 "pe_history_median": sorted(pes)[len(pes) // 2],
-                "pe_history_max": max(pes), "n_observations": len(pes)},
+                "pe_history_max": max(pes), "n_observations": len(pes),
+                "price_convention": "nominal (split-adjusted)" if using_nominal
+                                    else "UNKNOWN — may be dividend-adjusted"},
         period=period, family="novel",
-        caveat="EPS timeline reconstructed from latest-known filings "
-               "(pit_grade: reconstructed) with a 60-day publication lag assumption.")
+        caveat=("EPS timeline reconstructed from latest-known filings "
+                "(pit_grade: reconstructed) with a 60-day publication lag assumption."
+                + ("" if using_nominal else
+                   " WARNING: no nominal price series was supplied, so this P/E "
+                   "history may be computed from dividend-adjusted prices. That "
+                   "deflates older P/Es and biases the percentile toward "
+                   "'expensive'. Re-ingest prices to populate close_raw.")))
 
 
 # ---------------------------------------------------------------- TVT

@@ -25,19 +25,26 @@ UNIVERSE_KEY = "universe"
 SNAP_VERSION = 4  # bump when the item schema changes → forces a rebuild
 
 
-def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list]]:
-    """One query → {company_id: (dates, closes, volumes)} ordered oldest→newest."""
+def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
+    """One query → {company_id: (dates, closes, volumes, nominal_closes)}.
+
+    `closes` is the TOTAL-RETURN series (returns/momentum/vol basis);
+    `nominal_closes` is split-adjusted only and is what anything dividing a
+    price by a per-share accounting figure must use. See PriceObservation.
+    """
     rows = session.execute(
         select(PriceObservation.company_id, PriceObservation.obs_date,
-               PriceObservation.close, PriceObservation.volume)
+               PriceObservation.close, PriceObservation.volume,
+               PriceObservation.close_raw)
         .order_by(PriceObservation.company_id, PriceObservation.obs_date)).all()
-    out: dict[int, tuple[list, list, list]] = {}
-    for cid, d, c, v in rows:
+    out: dict[int, tuple[list, list, list, list]] = {}
+    for cid, d, c, v, raw in rows:
         if cid not in out:
-            out[cid] = ([], [], [])
+            out[cid] = ([], [], [], [])
         out[cid][0].append(d)
         out[cid][1].append(c)
         out[cid][2].append(v)
+        out[cid][3].append(raw)
     return out
 
 
@@ -102,7 +109,7 @@ def build_universe_snapshot(session: Session) -> dict:
     items = []
     ret63_by_ticker: dict[str, Optional[float]] = {}
     for c in companies:
-        dates, closes, volumes = prices.get(c.id, ([], [], []))
+        dates, closes, volumes, nominal = prices.get(c.id, ([], [], [], []))
         if len(closes) < 60:
             continue
         stmts = statements.get(c.id, [])
@@ -157,7 +164,9 @@ def build_universe_snapshot(session: Session) -> dict:
             if rd["implied_growth"].value is not None and hist and hist.value is not None:
                 sig["exp_gap"] = _r(rd["implied_growth"].value - hist.value)
                 sig["implied_growth_gap_pct"] = sig["exp_gap"]
-            sig["pe_pctile"] = _r(novel.pe_percentile_vs_history(closes, dates, stmts).value)
+            nom = nominal if nominal and all(x is not None for x in nominal) else None
+            sig["pe_pctile"] = _r(novel.pe_percentile_vs_history(
+                closes, dates, stmts, nominal_closes=nom).value)
 
         window = closes[-252:]  # 1y of closes, downsampled to ≤40 points
         step = max(1, len(window) // 40)

@@ -30,11 +30,26 @@ from . import services
 
 
 def _series(session: Session, cid: int):
+    """(dates, total_return_closes, volumes) — the return-computation basis."""
     rows = session.execute(
         select(PriceObservation.obs_date, PriceObservation.close, PriceObservation.volume)
         .where(PriceObservation.company_id == cid)
         .order_by(PriceObservation.obs_date)).all()
     return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows])
+
+
+def _nominal_closes(session: Session, cid: int) -> list[float] | None:
+    """Split-adjusted-only closes, for anything that divides a price by a
+    per-share accounting figure. None when the column was never backfilled, so
+    consumers can say so rather than silently using the wrong convention."""
+    rows = session.execute(
+        select(PriceObservation.close_raw)
+        .where(PriceObservation.company_id == cid)
+        .order_by(PriceObservation.obs_date)).all()
+    vals = [r[0] for r in rows]
+    if not vals or any(v is None for v in vals):
+        return None
+    return vals
 
 
 def _macro(session: Session, symbol: str, limit: int | None = None) -> list[float]:
@@ -186,7 +201,9 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                                             126, regime_key)))
 
     # ---- value cluster ----
-    pe_pct = novel.pe_percentile_vs_history(closes, dates, stmts, period)
+    pe_pct = novel.pe_percentile_vs_history(
+        closes, dates, stmts, period,
+        nominal_closes=_nominal_closes(session, company.id))
     E.append(ev("novel", "novel.value", "value", S("pe_pctile", invert=True),
                 f"P/E at {pe_pct.value:.0f}th percentile of own history"
                 if pe_pct.value is not None else "", [pe_pct]))

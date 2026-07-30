@@ -62,37 +62,74 @@ def sync_universe(session: Session) -> dict[str, int]:
 
 
 def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
-                  chunk: int = 25) -> int:
-    """Append-only daily close ingestion (only rows newer than each company's
-    stored max date). Batch-downloaded to respect the source."""
+                  chunk: int = 25, refetch: bool = False) -> int:
+    """Daily price ingestion, storing BOTH price conventions per bar.
+
+    Two series are required and they are not interchangeable:
+
+      close      total-return (splits AND dividends adjusted) — the correct basis
+                 for returns, momentum, volatility and correlation.
+      close_raw  nominal (splits/bonus only) — the price that actually traded,
+                 needed wherever a price meets a per-share accounting figure.
+
+    Why both: this previously fetched with ``auto_adjust=True`` and stored only
+    the total-return close. Dividend adjustment back-deflates HISTORICAL prices
+    (the most recent bar is unadjusted), so dividing that series by nominal
+    filing EPS produced a historical P/E series biased low — which made
+    ``pe_percentile_vs_history`` read systematically "expensive" and put a
+    standing bearish tilt on the value cluster. At ~1.3% yield over 10 years the
+    oldest bar is deflated ~12%.
+
+    Append-only by default. Pass ``refetch=True`` to rewrite existing bars,
+    which is required once to backfill ``close_raw`` on a database ingested
+    before this change.
+    """
     tickers = list(ids)
     inserted = 0
     for i in range(0, len(tickers), chunk):
         batch = tickers[i:i + chunk]
         symbols = [yahoo_symbol(t) for t in batch]
+        # auto_adjust=False keeps BOTH columns: "Close" is split-adjusted only,
+        # "Adj Close" is split+dividend adjusted.
         data = yf.download(symbols, period=f"{years}y", interval="1d",
-                           auto_adjust=True, progress=False, group_by="ticker",
+                           auto_adjust=False, progress=False, group_by="ticker",
                            threads=True)
         for t, sym in zip(batch, symbols):
             cid = ids[t]
-            latest = session.scalar(select(func.max(PriceObservation.obs_date))
-                                    .where(PriceObservation.company_id == cid))
+            latest = None if refetch else session.scalar(
+                select(func.max(PriceObservation.obs_date))
+                .where(PriceObservation.company_id == cid))
             try:
                 frame = data[sym] if len(symbols) > 1 else data
-                closes = frame["Close"].dropna()
+                nominal = frame["Close"].dropna()
+                total_ret = frame["Adj Close"] if "Adj Close" in frame else frame["Close"]
                 volumes = frame["Volume"]
             except KeyError:
                 log.warning("no price data for %s", sym)
                 continue
             store_raw(frame, "yahoo", f"history/{sym}", {"years": years}, session=session)
+            existing: dict = {}
+            if refetch:
+                existing = {r.obs_date: r for r in session.scalars(
+                    select(PriceObservation)
+                    .where(PriceObservation.company_id == cid)).all()}
             rows = []
-            for d, c in closes.items():
-                if latest is not None and d.date() <= latest:
+            for d, nom in nominal.items():
+                day = d.date()
+                if latest is not None and day <= latest:
                     continue
+                adj = total_ret.get(d)
+                adj = float(nom) if adj is None or math.isnan(adj) else float(adj)
                 v = volumes.get(d)
-                rows.append({"company_id": cid, "obs_date": d.date(),
-                             "close": float(c),
-                             "volume": None if v is None or math.isnan(v) else float(v)})
+                v = None if v is None or math.isnan(v) else float(v)
+                row = existing.get(day)
+                if row is not None:
+                    row.close, row.close_raw, row.volume = adj, float(nom), v
+                    inserted += 1
+                    continue
+                rows.append({"company_id": cid, "obs_date": day,
+                             "close": adj, "close_raw": float(nom),
+                             "volume": v})
             if rows:
                 session.bulk_insert_mappings(PriceObservation, rows)
                 inserted += len(rows)
@@ -106,7 +143,7 @@ def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
     candle, typically ≤15 min delayed for NSE). This is what keeps paper
     fills anchored to executable reality while the site is open."""
     symbols = [yahoo_symbol(t) for t in ids]
-    data = yf.download(symbols, period="5d", interval="1d", auto_adjust=True,
+    data = yf.download(symbols, period="5d", interval="1d", auto_adjust=False,
                        progress=False, group_by="ticker", threads=True)
     updated = inserted = 0
     latest_prices: dict[str, float] = {}
@@ -114,27 +151,35 @@ def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
         cid = ids[t]
         try:
             frame = data[sym] if len(symbols) > 1 else data
-            closes = frame["Close"].dropna()
+            nominal = frame["Close"].dropna()
+            total_ret = frame["Adj Close"] if "Adj Close" in frame else frame["Close"]
             volumes = frame["Volume"]
         except KeyError:
             continue
-        for d, c in closes.items():
+        for d, nom in nominal.items():
             v = volumes.get(d)
             v = None if v is None or math.isnan(v) else float(v)
+            adj = total_ret.get(d)
+            adj = float(nom) if adj is None or math.isnan(adj) else float(adj)
             row = session.execute(
                 select(PriceObservation)
                 .where(PriceObservation.company_id == cid,
                        PriceObservation.obs_date == d.date())).scalar_one_or_none()
             if row is None:
                 session.add(PriceObservation(company_id=cid, obs_date=d.date(),
-                                             close=float(c), volume=v))
+                                             close=adj, close_raw=float(nom),
+                                             volume=v))
                 inserted += 1
-            elif abs(row.close - float(c)) > 1e-9 or (v is not None and row.volume != v):
-                row.close = float(c)
+            elif (abs(row.close - adj) > 1e-9 or row.close_raw is None
+                  or abs((row.close_raw or 0) - float(nom)) > 1e-9
+                  or (v is not None and row.volume != v)):
+                row.close = adj
+                row.close_raw = float(nom)
                 row.volume = v
                 updated += 1
-        if len(closes):
-            latest_prices[t] = round(float(closes.iloc[-1]), 2)
+        # paper fills and displayed quotes must use the NOMINAL traded price
+        if len(nominal):
+            latest_prices[t] = round(float(nominal.iloc[-1]), 2)
     session.commit()
     return {"updated": updated, "inserted": inserted, "prices": latest_prices,
             "as_of_utc": datetime.now(timezone.utc).isoformat()}

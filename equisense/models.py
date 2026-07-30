@@ -83,7 +83,17 @@ class PriceObservation(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
     obs_date: Mapped[date] = mapped_column(Date, index=True)
+    # TOTAL-RETURN series: adjusted for splits AND dividends. Correct for every
+    # return/momentum/volatility/correlation computation.
     close: Mapped[float] = mapped_column(Float)                    # ₹ per share
+    # NOMINAL series: adjusted for splits/bonuses ONLY — the price actually
+    # traded that day. Required wherever a price meets a per-share accounting
+    # figure, because filing EPS/BVPS are nominal. Dividing a dividend-adjusted
+    # close by a nominal EPS deflates historical P/E and makes a valuation
+    # percentile read systematically "expensive". Nullable: rows ingested before
+    # this split are total-return only and must not silently masquerade as
+    # nominal (see PriceObservation usage notes in ingestion/yahoo.py).
+    close_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
     volume: Mapped[float | None] = mapped_column(Float, nullable=True)  # shares traded
 
 

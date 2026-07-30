@@ -376,3 +376,67 @@ def test_grounding_flags_fabricated_numbers():
     r = validate("ROIC came in at 31.4% versus 27.9% last year", _ctx())
     assert r["grounded"] is False
     assert set(r["violations"]) == {"31.4", "27.9"}
+
+
+# --------------------------------------------------- price convention (Wave S)
+
+def test_pe_percentile_uses_nominal_prices_not_total_return():
+    """Observed: prices were ingested with auto_adjust=True, so the stored series
+    is dividend-adjusted. Dividend adjustment back-deflates HISTORICAL bars while
+    leaving the latest bar alone, so dividing that series by nominal filing EPS
+    understates every past P/E and leaves today's at full value. The percentile
+    then reads systematically 'expensive', and because it is inverted into the
+    value cluster it applied a standing bearish tilt.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    n = 2600
+    d0 = _date(2016, 4, 1)
+    dates, nominal = [], []
+    px = 100.0
+    for i in range(n):
+        dates.append(d0 + _td(days=i))
+        px *= (1 + 0.00025)          # steady nominal drift, no valuation change
+        nominal.append(px)
+    # total-return series: history deflated by cumulative dividends still to come
+    yld = 0.013
+    total_ret = [p / ((1 + yld) ** ((n - 1 - i) / 365.0)) for i, p in enumerate(nominal)]
+    assert total_ret[0] < nominal[0] and total_ret[-1] == pytest.approx(nominal[-1])
+
+    stmts = [stmt(period=f"FY{2017 + k}", fiscal_year=2017 + k,
+                  net_income=100.0 * (1.00025 ** (365 * k)), shares_outstanding=10.0)
+             for k in range(7)]
+
+    biased = novel.pe_percentile_vs_history(total_ret, dates, stmts)
+    correct = novel.pe_percentile_vs_history(total_ret, dates, stmts,
+                                             nominal_closes=nominal)
+    assert biased.value is not None and correct.value is not None
+    assert biased.value > correct.value, \
+        "the dividend-adjusted series must overstate how expensive the stock looks"
+    assert correct.inputs["price_convention"].startswith("nominal")
+    assert "UNKNOWN" in biased.inputs["price_convention"]
+    assert "WARNING" in biased.caveat
+
+
+def test_pe_percentile_warns_when_no_nominal_series_supplied():
+    from datetime import date as _date, timedelta as _td
+    dates = [_date(2018, 1, 1) + _td(days=i) for i in range(600)]
+    closes = [100.0 + i * 0.05 for i in range(600)]
+    stmts = [stmt(period="FY2019", fiscal_year=2019, net_income=100.0,
+                  shares_outstanding=10.0)]
+    m = novel.pe_percentile_vs_history(closes, dates, stmts)
+    if m.value is not None:
+        assert "WARNING" in (m.caveat or "")
+
+
+def test_pe_percentile_ignores_mismatched_nominal_series():
+    """A length mismatch must fall back safely, not misalign price to date."""
+    from datetime import date as _date, timedelta as _td
+    dates = [_date(2018, 1, 1) + _td(days=i) for i in range(600)]
+    closes = [100.0 + i * 0.05 for i in range(600)]
+    stmts = [stmt(period="FY2019", fiscal_year=2019, net_income=100.0,
+                  shares_outstanding=10.0)]
+    m = novel.pe_percentile_vs_history(closes, dates, stmts, nominal_closes=[1.0, 2.0])
+    assert m is not None
+    if m.value is not None:
+        assert "UNKNOWN" in m.inputs["price_convention"]
