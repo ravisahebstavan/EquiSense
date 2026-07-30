@@ -28,6 +28,7 @@ from ..engine import montecarlo as MC
 from ..ingestion import nse_archive as NA
 from ..models import (Company, DeliveryStat, DerivativeQuote, IndexObservation,
                       PriceObservation)
+from .snapshot import get_universe
 
 DEFAULT_RISK_FREE = 0.065
 
@@ -613,3 +614,80 @@ def relationships(session: Session, lookback: int = 900,
     out["common_dates"] = n_common
     out["assets_included"] = list(series)
     return out
+
+
+# ------------------------------------------------------- institutional flow
+
+_DEALS_CACHE: dict = {"ts": 0.0, "rows": None}
+DEALS_TTL_SECONDS = 1800
+
+
+def _todays_deals() -> list[dict]:
+    """Bulk + block deals, fetched live and NOT stored — they are a same-day
+    disclosure file and nothing here studies their history yet."""
+    import time as _t
+    if _DEALS_CACHE["rows"] is not None and (_t.time() - _DEALS_CACHE["ts"]) < DEALS_TTL_SECONDS:
+        return _DEALS_CACHE["rows"]
+    rows = NA.fetch_bulk_deals() + NA.fetch_block_deals()
+    _DEALS_CACHE.update(ts=_t.time(), rows=rows)
+    return rows
+
+
+def institutional_flow(session: Session, ticker: Optional[str] = None) -> dict:
+    """Net disclosed institutional activity from NSE bulk/block deals.
+
+    Reports NET direction scaled by liquidity, never gross activity: bulk deals
+    are frequently one fund selling to another, so the same rupees appear on
+    both sides. Verified live — the four largest names by gross value all had a
+    net-to-gross ratio within 0.02 of zero.
+    """
+    from ..engine.novel import institutional_flow as flow_metric
+
+    deals = _todays_deals()
+    if not deals:
+        return {"available": False,
+                "reason": "no bulk/block deal file available (holiday, or not yet published)"}
+    universe = {}
+    try:
+        universe = {c["ticker"]: c for c in get_universe(session)["companies"]}
+    except Exception:                              # noqa: BLE001
+        pass
+
+    by_symbol: dict[str, list[dict]] = {}
+    for d in deals:
+        by_symbol.setdefault(d["symbol"], []).append(d)
+
+    if ticker:
+        t = ticker.upper()
+        adv = (universe.get(t) or {}).get("adv_cr")
+        m = flow_metric(by_symbol.get(t, []), adv_cr=adv,
+                        period=str(deals[0]["trade_date"]))
+        return {"available": True, "ticker": t, "trade_date": str(deals[0]["trade_date"]),
+                "flow": m.to_dict()}
+
+    ranked = []
+    for sym, ds in by_symbol.items():
+        adv = (universe.get(sym) or {}).get("adv_cr")
+        m = flow_metric(ds, adv_cr=adv, period=str(deals[0]["trade_date"]))
+        i = m.inputs
+        ranked.append({"symbol": sym, "in_universe": sym in universe,
+                       "deals": i["deals"], "net_value_cr": i["net_value_cr"],
+                       "gross_value_cr": i["gross_value_cr"],
+                       "net_to_gross_ratio": i["net_to_gross_ratio"],
+                       "days_of_adv": m.value,
+                       "counterparties": i["distinct_counterparties"]})
+    directional = [r for r in ranked
+                   if r["net_to_gross_ratio"] is not None
+                   and abs(r["net_to_gross_ratio"]) >= 0.5]
+    return {
+        "available": True,
+        "trade_date": str(deals[0]["trade_date"]),
+        "total_deals": len(deals), "symbols": len(by_symbol),
+        "by_net_value": sorted(ranked, key=lambda r: -abs(r["net_value_cr"]))[:15],
+        "directional": sorted(directional, key=lambda r: -abs(r["net_value_cr"]))[:10],
+        "note": ("`directional` keeps only names where NET is at least half of "
+                 "GROSS. Everything else is funds crossing stock with each other: "
+                 "large gross value with no net is the common case and carries no "
+                 "directional claim, which is the single easiest way to misread "
+                 "this file."),
+    }

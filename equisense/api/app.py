@@ -760,6 +760,14 @@ def markets_relationships(lookback: int = 900, s: Session = Depends(db)):
     return relationships(s, lookback=max(120, min(lookback, 2500)))
 
 
+@app.get("/api/markets/flow")
+def markets_flow(ticker: str | None = None, s: Session = Depends(db)):
+    """Net disclosed institutional activity from NSE bulk/block deals — NET
+    direction scaled by liquidity, never gross value."""
+    from .markets import institutional_flow
+    return institutional_flow(s, ticker)
+
+
 @app.get("/api/markets/sources")
 def markets_sources():
     """Data-source reachability. Exists because every archive fetch fails closed

@@ -618,3 +618,51 @@ def storage_report(session: Session) -> dict:
     except Exception:                              # noqa: BLE001 - reporting only
         pass
     return out
+
+
+# --------------------------------------------------------------- bulk deals
+
+def bulk_deals_url() -> str:
+    return f"{BASE}/content/equities/bulk.csv"
+
+
+def block_deals_url() -> str:
+    return f"{BASE}/content/equities/block.csv"
+
+
+def parse_deals(csv_text: str) -> list[dict]:
+    """Bulk/block deal disclosures.
+
+    `Date,Symbol,Security Name,Client Name,Buy/Sell,Quantity Traded,
+     Trade Price / Wght. Avg. Price,Remarks`
+
+    These are SEBI-mandated disclosures of large trades with the counterparty
+    NAMED, which is as close to observing institutional intent as free data
+    gets. They are also easy to over-read: a bulk deal is frequently one fund
+    selling to another, so gross activity says far less than NET direction.
+    """
+    out: list[dict] = []
+    for r in csv.DictReader(io.StringIO(csv_text)):
+        d = _d(r.get("Date", ""))
+        sym = (r.get("Symbol") or "").strip()
+        qty = _f(r.get("Quantity Traded", ""))
+        px = _f(r.get("Trade Price / Wght. Avg. Price", ""))
+        side = (r.get("Buy/Sell") or "").strip().upper()
+        if not d or not sym or qty is None or side not in ("BUY", "SELL"):
+            continue
+        out.append({"trade_date": d, "symbol": sym,
+                    "client": (r.get("Client Name") or "").strip(),
+                    "side": "buy" if side == "BUY" else "sell",
+                    "quantity": qty, "price": px,
+                    "value": None if px is None else qty * px})
+    return out
+
+
+def fetch_bulk_deals() -> list[dict]:
+    raw = _get(bulk_deals_url())
+    return parse_deals(raw.decode("utf-8", "replace")) if raw else []
+
+
+def fetch_block_deals() -> list[dict]:
+    raw = _get(block_deals_url())
+    return parse_deals(raw.decode("utf-8", "replace")) if raw else []

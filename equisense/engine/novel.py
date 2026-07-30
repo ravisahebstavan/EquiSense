@@ -348,3 +348,62 @@ def crowding_proxy(closes: Sequence[float], volumes: Sequence[Optional[float]],
                 "Volume-only: no delivery data supplied for this name, so a surge "
                 "driven by intraday churn is indistinguishable from real "
                 "accumulation. Ingest the NSE MTO file to close that gap."))
+
+
+# -------------------------------------------------------- institutional flow
+
+def institutional_flow(deals: Sequence[dict], adv_cr: Optional[float] = None,
+                       period: str = "") -> Metric:
+    """Net disclosed institutional activity from NSE bulk/block deals.
+
+    SEBI requires disclosure of large trades with the counterparty NAMED, which
+    is the closest free data comes to observing institutional intent.
+
+    Two things make the naive reading wrong, and both are handled here:
+
+    1. **Gross activity is nearly meaningless.** A bulk deal is very often one
+       fund selling to another, so the same volume can appear on both sides of
+       the tape. Only the NET (buy value − sell value) carries a directional
+       claim.
+    2. **Size is only meaningful relative to liquidity.** ₹50 crore of net
+       buying is enormous in a small cap and noise in Reliance, so the net is
+       expressed in DAYS OF AVERAGE TRADED VALUE rather than in rupees.
+
+    This is a descriptive flow measure, not a validated signal — it has no
+    registered hypothesis and no base-rate table, and says so.
+    """
+    if not deals:
+        return Metric(key="institutional_flow", label="Net Institutional Flow",
+                      value=None, unit="days of ADV",
+                      formula="no disclosed bulk/block deals in the window",
+                      inputs={"deals": 0}, period=period, family="novel",
+                      caveat="Absence of disclosure is not absence of activity — "
+                             "only trades above the disclosure threshold appear.")
+    buy = sum(d.get("value") or 0.0 for d in deals if d.get("side") == "buy")
+    sell = sum(d.get("value") or 0.0 for d in deals if d.get("side") == "sell")
+    net_cr = (buy - sell) / 1e7
+    gross_cr = (buy + sell) / 1e7
+    value = None if not adv_cr else net_cr / adv_cr
+    counterparties = {d.get("client", "") for d in deals if d.get("client")}
+    return Metric(
+        key="institutional_flow", label="Net Institutional Flow",
+        value=None if value is None else round(value, 3), unit="days of ADV",
+        formula=(f"(buy ₹{buy / 1e7:,.1f}cr − sell ₹{sell / 1e7:,.1f}cr) "
+                 f"= net ₹{net_cr:+,.1f}cr"
+                 + (f" / ADV ₹{adv_cr:,.1f}cr = {value:+.2f} days"
+                    if value is not None else " (no ADV reference)")),
+        inputs={"deals": len(deals), "buy_value_cr": round(buy / 1e7, 2),
+                "sell_value_cr": round(sell / 1e7, 2),
+                "net_value_cr": round(net_cr, 2),
+                "gross_value_cr": round(gross_cr, 2),
+                "net_to_gross_ratio": (round(net_cr / gross_cr, 3)
+                                       if gross_cr else None),
+                "distinct_counterparties": len(counterparties),
+                "adv_cr": adv_cr},
+        period=period, family="novel",
+        caveat=("Disclosed bulk/block deals only, so this is a floor on activity, "
+                "not a measure of it. A net-to-gross ratio near zero means funds "
+                "were trading with each other rather than accumulating or "
+                "distributing — high gross with no net is the common case and is "
+                "NOT a directional signal. No registered hypothesis backs this "
+                "yet: it is measured so it can be tested, not asserted."))

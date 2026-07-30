@@ -285,3 +285,58 @@ def test_prune_removes_only_rows_past_the_window(session_with_chain):
     assert s.query(DerivativeQuote).filter(
         DerivativeQuote.trade_date == fresh).count() == 1, \
         "in-window rows must be untouched"
+
+
+# ------------------------------------------------------------ bulk deals
+
+DEALS_CSV = "\n".join([
+    ("Date,Symbol,Security Name,Client Name,Buy/Sell,Quantity Traded,"
+     "Trade Price / Wght. Avg. Price,Remarks"),
+    "30-JUL-2026,ACME,Acme Ltd,FUND A,BUY,100000,500.00,-",
+    "30-JUL-2026,ACME,Acme Ltd,FUND B,SELL,100000,500.50,-",
+    "30-JUL-2026,REALBUY,Real Ltd,FUND C,BUY,200000,250.00,-",
+    "30-JUL-2026,BADROW,Bad Ltd,FUND D,HOLD,100,10.00,-",
+])
+
+
+def test_parse_deals_reads_side_quantity_and_value():
+    rows = NA.parse_deals(DEALS_CSV)
+    assert len(rows) == 3, "the non-BUY/SELL row must be skipped"
+    acme = [r for r in rows if r["symbol"] == "ACME"]
+    assert {r["side"] for r in acme} == {"buy", "sell"}
+    assert acme[0]["value"] == pytest.approx(100000 * 500.00)
+    assert acme[0]["trade_date"] == date(2026, 7, 30)
+    assert acme[0]["client"] == "FUND A"
+
+
+def test_flow_reports_net_not_gross():
+    """The trap this exists to avoid: bulk deals are frequently one fund
+    selling to another, so gross value looks enormous while net is ~zero.
+    Verified live — the four largest names by gross all had net/gross ~0.00."""
+    from equisense.engine.novel import institutional_flow
+    rows = NA.parse_deals(DEALS_CSV)
+    crossed = [r for r in rows if r["symbol"] == "ACME"]
+    m = institutional_flow(crossed, adv_cr=10.0)
+    assert m.inputs["gross_value_cr"] > 9.0
+    assert abs(m.inputs["net_to_gross_ratio"]) < 0.02, "crossed trade has no net"
+
+    directional = [r for r in rows if r["symbol"] == "REALBUY"]
+    m2 = institutional_flow(directional, adv_cr=10.0)
+    assert m2.inputs["net_to_gross_ratio"] == pytest.approx(1.0)
+    assert m2.value > 0
+
+
+def test_flow_scales_by_liquidity_not_rupees():
+    """Rs50cr of net buying is enormous in a small cap and noise in Reliance."""
+    from equisense.engine.novel import institutional_flow
+    rows = [r for r in NA.parse_deals(DEALS_CSV) if r["symbol"] == "REALBUY"]
+    small = institutional_flow(rows, adv_cr=1.0)
+    large = institutional_flow(rows, adv_cr=100.0)
+    assert small.value > large.value * 10
+
+
+def test_flow_without_deals_says_disclosure_is_a_floor():
+    from equisense.engine.novel import institutional_flow
+    m = institutional_flow([])
+    assert m.value is None
+    assert "not absence of activity" in m.caveat
