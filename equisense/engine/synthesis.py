@@ -85,25 +85,103 @@ PROVISIONAL_NOTE = ("Cluster weights are UNIFORM (provisional): the calibration 
                     "family required to unlock learned weights (§17 Gate 4).")
 
 
-def null_sd(cluster_counts: dict[str, int]) -> float:
-    """Closed-form null standard deviation of `net_score`.
+def null_sd(cluster_counts: dict[str, int],
+            weights: Optional[dict[str, float]] = None,
+            cluster_corr: Optional[dict] = None) -> float:
+    """Null standard deviation of `net_score`, correlation-aware.
 
-    Under the percentile normalization, an uninformative name's evidence
-    strengths are U(-1, 1). With C clusters holding m_c evidence each:
-        Var(net) = (1 / 3C²) · Σ_c (1 / m_c)
+    Under the percentile normalization an uninformative name's evidence
+    strengths are U(-1, 1), so a cluster holding m_c evidence has null variance
+    v_c = (1/3)/m_c. The net score is a weighted mean of cluster scores, so:
 
-    Assumes independence across clusters, which is the optimistic case — real
-    signals within the trend cluster in particular are correlated, so the true
-    null sd is somewhat LARGER and this standardization is mildly permissive.
-    Callers that can measure the universe-wide dispersion of `net_score`
-    directly should pass it via `synthesize(..., empirical_null_sd=...)`, which
-    absorbs that correlation from data rather than assuming it away.
+        Var(net) = Σ_i Σ_j w_i w_j ρ_ij √(v_i v_j)
+
+    With ρ = I and equal weights this collapses to the independence form
+    (1/3C²)·Σ(1/m_c), which is what this used to assume unconditionally.
+
+    WHY THE GENERAL FORM MATTERS. Cluster scores are NOT independent — measured
+    on the live universe, trend~value is −0.39 and flow~risk is +0.57. Those are
+    large. They happen to nearly cancel under EQUAL weights (mean off-diagonal
+    ρ = +0.008, variance ratio 1.03, so the independence assumption is currently
+    only ~1.5% optimistic). But that cancellation is a coincidence of the weight
+    vector, not a property of the clusters: the moment learned weights unlock
+    (research/learning.py, at ≥150 scored alignments) the weights stop being
+    uniform and the offsetting terms stop offsetting. Carrying the full
+    quadratic form means the null stays correct through that transition instead
+    of silently degrading.
+
+    `cluster_corr` is {"clusters": [...], "matrix": [[...]]} measured across the
+    universe. Missing pairs fall back to independence for that pair only.
     """
-    counts = [max(1, n) for n in cluster_counts.values()]
-    C = len(counts)
+    counts = {c: max(1, n) for c, n in cluster_counts.items()}
+    names = list(counts)
+    C = len(names)
     if C == 0:
         return float("nan")
-    return math.sqrt(sum(1.0 / m for m in counts) * UNIFORM_VARIANCE / (C * C))
+    v = {c: UNIFORM_VARIANCE / counts[c] for c in names}
+    w = {c: (weights or {}).get(c, 1.0) for c in names}
+    wsum = sum(w.values())
+    if wsum <= 0:
+        return float("nan")
+    w = {c: x / wsum for c, x in w.items()}
+
+    rho = _corr_lookup(cluster_corr)
+    total = 0.0
+    for i in names:
+        for j in names:
+            r = 1.0 if i == j else rho(i, j)
+            total += w[i] * w[j] * r * math.sqrt(v[i] * v[j])
+    return math.sqrt(total) if total > 0 else float("nan")
+
+
+def _corr_lookup(cluster_corr: Optional[dict]):
+    """(a, b) -> correlation, defaulting to 0 for unmeasured pairs."""
+    if not cluster_corr:
+        return lambda a, b: 0.0
+    idx = {c: i for i, c in enumerate(cluster_corr.get("clusters", []))}
+    m = cluster_corr.get("matrix") or []
+
+    def look(a: str, b: str) -> float:
+        ia, ib = idx.get(a), idx.get(b)
+        if ia is None or ib is None or ia >= len(m) or ib >= len(m[ia]):
+            return 0.0
+        val = m[ia][ib]
+        return 0.0 if val is None or val != val else max(-0.99, min(0.99, float(val)))
+
+    return look
+
+
+def shrink_correlation(matrix: list[list[float]], n_obs: int,
+                       target_identity: bool = True) -> list[list[float]]:
+    """Linear shrinkage of a sample correlation matrix toward the identity.
+
+    A 5×5 correlation matrix estimated from ~39 complete cases is noisy: the
+    sampling sd of each off-diagonal element is roughly 1/√n ≈ 0.16, which is
+    the same order as several of the entries. Shrinking toward independence
+    keeps a noisy estimate from making the null *less* conservative than the
+    honest independence assumption it replaced.
+
+    Intensity 1/(1+n/k²) is deliberately crude and deliberately conservative:
+    with few observations relative to the number of parameters it shrinks hard.
+    """
+    k = len(matrix)
+    if k < 2 or n_obs < 4:
+        return [[1.0 if i == j else 0.0 for j in range(k)] for i in range(k)]
+    intensity = 1.0 / (1.0 + n_obs / float(k * k))
+    intensity = max(0.0, min(1.0, intensity))
+    out = []
+    for i in range(k):
+        row = []
+        for j in range(k):
+            if i == j:
+                row.append(1.0)
+                continue
+            raw = matrix[i][j]
+            raw = 0.0 if raw is None or raw != raw else float(raw)
+            tgt = 0.0 if target_identity else 0.0
+            row.append((1 - intensity) * raw + intensity * tgt)
+        out.append(row)
+    return out
 
 
 @dataclass
@@ -164,7 +242,8 @@ def _band_rank(band: str) -> int:
 
 def synthesize(evidence: list[Evidence],
                weights: dict[str, float] | None = None,
-               empirical_null_sd: Optional[float] = None) -> Synthesis:
+               empirical_null_sd: Optional[float] = None,
+               cluster_corr: Optional[dict] = None) -> Synthesis:
     """`weights` (cluster → multiplier) come ONLY from the learning module's
     gated posteriors (research/learning.py); None = uniform provisional.
 
@@ -220,7 +299,7 @@ def synthesize(evidence: list[Evidence],
     dispersion = pstdev(cluster_scores.values()) if len(present) > 1 else 0.0
 
     sd = empirical_null_sd if (empirical_null_sd and empirical_null_sd > 0) \
-        else null_sd(cluster_counts)
+        else null_sd(cluster_counts, weights=eff_w, cluster_corr=cluster_corr)
     net_z = net / sd if sd and sd == sd and sd > 0 else 0.0
 
     dissent = []

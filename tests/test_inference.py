@@ -15,7 +15,7 @@ import pytest
 
 from equisense.engine.evidence import Evidence, ev
 from equisense.engine.synthesis import (ABSTAIN_Z, MAX_DISPERSION, null_sd,
-                                        synthesize)
+                                        shrink_correlation, synthesize)
 from equisense.engine.types import Metric
 from equisense.research.stats import (benjamini_hochberg, block_observations,
                                       cluster_block_bootstrap_ci,
@@ -229,3 +229,68 @@ def test_admissible_base_rate_promotes_to_t2():
     good = {"admissible": True, "n_eff": 200, "survives_multiplicity": True}
     e = ev("t", "technical.trend", "trend", 0.8, "s", [M], base_rate=good)
     assert e.tier == "T2"
+
+
+# ------------------------------------------ correlation-aware null (Wave S+)
+
+def test_null_sd_reduces_to_the_independence_form_without_correlation():
+    counts = {"a": 3, "b": 3, "c": 3}
+    closed = math.sqrt(sum(1.0 / m for m in counts.values()) / 3.0 / (len(counts) ** 2))
+    assert null_sd(counts) == pytest.approx(closed, rel=1e-12)
+
+
+def test_null_sd_widens_when_clusters_are_positively_correlated():
+    counts = {"a": 2, "b": 2, "c": 2}
+    corr = {"clusters": ["a", "b", "c"],
+            "matrix": [[1.0, 0.6, 0.6], [0.6, 1.0, 0.6], [0.6, 0.6, 1.0]]}
+    assert null_sd(counts, cluster_corr=corr) > null_sd(counts)
+
+
+def test_null_sd_narrows_when_clusters_offset():
+    """Measured live: trend~value is -0.39 and flow~risk +0.57. Negatively
+    correlated clusters genuinely reduce the null dispersion of their mean."""
+    counts = {"a": 2, "b": 2}
+    corr = {"clusters": ["a", "b"], "matrix": [[1.0, -0.5], [-0.5, 1.0]]}
+    assert null_sd(counts, cluster_corr=corr) < null_sd(counts)
+
+
+def test_correlation_matters_most_once_weights_stop_being_uniform():
+    """The reason the general quadratic form is worth carrying. Under equal
+    weights the measured cross-cluster correlations nearly cancel; under the
+    tilted weights that learned posteriors will produce, they do not."""
+    counts = {"trend": 3, "value": 2, "quality": 2, "flow": 2, "risk": 2}
+    clusters = ["trend", "value", "quality", "flow", "risk"]
+    M = [[1.0, -0.390, -0.004, -0.350, 0.204],
+         [-0.390, 1.0, 0.195, 0.027, -0.192],
+         [-0.004, 0.195, 1.0, -0.101, 0.118],
+         [-0.350, 0.027, -0.101, 1.0, 0.569],
+         [0.204, -0.192, 0.118, 0.569, 1.0]]
+    corr = {"clusters": clusters, "matrix": M}
+    uniform_gap = null_sd(counts, cluster_corr=corr) / null_sd(counts)
+    tilt = {"trend": 1.5, "value": 0.5, "quality": 0.6, "flow": 1.4, "risk": 1.5}
+    tilted_gap = (null_sd(counts, weights=tilt, cluster_corr=corr)
+                  / null_sd(counts, weights=tilt))
+    assert uniform_gap < 1.05, "equal weights: offsetting pairs nearly cancel"
+    assert tilted_gap > 1.08, "tilted weights: they stop cancelling"
+
+
+def test_unmeasured_pairs_fall_back_to_independence():
+    counts = {"a": 2, "b": 2}
+    partial = {"clusters": ["a"], "matrix": [[1.0]]}
+    assert null_sd(counts, cluster_corr=partial) == pytest.approx(null_sd(counts))
+
+
+def test_shrinkage_pulls_a_noisy_matrix_toward_independence():
+    """A 5x5 correlation from ~39 complete cases has per-element sampling sd of
+    about 1/sqrt(n) = 0.16 — the same order as several entries."""
+    M = [[1.0, -0.9], [-0.9, 1.0]]
+    tiny = shrink_correlation(M, n_obs=8)
+    large = shrink_correlation(M, n_obs=5000)
+    assert abs(tiny[0][1]) < abs(large[0][1]) < 0.9 + 1e-9
+    assert large[0][1] == pytest.approx(-0.9, abs=0.02)
+    assert all(row[i] == 1.0 for i, row in enumerate(tiny))
+
+
+def test_shrinkage_degenerates_to_identity_on_no_data():
+    out = shrink_correlation([[1.0, 0.8], [0.8, 1.0]], n_obs=0)
+    assert out == [[1.0, 0.0], [0.0, 1.0]]
