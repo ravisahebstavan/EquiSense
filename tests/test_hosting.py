@@ -12,6 +12,14 @@ from equisense.db import Base
 def mem_sessions(monkeypatch):
     """Fresh in-memory DB standing in for hosted Postgres; patches every
     get_session the storage backends resolve."""
+    # Base.metadata only knows tables whose module has been imported, so models
+    # must be imported BEFORE create_all — otherwise ledger_records/vault_blobs
+    # simply are not created. In a full-suite run another test imports models
+    # first and this passes by accident; in isolation it failed with
+    # "no such table: ledger_records". ensure_schema() does the same import for
+    # the same reason.
+    import equisense.models  # noqa: F401 - registers tables on Base.metadata
+
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
                         poolclass=StaticPool)
     Base.metadata.create_all(eng)
@@ -72,3 +80,51 @@ def test_auth_disabled_locally(monkeypatch):
     monkeypatch.delenv("EQUISENSE_ACCESS_TOKEN", raising=False)
     c = TestClient(app)
     assert c.get("/api/live/vault").status_code == 200  # frictionless dev
+
+# --------------------------------------------------- markets UI surface
+
+def test_markets_endpoints_are_registered():
+    """The Markets view calls these; a rename would break the page silently."""
+    from equisense.api.app import app
+    paths = {r.path for r in app.routes}
+    for p in ("/api/markets/derivatives/{symbol}", "/api/markets/simulate",
+              "/api/markets/relationships", "/api/markets/valuation",
+              "/api/markets/rates", "/api/markets/flow",
+              "/api/markets/sources", "/api/markets/position-risk",
+              "/api/markets/delivery/{ticker}"):
+        assert p in paths, f"{p} missing — the Markets view would 404"
+
+
+def test_markets_view_is_wired_into_the_frontend():
+    """Nav entry, route branch and every render function must all exist, or the
+    engines behind them are unreachable from the site — which is the definition
+    of dead weight."""
+    from pathlib import Path
+    web = Path(__file__).resolve().parent.parent / "web"
+    js = (web / "app.js").read_text()
+    html = (web / "index.html").read_text()
+    assert 'data-route="markets"' in html
+    assert 'name === "markets"' in js
+    for fn in ("viewMarkets", "renderDerivatives", "renderMarketRisk",
+               "renderRelations", "renderValuationRegime", "renderFlow"):
+        assert f"function {fn}" in js, f"{fn} not defined"
+
+
+def test_markets_view_uses_real_helpers_not_invented_ones():
+    """Guards a class of bug that only shows at runtime: calling a helper or
+    CSS class that does not exist renders a blank panel with no error."""
+    from pathlib import Path
+    web = Path(__file__).resolve().parent.parent / "web"
+    js = (web / "app.js").read_text()
+    css = (web / "style.css").read_text()
+    block = js[js.index("markets view"):js.index("routing */", js.index("markets view"))]
+    import re
+    # every helper the block calls must be defined in the file
+    for helper in ("fmtN", "esc", "signed", "skeleton", "api"):
+        assert re.search(rf"(const|function) {helper}\b", js), f"{helper} undefined"
+    assert "fmt(" not in block.replace("fmtN(", ""), "fmt() does not exist; it is fmtN()"
+    # every class the block uses must be styled somewhere
+    used = set(re.findall(r'class="([a-z0-9 _-]+)"', block))
+    names = {n for grp in used for n in grp.split()}
+    for n in names:
+        assert f".{n}" in css or n in ("primary",), f'CSS class "{n}" is not styled'

@@ -258,6 +258,7 @@ const COMMANDS = [
   { label: "Edit Investor Profile & Limits", k: "", run: () => location.hash = "#/portfolio/profile" },
   { label: "Go to Research", k: "gr", run: () => location.hash = "#/research" },
   { label: "Go to Lab", k: "gl", run: () => location.hash = "#/lab" },
+  { label: "Go to Markets (derivatives, risk, cross-asset)", k: "gm", run: () => location.hash = "#/markets" },
   { label: "Refresh live data (staged pipeline)", k: "R", run: openRefreshDrawer },
   { label: "Run studies (recompute base rates)", k: "", run: async () => { await api("/live/studies/run", { method: "POST" }); route(); } },
   { label: "Score due claims", k: "", run: async () => { await api("/live/score", { method: "POST" }); route(); } },
@@ -310,7 +311,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "?") { e.preventDefault(); openHelp(); return; }
   if (pendingG) {
     pendingG = false;
-    const map = { d: "dashboard", c: "companies", p: "portfolio", t: "trading", r: "research", l: "lab" };
+    const map = { d: "dashboard", c: "companies", p: "portfolio", t: "trading", r: "research", l: "lab", m: "markets" };
     if (map[e.key]) location.hash = "#/" + map[e.key];
     return;
   }
@@ -1714,6 +1715,239 @@ async function viewLab(section = "hypotheses") {
   }
 }
 
+
+/* ========================================================= markets view */
+/* Surfaces the multi-asset engines: derivatives (live, unstored), the
+   market-implied risk-free rate, cross-asset stress correlation, Monte Carlo
+   portfolio risk, and disclosed institutional flow. Every panel renders the
+   engine's own caveat rather than a cleaned-up summary of it. */
+
+const MARKET_TABS = [
+  ["derivatives", "Derivatives"], ["risk", "Risk (Monte Carlo)"],
+  ["relations", "Cross-Asset"], ["valuation", "Valuation Regime"],
+  ["flow", "Institutional Flow"],
+];
+
+async function viewMarkets(tab) {
+  const nav = MARKET_TABS.map(([k, label]) =>
+    `<button class="${k === tab ? "active" : ""}" data-tab="${k}">${label}</button>`).join("");
+  app.innerHTML = `<h1>Markets</h1>
+    <div class="sub" style="margin:-6px 0 14px">Derivatives, cross-asset behaviour and
+      simulated risk — all from free exchange-published data.</div>
+    <div class="tabs" id="mk-tabs">${nav}</div>
+    <div id="mk-body">${skeleton(4)}</div>`;
+  document.querySelectorAll("#mk-tabs [data-tab]").forEach(b =>
+    b.addEventListener("click", () => location.hash = `#/markets/${b.dataset.tab}`));
+  const body = document.getElementById("mk-body");
+  try {
+    if (tab === "risk") await renderMarketRisk(body);
+    else if (tab === "relations") await renderRelations(body);
+    else if (tab === "valuation") await renderValuationRegime(body);
+    else if (tab === "flow") await renderFlow(body);
+    else await renderDerivatives(body);
+  } catch (e) {
+    body.innerHTML = `<div class="panel">Could not load: ${esc(e.message)}</div>`;
+  }
+}
+
+function unavailable(d, what) {
+  return `<div class="panel"><strong>${what} unavailable.</strong>
+    <div class="sub" style="margin-top:6px">${esc(d.reason || "no data")}</div>
+    ${d.hint ? `<div class="sub">${esc(d.hint)}</div>` : ""}</div>`;
+}
+
+async function renderDerivatives(body) {
+  const sym = (document.getElementById("mk-sym") || {}).value || "NIFTY";
+  const d = await api(`/markets/derivatives/${encodeURIComponent(sym)}`);
+  if (!d.available) { body.innerHTML = unavailable(d, "Derivatives"); return; }
+  const ts = d.term_structure || {}, oc = d.option_chain || {};
+  const curve = (ts.contracts || []).map(c => `<tr>
+      <td>${esc(c.expiry)}</td><td class="num">${c.days_to_expiry}</td>
+      <td class="num">${fmtN(c.futures, 2)}</td>
+      <td class="num">${signed(c.implied_rate_pct)}%</td>
+      <td class="num sub">${signed(c.basis_pct)}%</td></tr>`).join("");
+  const smile = (oc.iv_surface || []).filter(r => r.iv_pct != null);
+  const puts = smile.filter(r => r.kind === "put").sort((a, b) => a.strike - b.strike);
+  const step = Math.max(1, Math.floor(puts.length / 10));
+  const smileRows = puts.filter((_, i) => i % step === 0).map(r => `<tr>
+      <td class="num">${fmtN(r.strike, 0)}</td>
+      <td class="num">${fmtN(r.iv_pct, 2)}%</td>
+      <td class="num sub">${fmtN(r.delta, 3)}</td></tr>`).join("");
+  body.innerHTML = `
+    <div class="panel"><div style="display:flex;gap:8px;align-items:center">
+      <input id="mk-sym" value="${esc(sym)}" style="width:150px" placeholder="NIFTY">
+      <button id="mk-go" class="primary">Load</button>
+      <span class="sub" style="margin-left:auto">${esc(d.source || "")} · ${esc(d.trade_date)}</span>
+    </div></div>
+    <div class="grid2">
+      <div class="panel"><h3>Futures term structure</h3>
+        <div class="tablewrap"><table><thead><tr><th>Expiry</th><th>DTE</th><th>Futures</th>
+          <th>Implied rate</th><th>Basis</th></tr></thead><tbody>${curve || ""}</tbody></table></div>
+        ${ts.calendar_spread ? `<div class="sub" style="margin-top:8px">
+          Annualised roll cost ${signed(ts.calendar_spread.annualised_roll_pct)}% —
+          ${esc(ts.calendar_spread.interpretation)}</div>` : ""}
+        <div class="sub">${esc(ts.curve_shape || "")}</div></div>
+      <div class="panel"><h3>Option chain</h3>
+        ${oc.computable === false ? `<div class="sub">${esc(oc.reason || "")}</div>` : `
+        <div class="tiles">
+          <div class="tile"><div class="label">Expiry</div><div class="value">${esc(oc.expiry || "")}</div>
+            <div class="sub">${oc.days_to_expiry}d</div></div>
+          <div class="tile"><div class="label">ATM IV</div><div class="value">${fmtN(oc.atm_iv_pct, 2)}%</div>
+            <div class="sub">${oc.iv_points_solved} strikes solved</div></div>
+          <div class="tile"><div class="label">25Δ skew</div><div class="value">${signed(oc.skew_25d_risk_reversal_pct)}</div>
+            <div class="sub">put IV − call IV</div></div>
+          <div class="tile"><div class="label">PCR (OI)</div><div class="value">${fmtN(oc.put_call_ratio_oi, 3)}</div>
+            <div class="sub">max pain ${fmtN(oc.max_pain_strike, 0)}</div></div>
+        </div>
+        <div class="tablewrap"><table style="margin-top:10px"><thead><tr><th>Put strike</th><th>IV</th>
+          <th>Delta</th></tr></thead><tbody>${smileRows}</tbody></table></div>
+        <div class="sub" style="margin-top:8px">${esc((oc.methodology || {}).pcr_caveat || "")}</div>
+        <div class="sub">${esc((oc.methodology || {}).max_pain_caveat || "")}</div>`}
+      </div></div>`;
+  const go = document.getElementById("mk-go");
+  if (go) go.addEventListener("click", () => renderDerivatives(body));
+}
+
+async function renderMarketRisk(body) {
+  const d = await api("/markets/simulate?horizon_days=21&paths=15000");
+  if (!d.available) { body.innerHTML = unavailable(d, "Simulation"); return; }
+  const models = d.risk.models || {};
+  const rows = Object.values(models).map(m => `<tr>
+      <td>${esc(m.model)}</td>
+      <td class="num">${fmtN(m.volatility_pct, 2)}%</td>
+      <td class="num">${fmtN(m.var_95_pct, 2)}%</td>
+      <td class="num" style="color:var(--critical)">${fmtN(m.var_99_pct, 2)}%</td>
+      <td class="num" style="color:var(--critical)">${fmtN(m.cvar_99_pct, 2)}%</td>
+      <td class="num sub">${fmtN(m.excess_kurtosis, 2)}</td></tr>`).join("");
+  const dd = d.drawdown;
+  const touch = dd ? Object.entries(dd.touch_probability_pct).map(([k, v]) =>
+    `<tr><td>${esc(k)}</td><td class="num">${fmtN(v, 1)}%</td></tr>`).join("") : "";
+  body.innerHTML = `
+    <div class="panel"><h3>Value at Risk / Expected Shortfall — ${d.risk.horizon_days} trading days</h3>
+      <div class="sub" style="margin-bottom:8px">Basis: ${esc(d.basis)} ·
+        ${d.risk.n_paths.toLocaleString()} paths · annualised vol ${fmtN(d.risk.annualised_vol_pct, 2)}%</div>
+      <div class="tablewrap"><table><thead><tr><th>Model</th><th>Vol</th><th>VaR 95</th>
+        <th>VaR 99</th><th>CVaR 99</th><th>Excess kurt</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">${esc(d.risk.interpretation)}</div>
+      <div class="sub" style="margin-top:8px">${esc((d.risk.method || {}).es_note || "")}</div>
+      <div class="sub">${esc((d.risk.method || {}).bootstrap || "")}</div></div>
+    ${dd ? `<div class="grid2">
+      <div class="panel"><h3>Probability of TOUCHING a drawdown (1 year)</h3>
+        <div class="tablewrap"><table><thead><tr><th>Level</th><th>Probability</th></tr></thead>
+          <tbody>${touch}</tbody></table></div>
+        <div class="sub" style="margin-top:8px">${esc(dd.note)}</div></div>
+      <div class="panel"><h3>Path outcomes</h3><div class="tiles">
+        <div class="tile"><div class="label">Median max DD</div>
+          <div class="value">${fmtN(dd.median_max_drawdown_pct, 1)}%</div></div>
+        <div class="tile"><div class="label">95th pctile DD</div>
+          <div class="value">${fmtN(dd.p95_max_drawdown_pct, 1)}%</div></div>
+        <div class="tile"><div class="label">Terminal p05</div>
+          <div class="value">${fmtN(dd.terminal_return_pct.p05, 1)}%</div></div>
+        <div class="tile"><div class="label">Terminal median</div>
+          <div class="value">${fmtN(dd.terminal_return_pct.median, 1)}%</div></div>
+      </div></div></div>` : ""}`;
+}
+
+async function renderRelations(body) {
+  const d = await api("/markets/relationships?lookback=900");
+  if (!d.available) { body.innerHTML = unavailable(d, "Relationship map"); return; }
+  const stress = Object.entries(d.stress_conditional || {})
+    .sort((a, b) => (b[1].gap || 0) - (a[1].gap || 0))
+    .map(([k, v]) => `<tr><td>${esc(k)}</td>
+      <td class="num">${signed(v.unconditional_r)}</td>
+      <td class="num">${signed(v.stress_r)}</td>
+      <td class="num" style="color:${(v.gap || 0) > 0.05 ? "var(--critical)" : "var(--good-text)"}">
+        ${signed(v.gap)}</td></tr>`).join("");
+  const pairs = (d.pairs || []).slice(0, 12).map(p => `<tr>
+      <td>${esc(p.a)} ~ ${esc(p.b)}</td><td class="num">${signed(p.r)}</td>
+      <td class="num sub">[${p.ci95.map(x => fmtN(x, 2)).join(", ")}]</td>
+      <td class="num sub">${p.q_value == null ? "—" : fmtN(p.q_value, 3)}</td>
+      <td>${p.survives_fdr ? "✓" : "—"}</td></tr>`).join("");
+  body.innerHTML = `
+    <div class="panel"><h3>Correlation in stress vs on average</h3>
+      <div class="sub" style="margin-bottom:8px">${d.common_dates} common dates ·
+        the stress column is the number a diversification claim actually rests on</div>
+      <div class="tablewrap"><table><thead><tr><th>Asset</th><th>Unconditional ρ</th>
+        <th>ρ in worst 20% of market days</th><th>Gap</th></tr></thead>
+        <tbody>${stress}</tbody></table></div>
+      <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">A POSITIVE gap means correlation
+        rises exactly when diversification is supposed to pay.</div></div>
+    <div class="panel"><h3>Pairwise correlations (FDR-controlled)</h3>
+      <div class="sub" style="margin-bottom:8px">${d.pairs_tested} pairs tested,
+        ${d.pairs_surviving_fdr} survive multiple-testing control</div>
+      <div class="tablewrap"><table><thead><tr><th>Pair</th><th>ρ</th><th>95% CI</th>
+        <th>q</th><th>FDR</th></tr></thead><tbody>${pairs}</tbody></table></div>
+      <div class="sub" style="margin-top:8px">${esc(d.note || "")}</div></div>`;
+}
+
+async function renderValuationRegime(body) {
+  const [v, r] = await Promise.all([api("/markets/valuation"), api("/markets/rates")]);
+  const iv = v.index || {}, seg = v.segments || {};
+  const segRows = ["large", "midcap", "smallcap"].filter(k => seg[k]).map(k => `<tr>
+      <td>${esc(seg[k].index)}</td><td class="num">${fmtN(seg[k].pe, 2)}</td>
+      <td class="num sub">${fmtN(seg[k].pe_percentile, 0)}th pctile</td></tr>`).join("");
+  body.innerHTML = `
+    <div class="grid2">
+      <div class="panel"><h3>Index valuation vs own history</h3>
+        ${iv.available ? `<div class="tiles">
+          <div class="tile"><div class="label">${esc(iv.index)} P/E</div>
+            <div class="value">${fmtN(iv.pe, 2)}</div>
+            <div class="sub">${fmtN(iv.pe_percentile_vs_own_history, 0)}th percentile</div></div>
+          <div class="tile"><div class="label">P/B</div><div class="value">${fmtN(iv.pb, 2)}</div></div>
+          <div class="tile"><div class="label">Dividend yield</div>
+            <div class="value">${fmtN(iv.div_yield, 2)}%</div></div>
+        </div>
+        <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">${esc(iv.reading || "")}</div>
+        <div class="tablewrap"><table style="margin-top:10px"><thead><tr><th>Segment</th>
+          <th>P/E</th><th>vs own history</th></tr></thead><tbody>${segRows}</tbody></table></div>
+        ${seg.smallcap_premium_x ? `<div class="sub" style="margin-top:8px">
+          Small-cap premium ${fmtN(seg.smallcap_premium_x, 2)}× — ${esc(seg.reading || "")}</div>` : ""}
+        <div class="sub" style="margin-top:8px">${esc(iv.caveat || "")}</div>`
+        : `<div class="sub">${esc(iv.reason || "no index valuation history")}</div>`}
+      </div>
+      <div class="panel"><h3>Market-implied rates</h3>
+        ${r.available ? `<div class="tiles">
+          <div class="tile"><div class="label">Risk-free (derived)</div>
+            <div class="value">${fmtN(r.risk_free.value, 2)}%</div>
+            <div class="sub">not hardcoded</div></div>
+          <div class="tile"><div class="label">ERP sanity check</div>
+            <div class="value">${signed(r.erp_check.value)}pp</div>
+            <div class="sub">earnings yield − rf</div></div>
+        </div>
+        <div class="sub" style="margin-top:10px">${esc(r.risk_free.formula || "")}</div>
+        <div class="sub" style="margin-top:8px">${esc(r.source || "")}</div>
+        <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">${esc(r.erp_check.caveat || "")}</div>`
+        : `<div class="sub">${esc(r.reason || "rate not derivable")}</div>`}
+      </div></div>`;
+}
+
+async function renderFlow(body) {
+  const d = await api("/markets/flow");
+  if (!d.available) { body.innerHTML = unavailable(d, "Institutional flow"); return; }
+  const row = r => `<tr><td>${esc(r.symbol)}${r.in_universe ? " ★" : ""}</td>
+      <td class="num">${r.deals}</td>
+      <td class="num sub">₹${fmtN(r.gross_value_cr, 1)}cr</td>
+      <td class="num" style="color:${r.net_value_cr > 0 ? "var(--good-text)" : "var(--critical)"}">
+        ₹${signed(r.net_value_cr)}cr</td>
+      <td class="num">${r.net_to_gross_ratio == null ? "—" : signed(r.net_to_gross_ratio)}</td>
+      <td class="num sub">${r.days_of_adv == null ? "—" : signed(r.days_of_adv) + "d"}</td></tr>`;
+  body.innerHTML = `
+    <div class="panel"><h3>Directional flow — net is at least half of gross</h3>
+      <div class="sub" style="margin-bottom:8px">${esc(d.trade_date)} ·
+        ${d.total_deals} disclosed deals across ${d.symbols} symbols</div>
+      <div class="tablewrap"><table><thead><tr><th>Symbol</th><th>Deals</th><th>Gross</th>
+        <th>Net</th><th>Net/gross</th><th>Days of ADV</th></tr></thead>
+        <tbody>${(d.directional || []).map(row).join("") ||
+          `<tr><td colspan="6" class="sub">Nothing directional today — every name was
+           funds crossing stock with each other.</td></tr>`}</tbody></table></div></div>
+    <div class="panel"><h3>Largest by absolute net</h3>
+      <div class="tablewrap"><table><thead><tr><th>Symbol</th><th>Deals</th><th>Gross</th>
+        <th>Net</th><th>Net/gross</th><th>Days of ADV</th></tr></thead>
+        <tbody>${(d.by_net_value || []).map(row).join("")}</tbody></table></div>
+      <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">${esc(d.note || "")}</div></div>`;
+}
+
 /* ============================================================== routing */
 
 async function route() {
@@ -1730,6 +1964,7 @@ async function route() {
     else if (name === "trading") await viewTrading();
     else if (name === "research") await viewResearch();
     else if (name === "lab") await viewLab(arg || "hypotheses");
+    else if (name === "markets") await viewMarkets(arg || "derivatives");
     else await viewDashboard();
   } catch (e) {
     app.innerHTML = `<div class="panel"><strong>Error:</strong> ${esc(e.message)}
