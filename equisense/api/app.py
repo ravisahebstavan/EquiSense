@@ -751,6 +751,15 @@ def markets_rates(s: Session = Depends(db)):
     return market_rates(s)
 
 
+@app.get("/api/markets/relationships")
+def markets_relationships(lookback: int = 900, s: Session = Depends(db)):
+    """Cross-asset correlation map with STRESS-CONDITIONAL correlations —
+    what still diversifies in a drawdown, which is when it matters. All pairs
+    are FDR-controlled."""
+    from .markets import relationships
+    return relationships(s, lookback=max(120, min(lookback, 2500)))
+
+
 @app.get("/api/markets/sources")
 def markets_sources():
     """Data-source reachability. Exists because every archive fetch fails closed

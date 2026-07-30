@@ -77,88 +77,144 @@ def strategy_backtest(session: Session, top_n: int = 3,
     composite = (pct_rank(mom) + pct_rank(mqi) + pct_rank(trend)
                  + (1 - pct_rank(vol)) + (1 - pct_rank(heat))) / 5
 
+    # ---- Jegadeesh-Titman (1993) overlapping tranches -------------------
+    # The previous implementation charged a FULL round trip on every monthly
+    # period and then "de-overlapped" the equity curve with (1+r)^(21/hold),
+    # which is not a portfolio path any capital could have followed. Two
+    # separate errors compounded: a 63-day hold turns over once per 63 days,
+    # not every month, so costs were ~3x too high; and the curve was a display
+    # artefact rather than a track record.
+    #
+    # The standard fix runs K = hold/21 parallel sub-portfolios staggered by one
+    # month. Each month exactly ONE tranche rotates, so turnover — and therefore
+    # cost — is 1/K of the book, and the portfolio's 21-day return is the mean
+    # across live tranches. Compounding those 21-day returns gives a genuine,
+    # investable equity curve.
+    K = max(1, int(round(hold_days / 21)))
+    fwd21 = closes.shift(-21) / closes - 1
     month_ends = closes.index[252::21]
-    fwd = closes.shift(-hold_days) / closes - 1
     cost = DEFAULT_ROUND_TRIP_COST_PCT / 100
-    trades, period_rets, nifty_rets = [], [], []
+
+    tranches: list[list] = [[] for _ in range(K)]
+    period_rets, nifty_rets = [], []
+    turnover_log = []
     nifty_series = nifty
-    for t in month_ends:
-        if t not in composite.index or t not in fwd.index:
+
+    for i, t in enumerate(month_ends):
+        if t not in composite.index or t not in fwd21.index:
             continue
         row = composite.loc[t].dropna()
         if len(row) < 15:
             continue
-        picks = row.nlargest(top_n).index
-        outcome = fwd.loc[t, picks].dropna()
-        if outcome.empty:
+
+        slot = i % K
+        old = set(tranches[slot])
+        new_picks = list(row.nlargest(top_n).index)
+        # cost is paid only on names actually changing hands in the rotating
+        # tranche, and that tranche is 1/K of the book
+        changed = len(old.symmetric_difference(set(new_picks))) / max(1, 2 * top_n)
+        period_cost = cost * changed / K
+        tranches[slot] = new_picks
+        turnover_log.append(round(changed / K * 100, 2))
+
+        live = [p for p in tranches if p]
+        if not live:
             continue
-        r = float(outcome.mean()) - cost
+        leg_rets = []
+        for picks in live:
+            o = fwd21.loc[t, [p for p in picks if p in fwd21.columns]].dropna()
+            if not o.empty:
+                leg_rets.append(float(o.mean()))
+        if not leg_rets:
+            continue
+        r = sum(leg_rets) / len(leg_rets) - period_cost
         period_rets.append({"date": str(t.date() if hasattr(t, "date") else t),
                             "ret_net_pct": round(r * 100, 2),
-                            "picks": list(picks)})
-        # nifty same window
+                            "picks": tranches[slot],
+                            "live_tranches": len(live)})
         idx = nifty_series.index
         try:
             i0 = idx.get_indexer([t], method="ffill")[0]
-            i1 = min(i0 + hold_days, len(idx) - 1)
-            nifty_rets.append(nifty_series.iloc[i1] / nifty_series.iloc[i0] - 1)
+            i1 = min(i0 + 21, len(idx) - 1)
+            nifty_rets.append(float(nifty_series.iloc[i1] / nifty_series.iloc[i0] - 1))
         except Exception:
             nifty_rets.append(None)
-        trades.extend(picks)
 
     if not period_rets:
         return {"error": "insufficient history for the backtest"}
+
+    # Periods are now NON-OVERLAPPING 21-day steps of one investable portfolio,
+    # so ordinary statistics apply and n_eff is simply the period count.
     rs = [p["ret_net_pct"] / 100 for p in period_rets]
-    n_eff = max(1, len(rs) * 21 // hold_days)  # overlapping monthly starts
+    n_eff = len(rs)
     mean_r = sum(rs) / len(rs)
     var = sum((x - mean_r) ** 2 for x in rs) / max(1, len(rs) - 1)
-    ann_factor = 252 / hold_days
+    ann_factor = 252 / 21
     nifty_valid = [x for x in nifty_rets if x is not None]
-    nifty_mean = sum(nifty_valid) / len(nifty_valid) if nifty_valid else None
-    ci_lo, ci_hi = moving_block_bootstrap_ci(
-        [x * 100 for x in rs], block_len=max(1, hold_days // 21))
+    nifty_mean = float(sum(nifty_valid) / len(nifty_valid)) if nifty_valid else None
+    from .stats import cluster_block_bootstrap_ci, deflated_sharpe_ratio
+    ci_lo, ci_hi = cluster_block_bootstrap_ci(
+        [[x * 100] for x in rs], statistic="median")
 
-    # equity curves (overlapping periods compounded naively for display only)
-    eq, neq, curve = 1.0, 1.0, []
+    # A real compounded equity curve: consecutive 21-day portfolio returns.
+    eq, neq, curve, peak, mdd = 1.0, 1.0, [], 1.0, 0.0
     for p, nr in zip(period_rets, nifty_rets):
-        eq *= (1 + p["ret_net_pct"] / 100) ** (21 / hold_days)  # de-overlap approx
+        eq *= (1 + p["ret_net_pct"] / 100)
         if nr is not None:
-            neq *= (1 + nr) ** (21 / hold_days)
-        curve.append({"date": p["date"], "strategy": round(eq * 100, 1),
-                      "nifty": round(neq * 100, 1)})
+            neq *= (1 + nr)
+        peak = max(peak, eq)
+        mdd = min(mdd, eq / peak - 1)
+        # cast: numpy scalars leak out of the pandas series and are not JSON
+        # serializable by every stack this payload passes through
+        curve.append({"date": p["date"], "strategy": round(float(eq) * 100, 1),
+                      "nifty": round(float(neq) * 100, 1)})
+
+    sharpe = (mean_r / (var ** 0.5) * (ann_factor ** 0.5)) if var > 0 else None
+    # A best-of-N backtest Sharpe is upward biased; the composite is one of
+    # several rules that were looked at, so it is deflated accordingly.
+    dsr = deflated_sharpe_ratio(rs, n_trials=8)
 
     result = {
         "computed_at": datetime.utcnow().isoformat(),
         "cache_version": BACKTEST_CACHE_VERSION,
         "vol_managed_overlay": vol_managed_overlay([p["ret_net_pct"] for p in period_rets],
                                                     hold_days),
-        "spec": f"monthly top-{top_n} by price-cluster percentile composite "
-                f"(momentum, MQI, trend, low-vol, low-crowding), {hold_days}d hold, "
-                f"{DEFAULT_ROUND_TRIP_COST_PCT}% round-trip cost",
-        "periods": len(rs), "n_eff": n_eff,
+        "spec": f"top-{top_n} by price-cluster percentile composite (momentum, "
+                f"MQI, trend, low-vol, low-crowding); {hold_days}d hold run as "
+                f"{K} overlapping monthly tranches (Jegadeesh-Titman); "
+                f"{DEFAULT_ROUND_TRIP_COST_PCT}% round-trip cost charged on "
+                f"actual turnover only",
+        "periods": len(rs), "n_eff": n_eff, "tranches": K,
+        "mean_monthly_turnover_pct": round(sum(turnover_log) / len(turnover_log), 2)
+        if turnover_log else None,
+        "max_drawdown_pct": round(mdd * 100, 2),
+        "deflated_sharpe": dsr,
         "mean_period_return_net_pct": round(mean_r * 100, 2),
         "median_ci95_pct": [round(ci_lo, 2), round(ci_hi, 2)],
         "hit_rate": round(sum(1 for x in rs if x > 0) / len(rs), 3),
         "annualized_net_pct": round(((1 + mean_r) ** ann_factor - 1) * 100, 2),
+        "total_return_pct": round((float(eq) - 1) * 100, 2),
+        "nifty_total_return_pct": round((float(neq) - 1) * 100, 2),
         "nifty_annualized_pct": None if nifty_mean is None else
         round(((1 + nifty_mean) ** ann_factor - 1) * 100, 2),
-        "sharpe_naive": round(mean_r / (var ** 0.5) * (ann_factor ** 0.5), 2)
-        if var > 0 else None,
+        "sharpe_naive": None if sharpe is None else round(sharpe, 2),
         "curve": curve[-120:],
         "caveats": [
             "price clusters only — fundamentals excluded because no PIT statement "
             "history exists (including reconstructed figures would be look-ahead)",
             "universe = current constituents (survivorship-tilted)",
-            f"overlapping {hold_days}d windows from monthly starts — read "
-            f"significance against n_eff={n_eff}, and the CI is on the median "
-            "period return",
+            f"{K} overlapping tranches make the reported periods NON-overlapping "
+            f"21-day steps of one investable portfolio, so n_eff={n_eff} is the "
+            "actual period count rather than a correction",
+            "the Sharpe is deflated for the number of rules tried "
+            "(Bailey & Lopez de Prado) — read deflated_sharpe, not sharpe_naive",
             "a sanity harness for the live rule, not a promise of returns",
         ],
     }
     return result
 
 
-BACKTEST_CACHE_VERSION = 2  # bump whenever the result schema changes → forces recompute
+BACKTEST_CACHE_VERSION = 3  # bump whenever the result schema changes → forces recompute
 TARGET_ANNUAL_VOL = 0.15   # typical equity vol target (Barroso-Santa-Clara use ~12%)
 VOL_LOOKBACK_PERIODS = 6   # trailing periods of the STRATEGY's own returns
 SCALE_BOUNDS = (0.3, 1.5)  # de-lever in stress, cap leverage in calm — never full off/on

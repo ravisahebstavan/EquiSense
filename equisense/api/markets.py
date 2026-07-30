@@ -534,3 +534,82 @@ def effective_risk_free(session: Session) -> tuple[float, str]:
     except Exception:                              # noqa: BLE001 - never block valuation
         pass
     return R.FALLBACK_RISK_FREE, f"stated fallback {R.FALLBACK_RISK_FREE:.2%} (could not derive)"
+
+
+# ------------------------------------------------------- cross-asset relations
+
+def relationships(session: Session, lookback: int = 900,
+                  extra_tickers: Optional[list[str]] = None) -> dict:
+    """Cross-asset relationship map: correlation, stress-conditional
+    correlation, and the assets that stop diversifying when it matters.
+
+    Series are intersected on COMMON DATES. Equity bars and macro bars come from
+    different providers with different holiday calendars, so tail-aligning by
+    position pairs one day's rupee move with another day's equity move — that
+    bug put RELIANCE-vs-NIFTY at +0.05 instead of +0.69.
+    """
+    from ..engine import crossasset as CA
+    from ..models import MacroObservation
+
+    def macro_returns(sym: str) -> dict:
+        rows = session.execute(
+            select(MacroObservation.obs_date, MacroObservation.close)
+            .where(MacroObservation.symbol == sym)
+            .order_by(MacroObservation.obs_date.desc()).limit(lookback)).all()
+        return CA.returns_from_dated_closes(rows)
+
+    def equity_returns(ticker: str) -> dict:
+        cid = session.scalar(select(Company.id).where(Company.ticker == ticker))
+        if cid is None:
+            return {}
+        rows = session.execute(
+            select(PriceObservation.obs_date, PriceObservation.close)
+            .where(PriceObservation.company_id == cid)
+            .order_by(PriceObservation.obs_date.desc()).limit(lookback)).all()
+        return CA.returns_from_dated_closes(rows)
+
+    dated = {"NIFTY": macro_returns("^NSEI"), "USDINR": macro_returns("INR=X"),
+             "BRENT": macro_returns("BZ=F"), "GOLD": macro_returns("GC=F"),
+             "SP500": macro_returns("^GSPC")}
+    held = [t for t in (extra_tickers or []) if t]
+    if not held:
+        from .live import portfolio_state
+        book = portfolio_state(session)
+        for cid in (book.get("weights") or {}):
+            t = session.scalar(select(Company.ticker).where(Company.id == cid))
+            if t:
+                held.append(t)
+    if not held:
+        # No book: fall back to the most LIQUID current constituents rather than
+        # an arbitrary slice. `limit(N)` without an order returns whatever the
+        # planner emits first, which on a database still carrying departed
+        # members surfaced exactly those stale names.
+        from .snapshot import get_universe
+        try:
+            snap = get_universe(session)["companies"]
+            held = [c["ticker"] for c in
+                    sorted(snap, key=lambda c: -(c.get("adv_cr") or 0))[:6]]
+        except Exception:                          # noqa: BLE001
+            held = list(session.scalars(
+                select(Company.ticker)
+                .where(Company.is_index_member == True)
+                .order_by(Company.ticker).limit(6)).all())  # noqa: E712
+    for t in held[:12]:
+        r = equity_returns(t)
+        if r:
+            dated[t] = r
+
+    dated = {k: v for k, v in dated.items() if len(v) >= CA.MIN_OBS}
+    if "NIFTY" not in dated or len(dated) < 3:
+        return {"available": False,
+                "reason": "need the NIFTY series and at least two other assets"}
+    series = CA.align_on_dates(dated)
+    n_common = len(next(iter(series.values()))) if series else 0
+    if n_common < CA.MIN_OBS:
+        return {"available": False,
+                "reason": f"only {n_common} common dates across the requested series"}
+    out = CA.relationship_matrix(series, "NIFTY")
+    out["available"] = out.get("computable", False)
+    out["common_dates"] = n_common
+    out["assets_included"] = list(series)
+    return out
