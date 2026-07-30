@@ -60,8 +60,15 @@ def get_session() -> Session:
 
 
 # Columns added after a DB may already exist: (table, column, DDL type+default).
+# DDL here must be valid on BOTH SQLite and Postgres. Note `BOOLEAN DEFAULT FALSE`,
+# not `DEFAULT 0`: SQLite accepts the integer literal, Postgres rejects it with
+# "column is of type boolean but default expression is of type integer", which
+# aborts ensure_schema() and therefore every cold start on a hosted database.
+# Verified against a live Neon instance.
 _SOFT_MIGRATIONS = [
-    ("companies", "is_financial", "BOOLEAN DEFAULT 0"),
+    ("companies", "is_financial", "BOOLEAN DEFAULT FALSE"),
+    ("companies", "is_index_member", "BOOLEAN DEFAULT TRUE"),
+    ("companies", "last_seen_in_index", "DATE"),
     ("filing_periods", "source", "VARCHAR(20) DEFAULT 'manual'"),
     ("filing_periods", "pit_grade", "VARCHAR(20) DEFAULT 'reconstructed'"),
     ("price_observations", "volume", "FLOAT"),
@@ -80,10 +87,10 @@ _SOFT_MIGRATIONS = [
     ("base_rates", "df", "INTEGER"),
     ("base_rates", "p_value", "FLOAT"),
     ("base_rates", "q_value", "FLOAT"),
-    ("base_rates", "admissible", "BOOLEAN DEFAULT 0"),
+    ("base_rates", "admissible", "BOOLEAN DEFAULT FALSE"),
     ("base_rates", "admissibility_reason", "TEXT"),
     ("base_rates", "multiplicity_verdict", "TEXT"),
-    ("base_rates", "survives_multiplicity", "BOOLEAN DEFAULT 0"),
+    ("base_rates", "survives_multiplicity", "BOOLEAN DEFAULT FALSE"),
 ]
 
 

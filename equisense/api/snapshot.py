@@ -101,7 +101,13 @@ def _max5_21d(closes: list[float]) -> Optional[float]:
 
 def build_universe_snapshot(session: Session) -> dict:
     """The one heavy pass: 3 bulk queries + pure CPU. Runs at refresh time."""
-    companies = session.scalars(select(Company)).all()
+    # Live analytical universe = CURRENT index members only. Departed names keep
+    # their history in the database (deleting it would manufacture survivorship
+    # bias) but must not sit in the cross-section: xsec_strength ranks each
+    # signal against this set, so a stale constituent silently shifts every
+    # percentile in the universe.
+    companies = session.scalars(
+        select(Company).where(Company.is_index_member == True)).all()   # noqa: E712
     prices = _bulk_prices(session)
     statements = _bulk_statements(session)
     nifty = _nifty(session)

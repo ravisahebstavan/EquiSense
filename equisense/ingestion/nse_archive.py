@@ -34,6 +34,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import time
 import zipfile
 from datetime import date, datetime, timedelta
 from typing import Iterable, Optional
@@ -47,9 +48,16 @@ from ..models import DeliveryStat, DerivativeQuote, IndexObservation
 log = logging.getLogger("equisense.ingest.nse")
 
 BASE = "https://nsearchives.nseindia.com"
-UA = ("Mozilla/5.0 (compatible; EquiSense/1.0; personal research tool; "
-      "+https://github.com/ravisahebstavan)")
+# NSE's edge silently STALLS on a long descriptive User-Agent — the connection is
+# accepted and then never returns, so the request dies on read timeout rather
+# than with an HTTP error. Verified: the descriptive UA times out on every
+# archive URL while a plain browser UA returns 200 immediately. Because `_get`
+# swallows failures by design (a missing file is normal on holidays), that
+# would have made EVERY NSE fetch return an empty list with no error surfaced.
+# Keep this short and browser-like.
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 TIMEOUT = 45
+RETRIES = 3
 
 
 def cm_bhavcopy_url(d: date) -> str:
@@ -68,18 +76,72 @@ def index_close_url(d: date) -> str:
     return f"{BASE}/content/indices/ind_close_all_{d:%d%m%Y}.csv"
 
 
-def _get(url: str) -> Optional[bytes]:
+def _get(url: str, retries: int = RETRIES) -> Optional[bytes]:
     """Single archive-file fetch. Returns None on any failure — a missing file
-    is the NORMAL case for holidays and weekends and must not raise."""
-    try:
-        req = Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
-        with urlopen(req, timeout=TIMEOUT) as r:
-            if r.status != 200:
-                return None
-            return r.read()
-    except Exception as exc:                      # noqa: BLE001 - source liveness
-        log.info("archive fetch failed %s: %s", url, exc)
-        return None
+    is the NORMAL case for holidays and weekends and must not raise.
+
+    Failures are logged at WARNING (not INFO) because this function returning
+    None is indistinguishable, to the caller, from "the exchange published
+    nothing" — and a silent transport failure looks exactly like an empty
+    dataset. Use `health_check()` to tell the two apart.
+    """
+    last = "unknown"
+    for attempt in range(max(1, retries)):
+        try:
+            req = Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "text/csv,application/zip,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            with urlopen(req, timeout=TIMEOUT) as r:
+                if r.status != 200:
+                    last = f"HTTP {r.status}"
+                    continue
+                return r.read()
+        except Exception as exc:                  # noqa: BLE001 - source liveness
+            last = f"{type(exc).__name__}: {exc}"
+            if attempt + 1 < max(1, retries):
+                time.sleep(1.5 * (attempt + 1))   # be gentle on a free source
+    log.warning("NSE archive fetch failed after %d attempts: %s (%s)",
+                max(1, retries), url, last)
+    return None
+
+
+def health_check() -> dict:
+    """Is the archive source actually reachable, and does each file parse?
+
+    Exists because every fetch here fails CLOSED (returns None → empty list), so
+    a transport problem is otherwise indistinguishable from a quiet market day.
+    Surfacing this in the Data Health page is the difference between "no
+    derivatives data today" and "we have been silently blind for a week".
+    """
+    probe_day = date.today()
+    for _ in range(7):                            # walk back to a trading day
+        if probe_day.weekday() < 5:
+            break
+        probe_day -= timedelta(days=1)
+    checks = {}
+    cons = fetch_index_constituents("nifty50")
+    checks["index_constituents"] = {"ok": len(cons) > 10, "rows": len(cons)}
+    for name, fn in (("index_close", fetch_index_close),
+                     ("delivery", fetch_delivery),
+                     ("fo_bhavcopy", fetch_fo_bhavcopy)):
+        rows = []
+        d = probe_day
+        for _ in range(5):                        # tolerate holidays / lag
+            rows = fn(d)
+            if rows:
+                break
+            d -= timedelta(days=1)
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+        checks[name] = {"ok": bool(rows), "rows": len(rows), "probed_date": d.isoformat()}
+    healthy = all(c["ok"] for c in checks.values())
+    return {"source": "NSE official public archives", "healthy": healthy,
+            "checks": checks,
+            "note": ("Every fetch fails closed (None → empty), so an unreachable "
+                     "source looks identical to a quiet market. This check "
+                     "distinguishes them.")}
 
 
 def _unzip_csv(raw: bytes) -> Optional[str]:
@@ -420,3 +482,51 @@ def futures_curve(session: Session, symbol: str, trade_date: date) -> list[tuple
             DerivativeQuote.instrument_type.in_(("IDF", "STF")))).all()
     return sorted((r.expiry, r.settlement_price or r.close)
                   for r in rows if (r.settlement_price or r.close))
+
+
+# ------------------------------------------------------- index constituents
+
+INDEX_LISTS = {
+    "nifty50": "ind_nifty50list",
+    "niftynext50": "ind_niftynext50list",
+    "nifty100": "ind_nifty100list",
+    "nifty200": "ind_nifty200list",
+    "nifty500": "ind_nifty500list",
+    "niftymidcap150": "ind_niftymidcap150list",
+    "niftysmallcap250": "ind_niftysmallcap250list",
+}
+
+
+def index_constituents_url(index_key: str) -> str:
+    slug = INDEX_LISTS.get(index_key.lower(), index_key)
+    return f"{BASE}/content/indices/{slug}.csv"
+
+
+def parse_constituents(csv_text: str) -> list[dict]:
+    """`Company Name,Industry,Symbol,Series,ISIN Code` → universe rows.
+
+    The exchange's own membership and its own industry classification, which
+    removes the need to hand-maintain either. `Industry` here is NSE's macro
+    classification, not GICS — mapped to the platform's internal sector labels
+    by `universe.sector_from_nse_industry`.
+    """
+    out: list[dict] = []
+    for r in csv.DictReader(io.StringIO(csv_text)):
+        sym = (r.get("Symbol") or "").strip()
+        if not sym:
+            continue
+        out.append({
+            "ticker": sym,
+            "name": (r.get("Company Name") or "").strip(),
+            "nse_industry": (r.get("Industry") or "").strip(),
+            "series": (r.get("Series") or "EQ").strip(),
+            "isin": (r.get("ISIN Code") or "").strip() or None,
+        })
+    return out
+
+
+def fetch_index_constituents(index_key: str = "nifty50") -> list[dict]:
+    """Live index membership from NSE. Empty list on any failure so the caller
+    can fall back to its pinned snapshot rather than starting with no universe."""
+    raw = _get(index_constituents_url(index_key))
+    return parse_constituents(raw.decode("utf-8", "replace")) if raw else []

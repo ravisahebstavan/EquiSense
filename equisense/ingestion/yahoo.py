@@ -43,11 +43,29 @@ def _f(df, labels: list[str], col) -> float | None:
     return None
 
 
-def sync_universe(session: Session) -> dict[str, int]:
-    """Create/refresh Company rows for the configured universe. Companies that
-    were demo-seeded flip to real once live data lands."""
+def sync_universe(session: Session, index_key: str = "nifty50") -> dict[str, int]:
+    """Create/refresh Company rows from the EXCHANGE'S OWN index membership.
+
+    Membership, industry classification and ISINs come from NSE's published
+    constituent CSV rather than a hand-maintained dict, so an index reshuffle is
+    picked up automatically. The pinned NIFTY50 map remains only as an offline
+    fallback and the fallback is reported, never silent — analysing a stale
+    membership list means holding names the index dropped and missing the ones
+    it added.
+    """
+    from .universe import resolve_universe
+
+    universe, source = resolve_universe(index_key)
+    log.info("universe source: %s", source)
+    fell_back = "FALLBACK" in source
+    if not universe:
+        universe = dict(NIFTY50)
+        source = "PINNED FALLBACK (empty resolution)"
+        fell_back = True
+
+    today = date.today()
     ids: dict[str, int] = {}
-    for ticker, (name, sector, cap_band, peer_group) in NIFTY50.items():
+    for ticker, (name, sector, cap_band, peer_group) in universe.items():
         row = session.scalars(select(Company).where(Company.ticker == ticker)).first()
         if row is None:
             row = Company(ticker=ticker, name=name, sector=sector)
@@ -55,9 +73,29 @@ def sync_universe(session: Session) -> dict[str, int]:
         row.name, row.sector, row.cap_band, row.peer_group = name, sector, cap_band, peer_group
         row.is_financial = is_financial(sector)
         row.is_demo_data = False
+        row.is_index_member = True
+        row.last_seen_in_index = today
         session.flush()
         ids[ticker] = row.id
+
+    # Names the index no longer holds are DEACTIVATED, not deleted. Keeping the
+    # rows preserves their price history (deleting it would manufacture the very
+    # survivorship bias every base-rate record is caveated for), while clearing
+    # the membership flag removes them from the live analytical universe so they
+    # stop contaminating cross-sectional percentile ranking and new cohorts.
+    #
+    # Skipped entirely when the constituent list was unreachable: a transient
+    # network failure must never be allowed to deactivate the whole universe.
+    departed: list[str] = []
+    if not fell_back:
+        for row in session.scalars(select(Company).where(
+                Company.is_demo_data == False)).all():          # noqa: E712
+            if row.ticker not in universe and row.is_index_member:
+                row.is_index_member = False
+                departed.append(row.ticker)
     session.commit()
+    log.info("synced %d companies (%s); deactivated %d departed: %s",
+             len(ids), source, len(departed), ", ".join(departed) or "none")
     return ids
 
 
@@ -324,13 +362,16 @@ def ingest_fundamentals(session: Session, ids: dict[str, int],
 
 
 def run_full_ingest(session: Session, years: int = 10,
-                    skip_fundamentals: bool = False) -> dict:
+                    skip_fundamentals: bool = False,
+                    index_key: str = "nifty50",
+                    refetch_prices: bool = False) -> dict:
     """One-shot pipeline: universe → prices → macro → fundamentals."""
     t0 = time.time()
-    ids = sync_universe(session)
-    prices = ingest_prices(session, ids, years=years)
+    ids = sync_universe(session, index_key=index_key)
+    prices = ingest_prices(session, ids, years=years, refetch=refetch_prices)
     macro = ingest_macro(session, years=years)
     fundamentals = 0 if skip_fundamentals else ingest_fundamentals(session, ids)
     return {"companies": len(ids), "price_rows": prices, "macro_rows": macro,
             "filing_rows": fundamentals, "seconds": round(time.time() - t0, 1),
+            "index": index_key, "tickers": list(ids),
             "as_of": datetime.now(timezone.utc).isoformat()}

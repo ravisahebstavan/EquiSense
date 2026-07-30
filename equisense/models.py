@@ -32,6 +32,14 @@ class Company(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     is_demo_data: Mapped[bool] = mapped_column(Boolean, default=False)
     is_financial: Mapped[bool] = mapped_column(Boolean, default=False)  # banks/NBFC: statement engines skip
+    # Index membership, refreshed from NSE's published constituent list on every
+    # universe sync. A company that LEAVES the index is deactivated, never
+    # deleted: its price history stays (deleting it would manufacture exactly the
+    # survivorship bias the research plane warns about on every base-rate record)
+    # but it drops out of the live analytical universe, so it no longer
+    # contaminates cross-sectional percentile ranking or new study cohorts.
+    is_index_member: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_seen_in_index: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     filings: Mapped[list["FilingPeriod"]] = relationship(back_populates="company")
 

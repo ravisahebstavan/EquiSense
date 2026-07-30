@@ -6,4 +6,7 @@ pydantic>=2.6
 anthropic>=0.90
 yfinance>=0.2.40
 pandas>=2.0
+# explicit: engine/montecarlo.py and research/stats.py import numpy directly.
+# It arrives transitively via pandas today, which is not a guarantee.
+numpy>=1.26
 psycopg[binary]>=3.1
