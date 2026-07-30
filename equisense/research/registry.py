@@ -26,6 +26,20 @@ STATUS_CAPS: dict[str, float] = {
 # evidence family → governing hypothesis (families without a governing
 # hypothesis are unvalidated T1 context and get the default cap)
 FAMILY_HYPOTHESIS: dict[str, str] = {
+    "novel.delivery": "HYP-012",
+    "novel.institutional_flow": "HYP-013",
+    # NOTE: banking.profitability / banking.spread are deliberately NOT mapped to
+    # HYP-014. Mapping them would set their cap to 0.0 (SHADOW) and make every
+    # financial-sector name blind again — the exact problem engine/banking.py was
+    # built to fix. The distinction the STATUS_CAPS table needs is between "this
+    # CLAIM cannot be tested yet" and "this MEASUREMENT cannot be used at all".
+    # HYP-014 is the former: it registers the specific, testable proposition that
+    # ranking banks on ROA beats ranking them on ROE. ROA and NIM themselves are
+    # standard accounting measures, not EquiSense inventions like CCS or the
+    # Fragility Index, so they carry the same DEFAULT_UNVALIDATED_CAP as
+    # Piotroski and Altman — which are equally untested by any registry entry.
+    # Treating a bank's ROA as unusable while an industrial's F-Score counts at
+    # 0.25 would be an inconsistency, not extra rigour.
     "technical.trend": "HYP-001",
     "novel.mqi": "HYP-004",
     "novel.ccs": "HYP-005",
@@ -50,6 +64,61 @@ def admission_cap(family: str) -> tuple[float, str]:
 
 
 REGISTRY: dict[str, dict] = {
+    "HYP-012": {
+        "name": "delivery_percentile_accumulation",
+        "family": "novel.delivery",
+        "motivation": "Delivery percentage separates stock that genuinely changed "
+                      "hands from intraday churn. Two names can print identical "
+                      "volume while one was accumulated and the other round-tripped "
+                      "by day traders. NSE publishes it daily (MTO file) and the "
+                      "platform now ingests it; the claim to be tested is that a "
+                      "volume surge on LOW delivery versus a stock's own norm marks "
+                      "late-crowd churn and precedes weaker short-horizon returns.",
+        "spec": "Monthly: rank the universe by delivery % relative to each stock's "
+                "own trailing mean; bottom quintile (churn) and top quintile "
+                "(accumulation); forward 21d & 63d excess vs universe median. "
+                "REQUIRES ~250 trading days of accumulated MTO history — the "
+                "archive publishes one file per day and cannot be backfilled "
+                "cheaply, so this cannot run yet.",
+        "status": "registered-deferred",
+    },
+    "HYP-013": {
+        "name": "net_institutional_flow_direction",
+        "family": "novel.institutional_flow",
+        "motivation": "SEBI-mandated bulk/block disclosures name the counterparty, "
+                      "the closest free data gets to institutional intent. The "
+                      "testable claim is narrow on purpose: only NET flow scaled by "
+                      "ADV should matter, and only where net is a large fraction of "
+                      "gross. Observed live, the largest gross print of the day "
+                      "(IIFL, Rs1,486cr) had net of MINUS Rs9.8cr — funds crossing "
+                      "stock with each other, carrying no directional information.",
+        "spec": "Daily: for names where |net| >= 50% of gross, rank by net flow in "
+                "days of ADV; forward 21d & 63d excess vs universe median. "
+                "REQUIRES accumulated deal history — the file is a same-day "
+                "disclosure that the platform deliberately does not store, so this "
+                "is not testable until a history is kept.",
+        "status": "registered-deferred",
+    },
+    "HYP-014": {
+        "name": "bank_roa_quality",
+        "family": "banking.profitability",
+        "motivation": "For a leveraged spread business ROA is the profitability "
+                      "measure that leverage does NOT flatter, while ROE is. The "
+                      "claim is that ranking banks on ROA (and on net interest "
+                      "margin) identifies durable franchises better than ranking "
+                      "them on ROE, which rewards balance-sheet risk. Live example: "
+                      "ICICI earns ROE 16.0% on ROA 1.95% at 8.2x leverage while SBI "
+                      "earns ROE 15.4% on ROA 1.07% at 14.4x — near-identical ROE, "
+                      "entirely different businesses.",
+        "spec": "Annual: rank financial-sector names by ROA and by NIM within the "
+                "financial cohort only; forward 126d & 252d excess vs the financial "
+                "cohort median. DEFERRED for the same reason as HYP-005/006: needs "
+                "archived point-in-time statements, and testing on Yahoo's restated "
+                "figures would be look-ahead. Also inherently incomplete — asset "
+                "quality and capital adequacy, the dominant drivers of bank "
+                "outcomes, are unavailable from any free source.",
+        "status": "registered-deferred",
+    },
     "HYP-009": {
         "name": "vol_managed_momentum_overlay",
         "family": "meta.risk_management",
