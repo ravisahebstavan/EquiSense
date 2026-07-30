@@ -280,3 +280,79 @@ class WatchlistItem(Base):
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), unique=True)
     rationale: Mapped[str] = mapped_column(Text)  # REQUIRED at add-time (§21)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------- NSE archives
+# Tables backed by NSE's official public EOD archive files. These are the free,
+# keyless, exchange-published source — materially better than the unofficial
+# quote API for anything derivative or delivery related, and they are the only
+# free route to a real Indian option chain with open interest.
+
+class DerivativeQuote(Base):
+    """One F&O contract's EOD bar from the NSE F&O bhavcopy.
+
+    Covers index futures/options (IDF/IDO) and stock futures/options (STF/STO):
+    ~35k rows per trading day. `settlement_price` is the exchange's own mark and
+    is what implied volatility should be solved from — `close` can be stale or
+    zero for untraded strikes, of which there are many.
+    """
+    __tablename__ = "derivative_quotes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)   # TckrSymb
+    instrument_type: Mapped[str] = mapped_column(String(6))       # IDF|IDO|STF|STO
+    expiry: Mapped[date] = mapped_column(Date, index=True)
+    strike: Mapped[float | None] = mapped_column(Float)           # None for futures
+    option_type: Mapped[str | None] = mapped_column(String(2))    # CE|PE, None for futures
+    open_price: Mapped[float | None] = mapped_column(Float)
+    high_price: Mapped[float | None] = mapped_column(Float)
+    low_price: Mapped[float | None] = mapped_column(Float)
+    close: Mapped[float | None] = mapped_column(Float)
+    settlement_price: Mapped[float | None] = mapped_column(Float)
+    underlying_price: Mapped[float | None] = mapped_column(Float)
+    open_interest: Mapped[float | None] = mapped_column(Float)
+    change_in_oi: Mapped[float | None] = mapped_column(Float)
+    volume: Mapped[float | None] = mapped_column(Float)
+    lot_size: Mapped[int | None] = mapped_column(Integer)
+
+
+class DeliveryStat(Base):
+    """Security-wise delivery position from the NSE MTO file.
+
+    Delivery percentage is the closest free proxy to "was this real
+    accumulation or intraday churn", and engine/novel.py's crowding proxy
+    documents its absence as a limitation. It is not absent — it is published
+    daily by the exchange.
+    """
+    __tablename__ = "delivery_stats"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    series: Mapped[str] = mapped_column(String(4))
+    traded_qty: Mapped[float] = mapped_column(Float)
+    delivered_qty: Mapped[float] = mapped_column(Float)
+    delivery_pct: Mapped[float] = mapped_column(Float)
+
+
+class IndexObservation(Base):
+    """Daily EOD bar for every NSE index, WITH the exchange's own valuation
+    metrics (P/E, P/B, dividend yield) — ~141 indices per day.
+
+    Index-level P/E history is a genuine market-valuation input that the
+    platform previously had no access to: it makes "is the market itself
+    expensive versus its own history" answerable on the same percentile
+    footing as the single-stock version.
+    """
+    __tablename__ = "index_observations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    index_name: Mapped[str] = mapped_column(String(60), index=True)
+    obs_date: Mapped[date] = mapped_column(Date, index=True)
+    open_value: Mapped[float | None] = mapped_column(Float)
+    high_value: Mapped[float | None] = mapped_column(Float)
+    low_value: Mapped[float | None] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float | None] = mapped_column(Float)
+    turnover_cr: Mapped[float | None] = mapped_column(Float)
+    pe: Mapped[float | None] = mapped_column(Float)
+    pb: Mapped[float | None] = mapped_column(Float)
+    div_yield: Mapped[float | None] = mapped_column(Float)
