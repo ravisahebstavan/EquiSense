@@ -114,3 +114,63 @@ def test_abstention_registers_counterfactual_claim(tmp_path, monkeypatch):
     assert rec["claim"]["direction"] == 0
     assert rec["claim"]["stated_probability"] is None
     assert L.verify_chain()["intact"]
+
+
+# ---------------------------------------------- dividends in XIRR (Wave S)
+
+def test_dividends_are_counted_as_cash_inflows():
+    """A dividend is cash that actually arrived. Omitting it understated the
+    money-weighted return by roughly the yield, every year, compounding."""
+    from datetime import date as _d
+
+    from equisense.engine.portfolio import Transaction, portfolio_xirr
+
+    txns = [Transaction(company_id=1, side="buy", quantity=100, price=100.0,
+                        trade_date=_d(2024, 1, 1))]
+    values = {1: 11_000.0}
+    as_of = _d(2026, 1, 1)
+    divs = {1: [(_d(2024, 6, 1), 5.0), (_d(2025, 6, 1), 6.0)]}
+
+    without = portfolio_xirr(txns, values, as_of)
+    with_div = portfolio_xirr(txns, values, as_of, divs)
+    assert with_div.value > without.value
+    assert with_div.inputs["dividends_received"] == pytest.approx(1100.0)
+    assert with_div.inputs["dividend_cashflows"] == 2
+    # stored rounded to 3dp; it must reconcile to the dividend-free XIRR
+    assert with_div.inputs["xirr_excluding_dividends_pct"] == pytest.approx(
+        without.value, abs=1e-3)
+
+
+def test_dividend_entitlement_uses_the_position_held_on_the_ex_date():
+    """Entitlement depends on the holding as it stood on the ex-date — buying
+    after it earns nothing, selling before it earns nothing."""
+    from datetime import date as _d
+
+    from equisense.engine.portfolio import Transaction, dividend_cashflows
+
+    txns = [Transaction(1, "buy", 100, 100.0, _d(2024, 1, 1)),
+            Transaction(1, "buy", 100, 110.0, _d(2024, 9, 1))]   # AFTER the ex-date
+    flows = dividend_cashflows(txns, {1: [(_d(2024, 6, 1), 5.0)]}, _d(2025, 1, 1))
+    assert len(flows) == 1
+    assert flows[0][1] == pytest.approx(500.0), "only the 100 shares held then"
+
+
+def test_shares_sold_before_the_ex_date_earn_nothing():
+    from datetime import date as _d
+
+    from equisense.engine.portfolio import Transaction, dividend_cashflows
+
+    txns = [Transaction(1, "buy", 100, 100.0, _d(2024, 1, 1)),
+            Transaction(1, "sell", 100, 120.0, _d(2024, 3, 1))]
+    flows = dividend_cashflows(txns, {1: [(_d(2024, 6, 1), 5.0)]}, _d(2025, 1, 1))
+    assert flows == []
+
+
+def test_xirr_reports_price_only_when_there_are_no_dividends():
+    from datetime import date as _d
+
+    from equisense.engine.portfolio import Transaction, portfolio_xirr
+
+    txns = [Transaction(1, "buy", 100, 100.0, _d(2024, 1, 1))]
+    m = portfolio_xirr(txns, {1: 11_000.0}, _d(2026, 1, 1))
+    assert "price-only" in m.caveat

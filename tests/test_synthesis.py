@@ -16,10 +16,36 @@ def test_insufficient_clusters_abstains():
 
 
 def test_agreement_produces_candidate():
-    s = synthesize([E("trend", 0.6), E("value", 0.5), E("quality", 0.7), E("risk", 0.4)])
+    """Broad agreement across well-covered clusters is a candidate.
+
+    Two evidence per cluster is the realistic coverage a live dossier produces.
+    With only ONE reading per cluster the null dispersion of net_score is large
+    (0.289) and the same strengths sit at |z| = 1.9 — genuinely marginal, and
+    correctly abstained on; see test_thin_coverage_needs_a_bigger_net.
+    """
+    s = synthesize([E("trend", 0.6), E("trend", 0.55),
+                    E("value", 0.5), E("value", 0.45),
+                    E("quality", 0.7), E("quality", 0.65),
+                    E("risk", 0.4), E("risk", 0.5)])
     assert s.verdict == "long_candidate"
     assert s.net_score > 0.4
+    assert abs(s.net_z) >= 2.0
     assert not s.dissent
+
+
+def test_thin_coverage_needs_a_bigger_net():
+    """Wave S invariant: the abstention bar scales with the null dispersion, so
+    a thinly-covered name must show a LARGER raw net to qualify. A fixed
+    threshold could not express this."""
+    strengths = [("trend", 0.6), ("value", 0.5), ("quality", 0.7), ("risk", 0.4)]
+    thin = synthesize([E(c, v) for c, v in strengths])
+    thick = synthesize([E(c, v) for c, v in strengths] +
+                       [E(c, v) for c, v in strengths])
+    assert thin.net_score == thick.net_score  # same balance of evidence
+    assert thin.null_sd > thick.null_sd       # but thin coverage is noisier
+    assert abs(thin.net_z) < abs(thick.net_z)
+    assert thin.verdict == "abstain_no_edge"
+    assert thick.verdict == "long_candidate"
 
 
 def test_disagreement_abstains_and_names_dissent():

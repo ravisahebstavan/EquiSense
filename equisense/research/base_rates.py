@@ -11,11 +11,36 @@ return the same date (peer-relative, drift-neutral).
 Known bias, stated on every record: the universe is *current* index
 constituents backfilled — survivorship-tilted. Absolute levels are optimistic;
 cross-sectional *rankings* are less affected. (§6.1: reconstructed grade.)
+
+INFERENCE (Wave S — replaces the Phase II first-order correction)
+-----------------------------------------------------------------
+The observations a cross-sectional event study produces are doubly dependent:
+names selected on the same date share a market-wide shock, and h-day forward
+windows sampled every 21 days overlap for ceil(h/21) consecutive dates. The
+previous estimator, N_eff ≈ N × 21/h, corrected only the second effect and so
+overstated independent information by roughly the cohort size — an order of
+magnitude in practice (verified: N=1080 → old 360, honest 37).
+
+Inference now runs through `research/stats.py`:
+  * dependence clusters = date blocks spanning the overlap horizon;
+  * the intraclass correlation is ESTIMATED from the observations (one-way
+    random-effects ANOVA) rather than assumed, and drives a Kish design effect;
+  * significance uses a Liang–Zeger cluster-robust SE on G−1 degrees of
+    freedom with an exact Student-t p-value;
+  * confidence intervals resample whole clusters (a moving-block bootstrap over
+    a flattened pick list cannot preserve same-date dependence);
+  * every study in a run is then FDR-controlled (Benjamini–Hochberg) and
+    checked against the Harvey–Liu–Zhu |t| ≥ 3 hurdle for a new factor.
+
+Records are ALWAYS written, never suppressed: a study that fails the power gate
+is published with `admissible=False` and the reason. Suppression would destroy
+the measurement; labelling it keeps the evidence and the honesty.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import math
+from datetime import datetime, timezone
 from functools import partial
 
 import pandas as pd
@@ -25,23 +50,37 @@ from sqlalchemy.orm import Session
 from ..engine.regime import regime_series
 from ..models import BaseRateRecord, Company, MacroObservation, PriceObservation
 from .registry import REGISTRY
+from .stats import (HLZ_T_HURDLE, benjamini_hochberg, block_observations,
+                    cluster_block_bootstrap_ci, cluster_robust_mean,
+                    effective_sample_size, multiplicity_verdict)
 
 SURVIVORSHIP_CAVEAT = ("universe=current constituents backfilled (survivorship-"
                        "tilted); prices PIT-safe, membership not")
 
-# Phase II §8: overlap-corrected effective sample size. Monthly (21d) sampling
-# with an h-day outcome window means consecutive episodes of the same stock
-# share ≈(h-21)/h of their window; N_eff ≈ N × 21/h is the honest first-order
-# correction (cross-sectional same-date correlation is partially removed by
-# median-demeaning; residual commonality makes even this slightly generous —
-# stated, not hidden).
 SAMPLING_DAYS = 21
 MIN_N_EFF = 30
+MIN_CLUSTERS = 8                     # below this, cluster-robust inference is itself unreliable
 DEFAULT_ROUND_TRIP_COST_PCT = 0.35   # statutory + typical large-cap impact
 BROAD_COHORT_PCT = 40.0
+FDR_ALPHA = 0.05
+
+
+def overlap_span(horizon_days: int) -> int:
+    """How many consecutive monthly sample dates share overlapping outcome
+    windows — the temporal width of one dependence cluster."""
+    return max(1, math.ceil(horizon_days / SAMPLING_DAYS))
 
 
 def n_effective(n: int, horizon_days: int) -> int:
+    """DEPRECATED time-overlap-only correction, retained because it is one
+    factor of the full design effect and is still the right answer when there
+    is exactly one observation per date.
+
+    Do not use for cross-sectional cohorts: it ignores same-date commonality
+    and overstates N_eff by ~the cohort size. Use
+    `stats.effective_sample_size` on date-blocked clusters instead — that is
+    what `run_study` does.
+    """
     return int(n * SAMPLING_DAYS / max(horizon_days, SAMPLING_DAYS))
 
 
@@ -87,11 +126,17 @@ def feat_above_200dma(closes: pd.DataFrame, volumes) -> pd.DataFrame:
 
 
 def feat_momentum_quality(closes: pd.DataFrame, volumes) -> pd.DataFrame:
+    """MQI, vectorised. Must mirror engine.novel.momentum_quality EXACTLY —
+    including the Wave S directional fix, where persistence is agreement with the
+    SIGN of momentum rather than the raw up-day fraction. Testing a different
+    construction from the one the dossier displays would make the base-rate table
+    evidence about a signal the platform does not actually use."""
     mom = closes.shift(21) / closes.shift(252) - 1
     rets = closes.pct_change()
     vol = rets.rolling(126, min_periods=100).std() * (252 ** 0.5)
     up = (rets > 0).rolling(231, min_periods=180).mean()
-    return (mom / vol.replace(0, pd.NA)) * (0.5 + up)
+    agreement = up.where(mom >= 0, 1.0 - up)
+    return (mom / vol.replace(0, pd.NA)) * (0.5 + agreement)
 
 
 def feat_participation_heat(closes: pd.DataFrame, volumes: pd.DataFrame) -> pd.DataFrame:
@@ -158,13 +203,24 @@ STUDIES: dict[str, dict] = {
 
 def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
               regimes: pd.Series, hyp_id: str, cfg: dict | None = None) -> list[dict]:
+    """Run one registered hypothesis and return one record per (horizon, regime).
+
+    Records are returned for every cell that has any observations at all. The
+    power/admissibility decision lives in the record (`admissible`,
+    `admissibility_reason`), not in whether the record exists — a measurement
+    that failed its power gate is still a measurement, and hiding it would let
+    the absence be mistaken for "not studied".
+    """
     cfg = cfg or STUDIES[hyp_id]
     feat = cfg["feature"](closes, volumes)
-    month_ends = closes.index[::21]  # ~monthly sampling
+    month_ends = closes.index[::SAMPLING_DAYS]  # ~monthly sampling
     results = []
     for horizon in cfg["horizons"]:
         fwd = closes.shift(-horizon) / closes - 1  # (t, t+h] outcome
-        excess_by_regime: dict[str, list[float]] = {"all": [], "uptrend": [], "downtrend": []}
+        # Per-DATE pick cohorts, kept grouped: the grouping IS the dependence
+        # structure that inference needs. Flattening here was the old bug.
+        dated_by_regime: dict[str, list[tuple]] = {"all": [], "uptrend": [],
+                                                   "downtrend": []}
         breadths: list[float] = []
         for t in month_ends:
             if t not in feat.index or t not in fwd.index:
@@ -181,34 +237,60 @@ def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
             picks = orow[mask & orow.notna()]
             if n_universe:
                 breadths.append(len(picks) / n_universe * 100)
+            excesses = [v * 100 for v in (picks - universe_median).tolist()]
+            if not excesses:
+                continue
             regime = regimes.get(t, "unknown")
-            for r in (picks - universe_median).tolist():
-                excess_by_regime["all"].append(r)
-                if regime in excess_by_regime:
-                    excess_by_regime[regime].append(r)
+            dated_by_regime["all"].append((t, excesses))
+            if regime in dated_by_regime:
+                dated_by_regime[regime].append((t, excesses))
         breadth = float(pd.Series(breadths).mean()) if breadths else None
-        for regime_key, vals in excess_by_regime.items():
-            n_eff = n_effective(len(vals), horizon)
-            if n_eff < MIN_N_EFF:
-                continue  # publication gate re-based on N_eff (Phase II §8, A1)
-            s = pd.Series(vals) * 100
-            from .backtest import moving_block_bootstrap_ci
-            ci_lo, ci_hi = moving_block_bootstrap_ci(
-                [v * 100 for v in vals], block_len=max(1, horizon // SAMPLING_DAYS))
-            caveats = [SURVIVORSHIP_CAVEAT,
-                       f"N_eff={n_eff} (overlap-corrected from N={len(vals)}); "
-                       "CIs should be read against N_eff"]
+        span = overlap_span(horizon)
+
+        for regime_key, dated in dated_by_regime.items():
+            if not dated:
+                continue
+            clusters = block_observations(dated, span)
+            ess = effective_sample_size(clusters)
+            mt = cluster_robust_mean(clusters)
+            flat = [v for c in clusters for v in c]
+            s = pd.Series(flat)
+            ci_lo, ci_hi = cluster_block_bootstrap_ci(clusters, statistic="median")
+
+            reasons = []
+            if ess["n_eff"] < MIN_N_EFF:
+                reasons.append(
+                    f"underpowered: N_eff={ess['n_eff']} < {MIN_N_EFF} "
+                    f"(N={ess['n']} observations collapse to ~{ess['n_clusters']} "
+                    f"independent date blocks at ICC={ess['icc']})")
+            if ess["n_clusters"] < MIN_CLUSTERS:
+                reasons.append(
+                    f"only {ess['n_clusters']} independent clusters "
+                    f"(< {MIN_CLUSTERS}) — cluster-robust inference unreliable")
             if breadth is not None and breadth > BROAD_COHORT_PCT:
-                caveats.append(f"broad cohort ({breadth:.0f}% of universe) — "
+                reasons.append(f"broad cohort ({breadth:.0f}% of universe) — "
                                "cross-sectionally undistinctive by construction")
+
+            caveats = [SURVIVORSHIP_CAVEAT,
+                       f"N={ess['n']} observations in {ess['n_clusters']} independent "
+                       f"date blocks (overlap span {span} sample dates, "
+                       f"ICC={ess['icc']}, design effect {ess['design_effect']}) "
+                       f"→ N_eff={ess['n_eff']}. Read every interval against N_eff.",
+                       "CI resamples whole date clusters (cluster bootstrap), so it "
+                       "reflects same-date commonality, not just serial overlap."]
+            caveats.extend(reasons)
+
             results.append({
                 "study_key": f"{REGISTRY[hyp_id]['name']}_{horizon}d",
                 "evidence_family": REGISTRY[hyp_id]["family"],
                 "registry_ref": hyp_id,
                 "horizon_days": horizon,
                 "regime_filter": regime_key,
-                "n": len(vals),
-                "n_eff": n_eff,
+                "n": ess["n"],
+                "n_eff": ess["n_eff"],
+                "n_clusters": ess["n_clusters"],
+                "icc": ess["icc"],
+                "design_effect": ess["design_effect"],
                 "cohort_breadth_pct": None if breadth is None else round(breadth, 1),
                 "hit_rate": float((s > 0).mean()),
                 "mean_excess_pct": float(s.mean()),
@@ -218,11 +300,25 @@ def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
                 "median_ci95_hi_pct": None if ci_hi != ci_hi else round(ci_hi, 2),
                 "q25_excess_pct": float(s.quantile(0.25)),
                 "q75_excess_pct": float(s.quantile(0.75)),
+                # cluster-robust inference on the MEAN excess return
+                "mean_se_pct": None if mt is None else round(mt.se, 4),
+                "t_stat": None if mt is None else round(mt.t_stat, 3),
+                "df": None if mt is None else mt.df,
+                "p_value": None if mt is None else mt.p_value,
+                # q_value / multiplicity verdict are filled in run-wide (FDR is
+                # a property of the family of tests, not of one test)
+                "q_value": None,
+                "admissible": not reasons,
+                "admissibility_reason": ("passes power and distinctiveness gates"
+                                         if not reasons else "; ".join(reasons)),
                 "spec": json.dumps({"hypothesis": hyp_id,
                                     "spec": REGISTRY[hyp_id]["spec"],
                                     "sampling": "monthly (21d)",
                                     "excess_vs": "universe median same-date",
                                     "cost_model_pct": DEFAULT_ROUND_TRIP_COST_PCT,
+                                    "inference": "cluster-robust (Liang–Zeger) on "
+                                                 "date blocks; exact Student-t; "
+                                                 "BH-FDR across the run",
                                     "caveats": caveats}),
             })
     return results
@@ -245,35 +341,112 @@ def run_all_studies(session: Session) -> dict:
         "feature": feat_max_effect, "select": ("quantile", 0.2), "horizons": [21, 63]}
 
     session.execute(delete(BaseRateRecord))  # full recompute; records are cache, ledger is truth
-    total = 0
+    records: list[dict] = []
     for hyp_id, cfg in all_studies.items():
-        for rec in run_study(closes, volumes, regimes, hyp_id, cfg=cfg):
-            session.add(BaseRateRecord(**rec, computed_at=datetime.utcnow()))
-            total += 1
+        records.extend(run_study(closes, volumes, regimes, hyp_id, cfg=cfg))
+
+    apply_multiplicity_control(records)
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for rec in records:
+        session.add(BaseRateRecord(**rec, computed_at=now))
     session.commit()
-    return {"records": total, "universe": closes.shape[1],
+    admissible = [r for r in records if r["admissible"]]
+    survivors = [r for r in admissible if r.get("survives_multiplicity")]
+    return {"records": len(records),
+            "admissible": len(admissible),
+            "survive_multiplicity": len(survivors),
+            "tests_in_family": sum(1 for r in records if r.get("p_value") is not None),
+            "universe": closes.shape[1],
             "history_days": closes.shape[0],
-            "caveat": SURVIVORSHIP_CAVEAT}
+            "caveat": SURVIVORSHIP_CAVEAT,
+            "multiplicity_note": (
+                f"{len(records)} study cells computed; FDR controlled at "
+                f"{FDR_ALPHA:.0%} (Benjamini–Hochberg) across the whole run, and "
+                f"cross-checked against the Harvey–Liu–Zhu |t|≥{HLZ_T_HURDLE} "
+                "hurdle for a newly proposed factor. Testing many cells at 95% "
+                "confidence manufactures winners by construction; this is the "
+                "correction for that.")}
 
 
-def get_base_rate(session: Session, study_key_prefix: str, horizon_days: int,
-                  regime: str = "all") -> dict | None:
-    row = session.scalars(
-        select(BaseRateRecord)
-        .where(BaseRateRecord.study_key == f"{study_key_prefix}_{horizon_days}d",
-               BaseRateRecord.regime_filter == regime)).first()
-    if row is None and regime != "all":  # shrink to unconditional when cell thin (§12.2)
-        return get_base_rate(session, study_key_prefix, horizon_days, "all")
-    if row is None:
-        return None
+def apply_multiplicity_control(records: list[dict], alpha: float = FDR_ALPHA) -> None:
+    """Fill q_value / multiplicity verdict across a whole run, in place.
+
+    FDR is computed only over the *primary* (unconditional, regime="all") cells.
+    Including the per-regime slices would triple-count the same underlying
+    episodes and make the correction both wrong and needlessly punitive; the
+    regime cells inherit the parent study's verdict as context.
+    """
+    primary = [r for r in records
+               if r["regime_filter"] == "all" and r.get("p_value") is not None]
+    qs = benjamini_hochberg([r["p_value"] for r in primary], alpha=alpha)
+    for r, q in zip(primary, qs):
+        r["q_value"] = None if q is None else round(q, 5)
+    by_study = {(r["study_key"]): r for r in primary}
+    for r in records:
+        parent = by_study.get(r["study_key"])
+        if r["regime_filter"] != "all" and parent is not None:
+            r["q_value"] = parent["q_value"]
+        verdict = multiplicity_verdict(r.get("t_stat"), r.get("q_value"), alpha)
+        r["multiplicity_verdict"] = verdict
+        r["survives_multiplicity"] = verdict.startswith("survives FDR and")
+        spec = json.loads(r["spec"])
+        spec["multiplicity"] = {
+            "family_size": len(primary),
+            "q_value": r["q_value"],
+            "t_stat": r.get("t_stat"),
+            "verdict": verdict,
+            "citation": "Benjamini & Hochberg (1995); Harvey, Liu & Zhu (2016), RFS",
+        }
+        r["spec"] = json.dumps(spec)
+
+
+def _serialize_base_rate(row: BaseRateRecord) -> dict:
     return {"study_key": row.study_key, "registry_ref": row.registry_ref,
             "regime": row.regime_filter, "horizon_days": row.horizon_days,
             "n": row.n, "n_eff": row.n_eff,
+            "n_clusters": row.n_clusters, "icc": row.icc,
+            "design_effect": row.design_effect,
             "cohort_breadth_pct": row.cohort_breadth_pct,
             "hit_rate": round(row.hit_rate, 3),
             "median_excess_pct": round(row.median_excess_pct, 2),
             "net_median_excess_pct": None if row.net_median_excess_pct is None
             else round(row.net_median_excess_pct, 2),
             "mean_excess_pct": round(row.mean_excess_pct, 2),
+            "median_ci95_pct": None if row.median_ci95_lo_pct is None else
+            [row.median_ci95_lo_pct, row.median_ci95_hi_pct],
             "iqr_excess_pct": [round(row.q25_excess_pct, 2), round(row.q75_excess_pct, 2)],
+            "t_stat": row.t_stat, "p_value": row.p_value, "q_value": row.q_value,
+            "df": row.df,
+            "admissible": bool(row.admissible),
+            "admissibility_reason": row.admissibility_reason,
+            "multiplicity_verdict": row.multiplicity_verdict,
+            "survives_multiplicity": bool(row.survives_multiplicity),
             "caveat": SURVIVORSHIP_CAVEAT}
+
+
+def get_base_rate(session: Session, study_key_prefix: str, horizon_days: int,
+                  regime: str = "all", admissible_only: bool = True) -> dict | None:
+    """Look up a stored study cell.
+
+    `admissible_only` (the default) is what callers attaching T2 evidence want:
+    an underpowered cell must not be dressed up as a validated base rate. Pass
+    False to retrieve the measurement anyway — the Lab surfaces every cell,
+    including the ones that failed their gates, because "we looked and it was
+    too thin to say" is itself a finding.
+
+    Regime fallback: a thin conditional cell shrinks to the unconditional one
+    (§12.2), and the returned record says which regime it actually came from.
+    """
+    row = session.scalars(
+        select(BaseRateRecord)
+        .where(BaseRateRecord.study_key == f"{study_key_prefix}_{horizon_days}d",
+               BaseRateRecord.regime_filter == regime)).first()
+    if row is not None and admissible_only and not row.admissible:
+        row = None
+    if row is None and regime != "all":  # shrink to unconditional when cell thin (§12.2)
+        return get_base_rate(session, study_key_prefix, horizon_days, "all",
+                             admissible_only=admissible_only)
+    if row is None:
+        return None
+    return _serialize_base_rate(row)

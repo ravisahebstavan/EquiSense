@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import ledger
-from ..engine import novel, quality, ratios, technical, valuation
+from ..engine import banking, novel, quality, ratios, technical, valuation
 from ..engine.evidence import Evidence, ev, xsec_strength
 from ..engine.portfolio import positions_from_ledger
 from ..engine.regime import classify_regime
@@ -30,11 +30,26 @@ from . import services
 
 
 def _series(session: Session, cid: int):
+    """(dates, total_return_closes, volumes) — the return-computation basis."""
     rows = session.execute(
         select(PriceObservation.obs_date, PriceObservation.close, PriceObservation.volume)
         .where(PriceObservation.company_id == cid)
         .order_by(PriceObservation.obs_date)).all()
     return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows])
+
+
+def _nominal_closes(session: Session, cid: int) -> list[float] | None:
+    """Split-adjusted-only closes, for anything that divides a price by a
+    per-share accounting figure. None when the column was never backfilled, so
+    consumers can say so rather than silently using the wrong convention."""
+    rows = session.execute(
+        select(PriceObservation.close_raw)
+        .where(PriceObservation.company_id == cid)
+        .order_by(PriceObservation.obs_date)).all()
+    vals = [r[0] for r in rows]
+    if not vals or any(v is None for v in vals):
+        return None
+    return vals
 
 
 def _macro(session: Session, symbol: str, limit: int | None = None) -> list[float]:
@@ -62,7 +77,7 @@ _SIG_CACHE: dict = {"key": None, "signals": None}
 
 SIGNAL_KEYS = ["momentum", "dist_52w", "trend", "rel_strength", "mqi", "vol",
                "heat", "f_score", "z_score", "ccs", "fragility", "exp_gap",
-               "pe_pctile", "sector_rel_mom", "max_effect"]
+               "pe_pctile", "sector_rel_mom", "max_effect", "delivery_pct"]
 
 
 def universe_signals(session: Session) -> dict[str, dict[str, Optional[float]]]:
@@ -186,32 +201,105 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                                             126, regime_key)))
 
     # ---- value cluster ----
-    pe_pct = novel.pe_percentile_vs_history(closes, dates, stmts, period)
+    pe_pct = novel.pe_percentile_vs_history(
+        closes, dates, stmts, period,
+        nominal_closes=_nominal_closes(session, company.id))
     E.append(ev("novel", "novel.value", "value", S("pe_pctile", invert=True),
                 f"P/E at {pe_pct.value:.0f}th percentile of own history"
                 if pe_pct.value is not None else "", [pe_pct]))
     if stmts and price and not company.is_financial:
-        rd = valuation.reverse_dcf(stmts[-1], price)
+        # Beta is ESTIMATED from this name's own history against NIFTY and shrunk
+        # toward 1.0 (Vasicek), instead of the previous hardcoded 1.0. Beta drives
+        # Ke → WACC → the entire reverse-DCF solve, so assuming 1.0 for every
+        # company injected a large, one-directional error into the headline
+        # valuation output.
+        beta_m = valuation.estimate_beta(closes, _macro(session, "^NSEI", 600), period=period)
+        # Risk-free is DERIVED from the futures basis + the index dividend yield
+        # rather than hardcoded at 7%. It feeds Ke -> WACC -> the implied-growth
+        # solve, so a stale constant biases every valuation in one direction.
+        from .markets import effective_risk_free
+        rf, rf_source = effective_risk_free(session)
+        wacc_a = valuation.WaccAssumptions(risk_free_rate=rf)
+        if beta_m.value is not None:
+            wacc_a.beta = beta_m.value
+        rd = valuation.reverse_dcf(
+            stmts[-1], price,
+            valuation.ReverseDcfAssumptions(wacc=wacc_a),
+            statements=stmts)
         hist = valuation.historical_fcf_cagr(stmts)
         if rd["implied_growth"].value is not None and hist and hist.value is not None:
             gap = rd["implied_growth"].value - hist.value
+            metrics = [rd["implied_growth"], hist, rd["wacc"]]
+            if beta_m.value is not None:
+                metrics.append(beta_m)
             E.append(ev("valuation", "valuation.expectations", "value",
                         S("exp_gap", invert=True),
                         f"Expectations Gap {gap:+.1f}pp (implied {rd['implied_growth'].value:.1f}% "
                         f"vs delivered {hist.value:.1f}%)",
-                        [rd["implied_growth"], hist],
-                        caveats=[rd["implied_growth"].caveat or ""]))
+                        metrics,
+                        caveats=[c for c in (rd["implied_growth"].caveat,
+                                             hist.caveat, beta_m.caveat,
+                                             f"Risk-free rate {rf:.2%}: {rf_source}.") if c]))
 
-    # ---- quality cluster (F/Z exploratory-capped; CCS/Fragility SHADOW) ----
+    # ---- quality cluster: banking model for financials ----
+    # Previously financials emitted NO fundamental evidence at all, so 11 of the
+    # NIFTY-50 could never reach the 3-cluster coverage floor and abstained by
+    # construction rather than on the merits.
+    if stmts and company.is_financial:
+        bank = banking.bank_summary(stmts)
+        if bank.get("analyzable"):
+            bm = {m["key"]: m for m in bank["metrics"]}
+            roa = bm.get("bank_roa", {}).get("value")
+            nim = bm.get("net_interest_margin", {}).get("value")
+            lev = bm.get("equity_multiplier", {}).get("value")
+            from ..engine.types import Metric as _M
+            if roa is not None:
+                # ROA is the bank profitability measure that is NOT flattered by
+                # leverage; ranking on ROE would reward balance-sheet risk.
+                E.append(ev("banking", "banking.profitability", "quality",
+                            _bank_strength(session, company, "roa", roa),
+                            f"Bank ROA {roa:.2f}%"
+                            + (f" on {lev:.1f}x leverage" if lev else ""),
+                            [_M(key="bank_roa", label="Return on Assets", value=roa,
+                                unit="%", formula=bm["bank_roa"]["formula"],
+                                inputs=bm["bank_roa"]["inputs"], period=period,
+                                family="banking",
+                                caveat=bm["bank_roa"].get("caveat"))],
+                            caveats=[banking.BANK_CAVEAT]))
+            if nim is not None:
+                E.append(ev("banking", "banking.spread", "quality",
+                            _bank_strength(session, company, "nim", nim),
+                            f"Net interest margin {nim:.2f}% (on assets)",
+                            [_M(key="net_interest_margin", label="Net Interest Margin",
+                                value=nim, unit="%",
+                                formula=bm["net_interest_margin"]["formula"],
+                                inputs=bm["net_interest_margin"]["inputs"],
+                                period=period, family="banking",
+                                caveat=bm["net_interest_margin"].get("caveat"))]))
+
     if stmts and not company.is_financial:
         curr, prev = stmts[-1], (stmts[-2] if len(stmts) >= 2 else None)
         if prev:
             f = quality.piotroski_f(curr, prev, price)
             if f.value is not None:
+                n_avail = int(f.inputs.get("signals_available", 0))
                 E.append(ev("quality", "quality.fscore", "quality", S("f_score"),
-                            f"Piotroski F {f.value:.0f}/9", [f]))
+                            f"Piotroski F {f.value:.1f}/9"
+                            + ("" if n_avail >= 9 else f" ({n_avail}/9 signals disclosed)"),
+                            [f], caveats=[f.caveat] if f.caveat else None))
+        # Both distress models are emitted: Z''-EM is the calibration-appropriate
+        # one here and is price-invariant, while the 1968 Z is retained for
+        # comparability. Only the EM variant carries evidence weight, so a share
+        # price fall cannot circularly become "distress evidence" about itself.
         z = quality.altman_z(curr, price)
-        if z.value is not None:
+        z_em = quality.altman_z_em(curr)
+        if z_em.value is not None:
+            E.append(ev("quality", "quality.zscore", "quality", S("z_score"),
+                        f"Altman Z''-EM {z_em.value:.2f} "
+                        f"({quality.altman_zone_em(z_em.value)})",
+                        [z_em] + ([z] if z.value is not None else []),
+                        caveats=[c for c in (z_em.caveat,) if c]))
+        elif z.value is not None:
             E.append(ev("quality", "quality.zscore", "quality", S("z_score"),
                         f"Altman Z {z.value:.2f} ({quality.altman_zone(z.value)})",
                         [z], caveats=[z.caveat or ""]))
@@ -346,3 +434,44 @@ def build_dossier(session: Session, company: Company, book_value: float = 1_000_
                          "registered_at": ledger_rec["created_at"],
                          "claim": ledger_rec["claim"]}
     return dossier
+
+
+_BANK_METRIC_CACHE: dict = {"key": None, "values": None}
+
+
+def _bank_strength(session: Session, company: Company, metric: str,
+                   value: float) -> Optional[float]:
+    """Percentile strength for a bank metric, ranked against OTHER BANKS ONLY.
+
+    Ranking a bank's ROA against industrials would be meaningless — a 1.9% ROA
+    is best-in-class for a bank and near-failure for a manufacturer. The peer set
+    is therefore the financial-sector cohort, and with fewer than 5 peers the
+    function returns None rather than manufacture a percentile from noise.
+    """
+    from .snapshot import get_universe
+    from ..engine import banking as _b
+    from . import services as _svc
+
+    universe = get_universe(session)
+    key = (universe.get("as_of"), metric)
+    if _BANK_METRIC_CACHE["key"] != key:
+        vals: dict[str, float] = {}
+        for row in session.scalars(
+                select(Company).where(Company.is_financial == True,      # noqa: E712
+                                      Company.is_index_member == True)).all():  # noqa: E712
+            st = _svc.latest_statements(session, row.id)
+            if not st or not _b.is_bank_analyzable(st[-1]):
+                continue
+            cur = st[-1]
+            if metric == "roa" and cur.net_income is not None and cur.total_assets:
+                vals[row.ticker] = cur.net_income / cur.total_assets * 100
+            elif metric == "nim":
+                nii = _b.net_interest_income(cur)
+                if nii is not None and cur.total_assets:
+                    vals[row.ticker] = nii / cur.total_assets * 100
+        _BANK_METRIC_CACHE.update(key=key, values=vals)
+    peers = _BANK_METRIC_CACHE["values"] or {}
+    if len(peers) < 5:
+        return None
+    rank = sum(1 for v in peers.values() if v <= value) / len(peers)
+    return 2 * (rank - 0.5)

@@ -28,12 +28,23 @@ def momentum_quality(closes: Sequence[float], period: str = "") -> Metric:
     """Momentum Quality Index (MQI) — EquiSense original.
 
     Rewards *smooth* trend over violent trend: identical 12-1 returns score
-    higher when achieved with lower volatility and more persistent daily
-    progress. Construction:
+    higher in magnitude when achieved with lower volatility and more consistent
+    daily progress in the trend's own direction. Construction:
         MQI = risk_adjusted_momentum × persistence_multiplier
         risk-adj momentum = (12-1 return %) / (annualized vol %)
-        persistence = fraction of up days over the momentum window
+        persistence = fraction of days moving WITH the sign of momentum
         multiplier = 0.5 + persistence  (range 0.5–1.5)
+
+    DIRECTIONAL FIX (Wave S): persistence was previously the raw up-day fraction,
+    regardless of trend direction. In a downtrend the up-day fraction is low, so
+    the multiplier fell below 1 and *shrank* the bearish score — meaning a smooth,
+    relentless decline was scored as WEAKER evidence than a choppy one, the exact
+    inverse of the construction's stated intent. Verified before the fix: a smooth
+    decline (−19.8% momentum) and a choppy decline (−44.0%) ranked in the wrong
+    order relative to their path quality. Persistence is now measured as agreement
+    with the direction of momentum, so path consistency amplifies the signal
+    symmetrically on both sides.
+
     Hypothesis (registered: HYP-004): smooth momentum decays slower than raw
     momentum — path quality carries information about holder composition.
     """
@@ -41,22 +52,32 @@ def momentum_quality(closes: Sequence[float], period: str = "") -> Metric:
     vol = realized_vol(closes, 126).value
     window = closes[-(TRADING_DAYS - 21):-21] if len(closes) >= TRADING_DAYS else closes
     ups = sum(1 for i in range(1, len(window)) if window[i] > window[i - 1])
-    persistence = ups / max(1, len(window) - 1)
+    n_moves = max(1, len(window) - 1)
+    up_fraction = ups / n_moves
+    # agreement with the trend's own direction, not "went up"
+    if mom is None:
+        persistence = up_fraction
+    else:
+        persistence = up_fraction if mom >= 0 else (1.0 - up_fraction)
     if mom is None or vol in (None, 0):
         value = None
         formula = "insufficient history"
     else:
         value = (mom / vol) * (0.5 + persistence)
         formula = (f"({fmt(mom)}% mom / {fmt(vol)}% vol) × "
-                   f"(0.5 + persistence {persistence:.2f})")
+                   f"(0.5 + trend-agreement {persistence:.2f})")
     return Metric(
         key="momentum_quality", label="Momentum Quality Index (MQI)",
         value=value, unit="score", formula=formula,
         inputs={"momentum_12_1_pct": mom, "vol_126d_pct": vol,
-                "up_day_fraction": round(persistence, 3)},
+                "up_day_fraction": round(up_fraction, 3),
+                "trend_agreement_fraction": round(persistence, 3)},
         period=period, family="novel",
         caveat="EquiSense-original composite; hypothesis HYP-004 in the registry. "
-               "Not a validated standalone signal until its base-rate table says so.")
+               "Persistence measures agreement with the direction of momentum, so "
+               "the score is symmetric: a smooth decline is strongly negative, not "
+               "weakly negative. Not a validated standalone signal until its "
+               "base-rate table says so.")
 
 
 # ---------------------------------------------------------------- CCS
@@ -153,12 +174,30 @@ def fragility(stmts: list[StatementData], closes: Sequence[float],
 # ------------------------------------------------------- valuation history
 
 def pe_percentile_vs_history(closes: Sequence[float], close_dates: Sequence[date],
-                             stmts: list[StatementData], period: str = "") -> Metric:
+                             stmts: list[StatementData], period: str = "",
+                             nominal_closes: Optional[Sequence[float]] = None) -> Metric:
     """Current trailing P/E's percentile within its own multi-year P/E history.
 
     Historical P/E at each month-end uses the latest fiscal year EPS *known at
     that time* (PIT-honest within the reconstructed-fundamentals caveat).
+
+    PRICE CONVENTION (Wave S): pass `nominal_closes` — the split-adjusted but
+    NOT dividend-adjusted series. A total-return series back-deflates historical
+    prices while leaving the most recent bar alone, so dividing it by nominal
+    filing EPS understates every historical P/E and leaves today's P/E at full
+    value. The percentile then reads systematically "expensive", and because that
+    percentile is inverted into the value cluster it applied a standing bearish
+    tilt. At ~1.3% dividend yield over 10 years the oldest bar is deflated ~12%.
+
+    When `nominal_closes` is absent the function still computes, but says in its
+    caveat that the series may be dividend-adjusted and the level may be biased.
     """
+    price_series = nominal_closes if nominal_closes else closes
+    using_nominal = bool(nominal_closes)
+    if len(price_series) != len(close_dates):
+        price_series = closes
+        using_nominal = False
+    closes = price_series
     eps_by_fy_end: list[tuple[date, float]] = []
     for s in stmts:
         if s.net_income and s.shares_outstanding:
@@ -195,10 +234,17 @@ def pe_percentile_vs_history(closes: Sequence[float], close_dates: Sequence[date
                 f"observations of own history",
         inputs={"pe_now": pe_now, "pe_history_min": min(pes),
                 "pe_history_median": sorted(pes)[len(pes) // 2],
-                "pe_history_max": max(pes), "n_observations": len(pes)},
+                "pe_history_max": max(pes), "n_observations": len(pes),
+                "price_convention": "nominal (split-adjusted)" if using_nominal
+                                    else "UNKNOWN — may be dividend-adjusted"},
         period=period, family="novel",
-        caveat="EPS timeline reconstructed from latest-known filings "
-               "(pit_grade: reconstructed) with a 60-day publication lag assumption.")
+        caveat=("EPS timeline reconstructed from latest-known filings "
+                "(pit_grade: reconstructed) with a 60-day publication lag assumption."
+                + ("" if using_nominal else
+                   " WARNING: no nominal price series was supplied, so this P/E "
+                   "history may be computed from dividend-adjusted prices. That "
+                   "deflates older P/Es and biases the percentile toward "
+                   "'expensive'. Re-ingest prices to populate close_raw.")))
 
 
 # ---------------------------------------------------------------- TVT
@@ -242,27 +288,122 @@ def trend_value_tension(pe_pctile: Optional[float], trend_above_ma_pct: Optional
 # ---------------------------------------------------------------- crowding
 
 def crowding_proxy(closes: Sequence[float], volumes: Sequence[Optional[float]],
-                   period: str = "") -> Metric:
+                   period: str = "",
+                   delivery_pct: Optional[float] = None,
+                   delivery_mean_pct: Optional[float] = None) -> Metric:
     """Participation Heat — EquiSense original crowding proxy.
 
-    Volume surge × recent price extension. High values = late-crowd
-    conditions; entries here have historically worse short-horizon
-    distributions (hypothesis HYP-007, testable against stored history).
+    Volume surge × recent price extension. High values = late-crowd conditions;
+    entries here have historically worse short-horizon distributions (hypothesis
+    HYP-007, testable against stored history).
+
+    DELIVERY REFINEMENT (Wave S). The original construction could not tell a
+    volume surge that represents real accumulation from one that is pure
+    intraday churn, and its own caveat said so: "true crowding needs ownership/
+    flow data (delivery %, FII per-stock) not available from the free source."
+    Delivery percentage IS available — NSE publishes it daily in the MTO file —
+    so when supplied it modulates the score:
+
+      * a surge on LOW delivery versus the stock's own norm is churn, which is
+        the crowding case the signal is trying to catch → amplified;
+      * a surge on HIGH delivery is stock genuinely changing hands and being
+        taken to the demat account, which is a weaker crowding claim → damped.
+
+    The multiplier is bounded to [0.6, 1.5] so a flow input can shade the
+    reading but never dominate the price/volume core, and the score is fully
+    backward compatible when delivery is absent.
     """
     vsurge = volume_anomaly(volumes).value
     r63 = None
     if len(closes) >= 64 and closes[-64] > 0:
         r63 = (closes[-1] / closes[-64] - 1) * 100
+    delivery_mult = 1.0
+    if delivery_pct is not None and delivery_mean_pct:
+        # ratio < 1 => delivery below this stock's own norm => churn
+        ratio = delivery_pct / delivery_mean_pct
+        delivery_mult = _clamp(1.0 + (1.0 - ratio), 0.6, 1.5)
     if vsurge is None or r63 is None:
         value = None
         formula = "needs volume + 63d of prices"
     else:
-        value = vsurge * max(0.0, r63) / 10
-        formula = f"vol surge {vsurge:.2f}x × max(0, 63d return {r63:+.1f}%) / 10"
+        value = vsurge * max(0.0, r63) / 10 * delivery_mult
+        formula = (f"vol surge {vsurge:.2f}x × max(0, 63d return {r63:+.1f}%) / 10"
+                   + (f" × delivery factor {delivery_mult:.2f} "
+                      f"(delivery {delivery_pct:.1f}% vs own mean "
+                      f"{delivery_mean_pct:.1f}%)"
+                      if delivery_pct is not None and delivery_mean_pct else ""))
     return Metric(
         key="crowding_proxy", label="Participation Heat", value=value, unit="score",
         formula=formula,
-        inputs={"volume_surge": vsurge, "return_63d_pct": r63},
+        inputs={"volume_surge": vsurge, "return_63d_pct": r63,
+                "delivery_pct": delivery_pct,
+                "delivery_mean_pct": delivery_mean_pct,
+                "delivery_multiplier": round(delivery_mult, 3)},
         period=period, family="novel",
-        caveat="Proxy only — true crowding needs ownership/flow data "
-               "(delivery %, FII per-stock) not available from the free source.")
+        caveat=("Delivery percentage (NSE MTO file) distinguishes a churn-driven "
+                "volume surge from genuine accumulation; the multiplier is capped "
+                "to ±50% so flow shades the reading without overriding the "
+                "price/volume core."
+                if delivery_pct is not None and delivery_mean_pct else
+                "Volume-only: no delivery data supplied for this name, so a surge "
+                "driven by intraday churn is indistinguishable from real "
+                "accumulation. Ingest the NSE MTO file to close that gap."))
+
+
+# -------------------------------------------------------- institutional flow
+
+def institutional_flow(deals: Sequence[dict], adv_cr: Optional[float] = None,
+                       period: str = "") -> Metric:
+    """Net disclosed institutional activity from NSE bulk/block deals.
+
+    SEBI requires disclosure of large trades with the counterparty NAMED, which
+    is the closest free data comes to observing institutional intent.
+
+    Two things make the naive reading wrong, and both are handled here:
+
+    1. **Gross activity is nearly meaningless.** A bulk deal is very often one
+       fund selling to another, so the same volume can appear on both sides of
+       the tape. Only the NET (buy value − sell value) carries a directional
+       claim.
+    2. **Size is only meaningful relative to liquidity.** ₹50 crore of net
+       buying is enormous in a small cap and noise in Reliance, so the net is
+       expressed in DAYS OF AVERAGE TRADED VALUE rather than in rupees.
+
+    This is a descriptive flow measure, not a validated signal — it has no
+    registered hypothesis and no base-rate table, and says so.
+    """
+    if not deals:
+        return Metric(key="institutional_flow", label="Net Institutional Flow",
+                      value=None, unit="days of ADV",
+                      formula="no disclosed bulk/block deals in the window",
+                      inputs={"deals": 0}, period=period, family="novel",
+                      caveat="Absence of disclosure is not absence of activity — "
+                             "only trades above the disclosure threshold appear.")
+    buy = sum(d.get("value") or 0.0 for d in deals if d.get("side") == "buy")
+    sell = sum(d.get("value") or 0.0 for d in deals if d.get("side") == "sell")
+    net_cr = (buy - sell) / 1e7
+    gross_cr = (buy + sell) / 1e7
+    value = None if not adv_cr else net_cr / adv_cr
+    counterparties = {d.get("client", "") for d in deals if d.get("client")}
+    return Metric(
+        key="institutional_flow", label="Net Institutional Flow",
+        value=None if value is None else round(value, 3), unit="days of ADV",
+        formula=(f"(buy ₹{buy / 1e7:,.1f}cr − sell ₹{sell / 1e7:,.1f}cr) "
+                 f"= net ₹{net_cr:+,.1f}cr"
+                 + (f" / ADV ₹{adv_cr:,.1f}cr = {value:+.2f} days"
+                    if value is not None else " (no ADV reference)")),
+        inputs={"deals": len(deals), "buy_value_cr": round(buy / 1e7, 2),
+                "sell_value_cr": round(sell / 1e7, 2),
+                "net_value_cr": round(net_cr, 2),
+                "gross_value_cr": round(gross_cr, 2),
+                "net_to_gross_ratio": (round(net_cr / gross_cr, 3)
+                                       if gross_cr else None),
+                "distinct_counterparties": len(counterparties),
+                "adv_cr": adv_cr},
+        period=period, family="novel",
+        caveat=("Disclosed bulk/block deals only, so this is a floor on activity, "
+                "not a measure of it. A net-to-gross ratio near zero means funds "
+                "were trading with each other rather than accumulating or "
+                "distributing — high gross with no net is the common case and is "
+                "NOT a directional signal. No registered hypothesis backs this "
+                "yet: it is measured so it can be tested, not asserted."))

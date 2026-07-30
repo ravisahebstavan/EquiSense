@@ -32,6 +32,14 @@ class Company(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     is_demo_data: Mapped[bool] = mapped_column(Boolean, default=False)
     is_financial: Mapped[bool] = mapped_column(Boolean, default=False)  # banks/NBFC: statement engines skip
+    # Index membership, refreshed from NSE's published constituent list on every
+    # universe sync. A company that LEAVES the index is deactivated, never
+    # deleted: its price history stays (deleting it would manufacture exactly the
+    # survivorship bias the research plane warns about on every base-rate record)
+    # but it drops out of the live analytical universe, so it no longer
+    # contaminates cross-sectional percentile ranking or new study cohorts.
+    is_index_member: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_seen_in_index: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     filings: Mapped[list["FilingPeriod"]] = relationship(back_populates="company")
 
@@ -57,6 +65,10 @@ class FilingPeriod(Base):
     depreciation: Mapped[float | None] = mapped_column(Float)
     ebit: Mapped[float | None] = mapped_column(Float)
     interest_expense: Mapped[float | None] = mapped_column(Float)
+    # Banking-specific: a bank's revenue engine is the interest spread, which the
+    # industrial schema has nowhere to put. Null for non-financials.
+    interest_income: Mapped[float | None] = mapped_column(Float)
+    net_interest_income: Mapped[float | None] = mapped_column(Float)
     pbt: Mapped[float | None] = mapped_column(Float)
     tax_expense: Mapped[float | None] = mapped_column(Float)
     net_income: Mapped[float | None] = mapped_column(Float)
@@ -83,8 +95,22 @@ class PriceObservation(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
     obs_date: Mapped[date] = mapped_column(Date, index=True)
+    # TOTAL-RETURN series: adjusted for splits AND dividends. Correct for every
+    # return/momentum/volatility/correlation computation.
     close: Mapped[float] = mapped_column(Float)                    # ₹ per share
+    # NOMINAL series: adjusted for splits/bonuses ONLY — the price actually
+    # traded that day. Required wherever a price meets a per-share accounting
+    # figure, because filing EPS/BVPS are nominal. Dividing a dividend-adjusted
+    # close by a nominal EPS deflates historical P/E and makes a valuation
+    # percentile read systematically "expensive". Nullable: rows ingested before
+    # this split are total-return only and must not silently masquerade as
+    # nominal (see PriceObservation usage notes in ingestion/yahoo.py).
+    close_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
     volume: Mapped[float | None] = mapped_column(Float, nullable=True)  # shares traded
+    # Cash dividend per share with this EX-date (0/None on ordinary days).
+    # Required for money-weighted return: a dividend is a real cash inflow, and
+    # omitting it understates XIRR by roughly the yield, every year.
+    dividend: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class MacroObservation(Base):
@@ -108,11 +134,24 @@ class BaseRateRecord(Base):
     horizon_days: Mapped[int] = mapped_column(Integer)
     regime_filter: Mapped[str] = mapped_column(String(30), default="all")
     n: Mapped[int] = mapped_column(Integer)
-    n_eff: Mapped[int | None] = mapped_column(Integer)               # overlap-corrected (§8 Phase II, A1 fix)
+    n_eff: Mapped[int | None] = mapped_column(Integer)               # design-effect corrected (Wave S)
+    n_clusters: Mapped[int | None] = mapped_column(Integer)          # independent date blocks
+    icc: Mapped[float | None] = mapped_column(Float)                 # estimated intraclass correlation
+    design_effect: Mapped[float | None] = mapped_column(Float)       # Kish variance inflation
     cohort_breadth_pct: Mapped[float | None] = mapped_column(Float)  # avg % of universe selected (A5)
     net_median_excess_pct: Mapped[float | None] = mapped_column(Float)  # after round-trip cost model
-    median_ci95_lo_pct: Mapped[float | None] = mapped_column(Float)     # moving-block bootstrap (PHASE2 §8)
+    median_ci95_lo_pct: Mapped[float | None] = mapped_column(Float)     # cluster bootstrap (Wave S)
     median_ci95_hi_pct: Mapped[float | None] = mapped_column(Float)
+    # cluster-robust inference + multiple-testing control (Wave S)
+    mean_se_pct: Mapped[float | None] = mapped_column(Float)         # Liang–Zeger cluster-robust SE
+    t_stat: Mapped[float | None] = mapped_column(Float)
+    df: Mapped[int | None] = mapped_column(Integer)                  # G−1, not N−1
+    p_value: Mapped[float | None] = mapped_column(Float)             # exact Student-t
+    q_value: Mapped[float | None] = mapped_column(Float)             # Benjamini–Hochberg FDR
+    admissible: Mapped[bool] = mapped_column(Boolean, default=False)
+    admissibility_reason: Mapped[str | None] = mapped_column(Text)
+    multiplicity_verdict: Mapped[str | None] = mapped_column(Text)
+    survives_multiplicity: Mapped[bool] = mapped_column(Boolean, default=False)
     hit_rate: Mapped[float | None] = mapped_column(Float)            # P(excess return > 0)
     mean_excess_pct: Mapped[float | None] = mapped_column(Float)
     median_excess_pct: Mapped[float | None] = mapped_column(Float)
@@ -257,3 +296,79 @@ class WatchlistItem(Base):
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), unique=True)
     rationale: Mapped[str] = mapped_column(Text)  # REQUIRED at add-time (§21)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------- NSE archives
+# Tables backed by NSE's official public EOD archive files. These are the free,
+# keyless, exchange-published source — materially better than the unofficial
+# quote API for anything derivative or delivery related, and they are the only
+# free route to a real Indian option chain with open interest.
+
+class DerivativeQuote(Base):
+    """One F&O contract's EOD bar from the NSE F&O bhavcopy.
+
+    Covers index futures/options (IDF/IDO) and stock futures/options (STF/STO):
+    ~35k rows per trading day. `settlement_price` is the exchange's own mark and
+    is what implied volatility should be solved from — `close` can be stale or
+    zero for untraded strikes, of which there are many.
+    """
+    __tablename__ = "derivative_quotes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)   # TckrSymb
+    instrument_type: Mapped[str] = mapped_column(String(6))       # IDF|IDO|STF|STO
+    expiry: Mapped[date] = mapped_column(Date, index=True)
+    strike: Mapped[float | None] = mapped_column(Float)           # None for futures
+    option_type: Mapped[str | None] = mapped_column(String(2))    # CE|PE, None for futures
+    open_price: Mapped[float | None] = mapped_column(Float)
+    high_price: Mapped[float | None] = mapped_column(Float)
+    low_price: Mapped[float | None] = mapped_column(Float)
+    close: Mapped[float | None] = mapped_column(Float)
+    settlement_price: Mapped[float | None] = mapped_column(Float)
+    underlying_price: Mapped[float | None] = mapped_column(Float)
+    open_interest: Mapped[float | None] = mapped_column(Float)
+    change_in_oi: Mapped[float | None] = mapped_column(Float)
+    volume: Mapped[float | None] = mapped_column(Float)
+    lot_size: Mapped[int | None] = mapped_column(Integer)
+
+
+class DeliveryStat(Base):
+    """Security-wise delivery position from the NSE MTO file.
+
+    Delivery percentage is the closest free proxy to "was this real
+    accumulation or intraday churn", and engine/novel.py's crowding proxy
+    documents its absence as a limitation. It is not absent — it is published
+    daily by the exchange.
+    """
+    __tablename__ = "delivery_stats"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    series: Mapped[str] = mapped_column(String(4))
+    traded_qty: Mapped[float] = mapped_column(Float)
+    delivered_qty: Mapped[float] = mapped_column(Float)
+    delivery_pct: Mapped[float] = mapped_column(Float)
+
+
+class IndexObservation(Base):
+    """Daily EOD bar for every NSE index, WITH the exchange's own valuation
+    metrics (P/E, P/B, dividend yield) — ~141 indices per day.
+
+    Index-level P/E history is a genuine market-valuation input that the
+    platform previously had no access to: it makes "is the market itself
+    expensive versus its own history" answerable on the same percentile
+    footing as the single-stock version.
+    """
+    __tablename__ = "index_observations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    index_name: Mapped[str] = mapped_column(String(60), index=True)
+    obs_date: Mapped[date] = mapped_column(Date, index=True)
+    open_value: Mapped[float | None] = mapped_column(Float)
+    high_value: Mapped[float | None] = mapped_column(Float)
+    low_value: Mapped[float | None] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float | None] = mapped_column(Float)
+    turnover_cr: Mapped[float | None] = mapped_column(Float)
+    pe: Mapped[float | None] = mapped_column(Float)
+    pb: Mapped[float | None] = mapped_column(Float)
+    div_yield: Mapped[float | None] = mapped_column(Float)

@@ -25,19 +25,47 @@ UNIVERSE_KEY = "universe"
 SNAP_VERSION = 4  # bump when the item schema changes → forces a rebuild
 
 
-def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list]]:
-    """One query → {company_id: (dates, closes, volumes)} ordered oldest→newest."""
+def _bulk_delivery(session: Session) -> dict:
+    """{ticker: {latest, mean}} delivery percentage from the NSE MTO archive.
+
+    The MEAN is the reference the latest reading is judged against: absolute
+    delivery levels differ enormously by name (an ETF sits near 90%, a
+    speculative small cap near 10%), so only the deviation from a stock's OWN
+    norm carries information.
+    """
+    from ..models import DeliveryStat
+    rows = session.execute(
+        select(DeliveryStat.symbol, DeliveryStat.trade_date,
+               DeliveryStat.delivery_pct)
+        .order_by(DeliveryStat.symbol, DeliveryStat.trade_date)).all()
+    acc: dict = {}
+    for sym, _d, pct in rows:
+        acc.setdefault(sym, []).append(float(pct))
+    return {sym: {"latest": vals[-1], "mean": sum(vals) / len(vals),
+                  "observations": len(vals)}
+            for sym, vals in acc.items() if vals}
+
+
+def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
+    """One query → {company_id: (dates, closes, volumes, nominal_closes)}.
+
+    `closes` is the TOTAL-RETURN series (returns/momentum/vol basis);
+    `nominal_closes` is split-adjusted only and is what anything dividing a
+    price by a per-share accounting figure must use. See PriceObservation.
+    """
     rows = session.execute(
         select(PriceObservation.company_id, PriceObservation.obs_date,
-               PriceObservation.close, PriceObservation.volume)
+               PriceObservation.close, PriceObservation.volume,
+               PriceObservation.close_raw)
         .order_by(PriceObservation.company_id, PriceObservation.obs_date)).all()
-    out: dict[int, tuple[list, list, list]] = {}
-    for cid, d, c, v in rows:
+    out: dict[int, tuple[list, list, list, list]] = {}
+    for cid, d, c, v, raw in rows:
         if cid not in out:
-            out[cid] = ([], [], [])
+            out[cid] = ([], [], [], [])
         out[cid][0].append(d)
         out[cid][1].append(c)
         out[cid][2].append(v)
+        out[cid][3].append(raw)
     return out
 
 
@@ -94,15 +122,22 @@ def _max5_21d(closes: list[float]) -> Optional[float]:
 
 def build_universe_snapshot(session: Session) -> dict:
     """The one heavy pass: 3 bulk queries + pure CPU. Runs at refresh time."""
-    companies = session.scalars(select(Company)).all()
+    # Live analytical universe = CURRENT index members only. Departed names keep
+    # their history in the database (deleting it would manufacture survivorship
+    # bias) but must not sit in the cross-section: xsec_strength ranks each
+    # signal against this set, so a stale constituent silently shifts every
+    # percentile in the universe.
+    companies = session.scalars(
+        select(Company).where(Company.is_index_member == True)).all()   # noqa: E712
     prices = _bulk_prices(session)
+    delivery = _bulk_delivery(session)
     statements = _bulk_statements(session)
     nifty = _nifty(session)
 
     items = []
     ret63_by_ticker: dict[str, Optional[float]] = {}
     for c in companies:
-        dates, closes, volumes = prices.get(c.id, ([], [], []))
+        dates, closes, volumes, nominal = prices.get(c.id, ([], [], [], []))
         if len(closes) < 60:
             continue
         stmts = statements.get(c.id, [])
@@ -116,39 +151,54 @@ def build_universe_snapshot(session: Session) -> dict:
             "rel_strength": _r(technical.relative_strength(closes, nifty).value),
             "mqi": _r(novel.momentum_quality(closes).value),
             "vol": _r(technical.realized_vol(closes).value),
-            "heat": _r(novel.crowding_proxy(closes, volumes).value),
+            "heat": _r(novel.crowding_proxy(
+                closes, volumes,
+                delivery_pct=(delivery.get(c.ticker) or {}).get("latest"),
+                delivery_mean_pct=(delivery.get(c.ticker) or {}).get("mean")).value),
+            "delivery_pct": _r((delivery.get(c.ticker) or {}).get("latest")),
             "max_effect": None if max5 is None else _r(-max5 * 100),  # negated: low actual MAX scores high
             "sector_rel_mom": None,  # filled below, needs the full cross-section first
             "f_score": None, "z_score": None, "z_zone": None, "ccs": None,
             "fragility": None, "exp_gap": None, "pe_pctile": None,
             "revenue_cagr_pct": None, "roic_pct": None, "pe": None,
             "dividend_yield_pct": None, "debt_to_equity": None,
-            "implied_growth_gap_pct": None,
+            "implied_growth_gap_pct": None, "f_signals_available": None,
+            "z_score_em": None, "delivery_pct": None,
         }
         if stmts and not c.is_financial:
             curr = stmts[-1]
             prev = stmts[-2] if len(stmts) >= 2 else None
             years = curr.fiscal_year - stmts[0].fiscal_year
             sig["revenue_cagr_pct"] = _cagr(stmts[0].revenue, curr.revenue, years)
-            sig["roic_pct"] = _r(ratios.roic(curr).value)
+            sig["roic_pct"] = _r(ratios.roic(curr, prev=prev).value)
             ps = {m.key: m for m in ratios.per_share_ratios(curr, price)}
             sig["pe"] = _r(ps["pe"].value) if "pe" in ps else None
             sig["dividend_yield_pct"] = _r(ps["dividend_yield"].value) if "dividend_yield" in ps else None
             lev = {m.key: m for m in ratios.leverage_ratios(curr)}
             sig["debt_to_equity"] = _r(lev["debt_to_equity"].value)
             if prev:
-                sig["f_score"] = quality.piotroski_f(curr, prev, price).value
+                f = quality.piotroski_f(curr, prev, price)
+                sig["f_score"] = f.value
+                # carried so quality_tier() can refuse to tier on sparse data
+                sig["f_signals_available"] = int(f.inputs.get("signals_available", 0))
             z = quality.altman_z(curr, price)
+            z_em = quality.altman_z_em(curr)
             sig["z_score"] = _r(z.value)
-            sig["z_zone"] = quality.altman_zone(z.value)
+            sig["z_score_em"] = _r(z_em.value)
+            # zone prefers the EM variant: price-invariant and calibrated for
+            # non-manufacturers, which most of this universe is
+            sig["z_zone"] = (quality.altman_zone_em(z_em.value)
+                             or quality.altman_zone(z.value))
             sig["ccs"] = _r(novel.cash_conviction(stmts).value)
             sig["fragility"] = _r(novel.fragility(stmts, closes).value)
-            rd = valuation.reverse_dcf(curr, price)
+            rd = valuation.reverse_dcf(curr, price, statements=stmts)
             hist = valuation.historical_fcf_cagr(stmts)
             if rd["implied_growth"].value is not None and hist and hist.value is not None:
                 sig["exp_gap"] = _r(rd["implied_growth"].value - hist.value)
                 sig["implied_growth_gap_pct"] = sig["exp_gap"]
-            sig["pe_pctile"] = _r(novel.pe_percentile_vs_history(closes, dates, stmts).value)
+            nom = nominal if nominal and all(x is not None for x in nominal) else None
+            sig["pe_pctile"] = _r(novel.pe_percentile_vs_history(
+                closes, dates, stmts, nominal_closes=nom).value)
 
         window = closes[-252:]  # 1y of closes, downsampled to ≤40 points
         step = max(1, len(window) // 40)

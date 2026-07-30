@@ -80,3 +80,76 @@ def yahoo_symbol(ticker: str) -> str:
 
 def is_financial(sector: str) -> bool:
     return sector in FINANCIAL_SECTORS
+
+
+# --------------------------------------------------- exchange-derived universe
+# The NIFTY50 map above is now a PINNED FALLBACK, not the source of truth. NSE
+# publishes index membership as a free keyless CSV, so the universe, the
+# industry classification and the ISINs all come from the exchange itself and
+# stay correct through index reshuffles without anyone editing this file.
+
+# NSE macro-industry -> the platform's internal sector taxonomy. Explicit rather
+# than fuzzy-matched, because a silent misclassification would put a company in
+# the wrong peer set and quietly corrupt every relative comparison.
+NSE_INDUSTRY_TO_SECTOR = {
+    "Financial Services": "Financials",
+    "Information Technology": "Information Technology",
+    "Oil Gas & Consumable Fuels": "Energy",
+    "Fast Moving Consumer Goods": "Consumer Staples",
+    "Automobile and Auto Components": "Consumer Discretionary",
+    "Consumer Durables": "Consumer Discretionary",
+    "Consumer Services": "Consumer Discretionary",
+    "Healthcare": "Healthcare",
+    "Metals & Mining": "Materials",
+    "Construction Materials": "Materials",
+    "Chemicals": "Materials",
+    "Capital Goods": "Industrials",
+    "Construction": "Industrials",
+    "Services": "Industrials",
+    "Power": "Utilities",
+    "Telecommunication": "Communication Services",
+    "Media Entertainment & Publication": "Communication Services",
+    "Realty": "Real Estate",
+    "Textiles": "Consumer Discretionary",
+    "Forest Materials": "Materials",
+    "Diversified": "Industrials",
+}
+
+INDEX_CAP_BAND = {
+    "nifty50": "large", "niftynext50": "large", "nifty100": "large",
+    "nifty200": "large", "niftymidcap150": "mid", "niftysmallcap250": "small",
+    "nifty500": "large",
+}
+
+
+def sector_from_nse_industry(industry: str) -> str:
+    """Map NSE's macro-industry label to the internal sector taxonomy."""
+    return NSE_INDUSTRY_TO_SECTOR.get((industry or "").strip(), "Other")
+
+
+def resolve_universe(index_key: str = "nifty50",
+                     allow_fallback: bool = True) -> tuple[dict, str]:
+    """(universe, source) — live NSE membership, or the pinned snapshot.
+
+    `universe` is {ticker: (name, sector, cap_band, peer_group)}, matching the
+    shape of the NIFTY50 constant so every caller is unchanged.
+
+    Falling back is reported, never silent: running against a stale pinned list
+    after an index reshuffle means analysing companies the index no longer holds
+    and missing the ones it added, which is a survivorship problem in miniature.
+    """
+    from .nse_archive import fetch_index_constituents
+
+    rows = fetch_index_constituents(index_key)
+    if not rows:
+        if not allow_fallback:
+            return {}, "unavailable (NSE constituent list unreachable)"
+        return dict(NIFTY50), ("PINNED FALLBACK — NSE constituent list "
+                               "unreachable; membership may be stale")
+    band = INDEX_CAP_BAND.get(index_key.lower(), "large")
+    out: dict[str, tuple] = {}
+    for r in rows:
+        sector = sector_from_nse_industry(r["nse_industry"])
+        peer = (r["nse_industry"] or "other").lower().replace(" ", "_").replace("&", "and")
+        out[r["ticker"]] = (r["name"], sector, band, peer)
+    return out, f"NSE published constituents ({index_key}, {len(out)} names)"

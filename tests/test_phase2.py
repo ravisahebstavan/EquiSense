@@ -84,12 +84,31 @@ def test_deferred_hypotheses_are_shadow():
     assert any("SHADOW" in c for c in e.caveats)
 
 
-def test_exploratory_families_capped():
+def test_exploratory_families_carry_admission_weight_not_clipped_strength():
+    """Wave S: admission control is a WEIGHT, not a clip.
+
+    Clipping the measurement to the cap destroyed information and — because
+    every live hypothesis sits at 0.25 — had made 'high' conviction and
+    'abstain_disagreement' unreachable by construction. The measurement is now
+    preserved at full range and the trust in it travels alongside.
+    """
     cap, _ = admission_cap("technical.trend")
     assert cap == 0.25
     e = ev("technical", "technical.trend", "trend", 0.95, "strong momentum", [M])
-    assert e.strength == pytest.approx(0.25)
-    assert any("capped" in c for c in e.caveats)
+    assert e.strength == pytest.approx(0.95), "measurement must not be clipped"
+    assert e.admission_weight == pytest.approx(0.25)
+    assert any("admission weight" in c for c in e.caveats)
+
+
+def test_exploratory_evidence_cannot_buy_high_conviction():
+    """The discipline the cap existed to enforce, now enforced explicitly."""
+    strong = [ev("t", f, c, 0.95, "s", [M]) for c, f in
+              (("trend", "technical.trend"), ("value", "novel.value"),
+               ("quality", "quality.fscore"), ("risk", "risk.volatility"),
+               ("flow", "novel.crowding"))]
+    s = synthesize([e for e in strong if e])
+    assert s.conviction_ceiling == "low"
+    assert s.conviction_band == "low", "exploratory families must not reach high conviction"
 
 
 def test_shadow_excluded_from_synthesis():
@@ -99,8 +118,10 @@ def test_shadow_excluded_from_synthesis():
             ev("t", "risk.volatility", "risk", 0.9, "s", [M])]
     s = synthesize(real + [strong_shadow])
     assert "quality" not in s.cluster_scores  # shadow never aggregates
-    # all real evidence capped at 0.25 → net small but positive
-    assert 0 < s.net_score <= 0.25
+    assert strong_shadow.admission_weight == 0.0
+    # full-range measurement is preserved, so net now reflects the real evidence
+    assert 0 < s.net_score <= 1.0
+    assert s.net_score == pytest.approx(0.9, abs=1e-6)
 
 
 def test_reg001_is_registered():

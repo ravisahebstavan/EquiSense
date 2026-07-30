@@ -543,16 +543,29 @@ def live_base_rates(s: Session = Depends(db)):
     from ..research.registry import REGISTRY
     rows = s.scalars(select(BaseRateRecord).order_by(BaseRateRecord.study_key)).all()
     return {"registry": REGISTRY,
+            "inference_note": (
+                "N_eff is design-effect corrected: N observations collapse to "
+                "n_clusters independent date blocks at the estimated ICC. "
+                "t/p are cluster-robust (Liang–Zeger) on G−1 df; q is "
+                "Benjamini–Hochberg FDR across the run. A cell with "
+                "admissible=false was measured but is not usable as evidence."),
             "records": [{
                 "study_key": r.study_key, "registry_ref": r.registry_ref,
                 "regime": r.regime_filter, "horizon_days": r.horizon_days,
                 "n": r.n, "n_eff": r.n_eff, "hit_rate": round(r.hit_rate, 3),
+                "n_clusters": r.n_clusters, "icc": r.icc,
+                "design_effect": r.design_effect,
                 "median_excess_pct": round(r.median_excess_pct, 2),
                 "net_median_excess_pct": None if r.net_median_excess_pct is None
                 else round(r.net_median_excess_pct, 2),
                 "cohort_breadth_pct": r.cohort_breadth_pct,
                 "ci95": None if r.median_ci95_lo_pct is None else f"{r.median_ci95_lo_pct}, {r.median_ci95_hi_pct}",
                 "iqr": [round(r.q25_excess_pct, 2), round(r.q75_excess_pct, 2)],
+                "t_stat": r.t_stat, "p_value": r.p_value, "q_value": r.q_value,
+                "admissible": bool(r.admissible),
+                "admissibility_reason": r.admissibility_reason,
+                "multiplicity_verdict": r.multiplicity_verdict,
+                "survives_multiplicity": bool(r.survives_multiplicity),
                 "computed_at": r.computed_at.isoformat(),
             } for r in rows]}
 
@@ -663,6 +676,105 @@ def cron_refresh(s: Session = Depends(db)):
 def company_memory_view(company_id: int, s: Session = Depends(db)):
     from .status import company_memory
     return company_memory(s, _get_company(s, company_id))
+
+
+# ------------------------------------------------------- markets (multi-asset)
+# Derivatives, flow and valuation-regime endpoints. Each returns
+# {"available": false, "reason": ...} rather than raising when the underlying
+# dataset has not been ingested yet — an empty dataset is an ordinary state and
+# the UI has to be able to say which one it is.
+
+
+@app.get("/api/markets/derivatives/{symbol}")
+def markets_derivatives(symbol: str, live: bool = True, s: Session = Depends(db)):
+    """Futures term structure (implied financing rate) + option chain with a
+    solved IV surface, 25-delta skew, PCR and OI structure."""
+    from .markets import derivative_snapshot
+    return derivative_snapshot(s, symbol, live=live)
+
+
+class PositionLeg(BaseModel):
+    kind: str = Field(description="call | put | future")
+    strike: float = 0.0
+    quantity: int = Field(description="lots; negative is short")
+    premium: float = 0.0
+
+
+class PositionRiskRequest(BaseModel):
+    symbol: str = "NIFTY"
+    account_equity: float = Field(default=100_000.0, gt=0)
+    legs: list[PositionLeg]
+
+
+@app.post("/api/markets/position-risk")
+def markets_position_risk(req: PositionRiskRequest, s: Session = Depends(db)):
+    """Net greeks, expiry payoff, scenario margin estimate and the leverage
+    reality-check (with SEBI's published individual F&O loss rate attached)."""
+    from .markets import position_risk
+    if not req.legs:
+        raise HTTPException(400, "at least one leg is required")
+    return position_risk(s, req.symbol, [l.model_dump() for l in req.legs],
+                         req.account_equity)
+
+
+@app.get("/api/markets/delivery/{ticker}")
+def markets_delivery(ticker: str, s: Session = Depends(db)):
+    """Delivery percentage vs the stock's own history — real accumulation
+    versus intraday churn, from NSE's published MTO file."""
+    from .markets import delivery_profile
+    return delivery_profile(s, ticker)
+
+
+@app.get("/api/markets/valuation")
+def markets_valuation(index: str = "Nifty 50", s: Session = Depends(db)):
+    """Index P/E vs its own history, plus the large/mid/small multiple spread."""
+    from .markets import market_valuation, valuation_spread
+    return {"index": market_valuation(s, index), "segments": valuation_spread(s)}
+
+
+@app.get("/api/markets/simulate")
+def markets_simulate(horizon_days: int = 21, paths: int = 20000,
+                     s: Session = Depends(db)):
+    """Monte Carlo VaR / Expected Shortfall / drawdown on the actual book,
+    under Gaussian, Student-t AND a bootstrap of real history."""
+    from .markets import portfolio_simulation
+    return portfolio_simulation(s, horizon_days=horizon_days,
+                                n_paths=max(1000, min(paths, 60000)))
+
+
+@app.get("/api/markets/rates")
+def markets_rates(s: Session = Depends(db)):
+    """Risk-free rate implied by the futures basis plus the exchange's own index
+    dividend yield, and an earnings-yield ERP sanity check. Replaces a hardcoded
+    7.0% that fed every discounted valuation."""
+    from .markets import market_rates
+    return market_rates(s)
+
+
+@app.get("/api/markets/relationships")
+def markets_relationships(lookback: int = 900, s: Session = Depends(db)):
+    """Cross-asset correlation map with STRESS-CONDITIONAL correlations —
+    what still diversifies in a drawdown, which is when it matters. All pairs
+    are FDR-controlled."""
+    from .markets import relationships
+    return relationships(s, lookback=max(120, min(lookback, 2500)))
+
+
+@app.get("/api/markets/flow")
+def markets_flow(ticker: str | None = None, s: Session = Depends(db)):
+    """Net disclosed institutional activity from NSE bulk/block deals — NET
+    direction scaled by liquidity, never gross value."""
+    from .markets import institutional_flow
+    return institutional_flow(s, ticker)
+
+
+@app.get("/api/markets/sources")
+def markets_sources():
+    """Data-source reachability. Exists because every archive fetch fails closed
+    (returns empty), so an unreachable source is otherwise indistinguishable
+    from a quiet market day."""
+    from ..ingestion.nse_archive import health_check
+    return health_check()
 
 
 # ---------------------------------------------------------------- static UI

@@ -99,11 +99,83 @@ def altman_z(s: StatementData, price: Optional[float] = None) -> Metric:
 
 
 def altman_zone(z: Optional[float]) -> Optional[str]:
+    """Zones for the ORIGINAL 1968 Z-score only (2.99 / 1.81 cut-offs)."""
     if z is None:
         return None
     if z > 2.99:
         return "safe"
     if z >= 1.81:
+        return "grey"
+    return "distress"
+
+
+# ---------------------------------------------------- Altman Z''  (emerging markets)
+
+Z_EM_CAVEAT = (
+    "Altman Z''-score (1995 EM variant, as recommended in Altman & Hotchkiss, "
+    "'Corporate Financial Distress and Bankruptcy'). Drops the Sales/Total-Assets "
+    "term — which is what makes the original model sector-biased against "
+    "asset-light and services businesses — and uses BOOK equity rather than "
+    "market equity, so the score does not move simply because the share price "
+    "moved. This is the appropriate variant for Indian non-manufacturers; the "
+    "original 1968 model is retained alongside it for comparability."
+)
+
+
+def altman_z_em(s: StatementData) -> Metric:
+    """Altman Z''-score for emerging markets / non-manufacturers.
+
+        Z'' = 3.25 + 6.56·X1 + 3.26·X2 + 6.72·X3 + 1.05·X4
+
+        X1 = working capital / total assets
+        X2 = retained earnings / total assets
+        X3 = EBIT / total assets
+        X4 = BOOK value of equity / total liabilities
+
+    Why this exists: the original 1968 Z-score was fitted on US manufacturers and
+    includes a Sales/Assets term, which systematically penalises the asset-light
+    and services businesses that dominate the modern Indian large-cap index. It
+    also uses MARKET equity, which makes "distress" partly a restatement of a
+    price decline — circular when the score is then used as evidence about a
+    stock. Z'' fixes both. The zone cut-offs are Altman's own for this variant.
+    """
+    required = [s.current_assets, s.current_liabilities, s.retained_earnings,
+                s.ebit, s.total_assets, s.total_equity]
+    total_liabilities = None
+    if s.total_assets is not None and s.total_equity is not None:
+        total_liabilities = s.total_assets - s.total_equity
+    if any(v is None for v in required) or not total_liabilities \
+            or s.total_assets in (None, 0):
+        return Metric(key="altman_z_em", label="Altman Z''-Score (EM)", value=None,
+                      unit="score",
+                      formula="3.25 + 6.56·WC/TA + 3.26·RE/TA + 6.72·EBIT/TA + 1.05·BVE/TL",
+                      inputs={}, period=s.period, family="distress",
+                      caveat=Z_EM_CAVEAT)
+    wc = s.current_assets - s.current_liabilities
+    x1 = wc / s.total_assets
+    x2 = s.retained_earnings / s.total_assets
+    x3 = s.ebit / s.total_assets
+    x4 = s.total_equity / total_liabilities
+    z = 3.25 + 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4
+    return Metric(
+        key="altman_z_em", label="Altman Z''-Score (EM)", value=z, unit="score",
+        formula=(f"3.25 + 6.56×{x1:.3f} (WC/TA) + 3.26×{x2:.3f} (RE/TA) "
+                 f"+ 6.72×{x3:.3f} (EBIT/TA) + 1.05×{x4:.3f} (BVE/TL)"),
+        inputs={"working_capital": wc, "retained_earnings": s.retained_earnings,
+                "ebit": s.ebit, "book_value_equity": s.total_equity,
+                "total_liabilities": total_liabilities,
+                "total_assets": s.total_assets,
+                "zone": altman_zone_em(z)},
+        period=s.period, family="distress", caveat=Z_EM_CAVEAT)
+
+
+def altman_zone_em(z: Optional[float]) -> Optional[str]:
+    """Altman's zones for the Z'' EM variant (distinct from the 1968 cut-offs)."""
+    if z is None:
+        return None
+    if z > 5.85:
+        return "safe"
+    if z >= 4.15:
         return "grey"
     return "distress"
 
@@ -151,23 +223,65 @@ def piotroski_f(curr: StatementData, prev: StatementData,
     signals["turnover_improving"] = None if (at_c is None or at_p is None) else at_c > at_p
 
     available = {k: v for k, v in signals.items() if v is not None}
-    score = sum(1 for v in available.values() if v)
+    passed = sum(1 for v in available.values() if v)
+    n_avail = len(available)
+
+    # A missing signal is NOT a failed signal. Reporting `passed` against a fixed
+    # /9 denominator conflated the two: an improving company with only 6
+    # computable signals scored 6/9 and was tiered "medium" (or "low"), and that
+    # tier then flowed into attention_score (f_score/9), the candidates engine,
+    # and the portfolio's quality-band concentration axis — so capital was
+    # labelled "fundamentally fragile" because of a data gap. Verified.
+    # Fix: report the raw count AND an availability-scaled score, and refuse to
+    # tier at all when coverage is too thin to support a judgement.
+    scaled = (passed * 9.0 / n_avail) if n_avail else None
     caveats = []
     if margin_fallback:
         caveats.append("Margin signal uses operating margin (gross profit undisclosed).")
-    if len(available) < 9:
-        caveats.append(f"Only {len(available)}/9 signals computable from available data.")
+    if n_avail < 9:
+        caveats.append(
+            f"Only {n_avail}/9 signals computable. The headline value is the "
+            f"availability-scaled score ({passed}/{n_avail} → {scaled:.1f}/9); the raw "
+            f"count is in inputs. A missing signal is not a failed signal — but "
+            f"scaling assumes the undisclosed signals would pass at the same rate "
+            f"as the observed ones (missing-at-random). That is an assumption, not "
+            f"a measurement: this score carries {9 - n_avail} signal(s) of "
+            f"imputation and should be read with wider error bars than a full 9/9.")
+    if n_avail < MIN_F_SIGNALS:
+        caveats.append(
+            f"Below the {MIN_F_SIGNALS}-signal floor for tiering — quality_tier() "
+            "returns None rather than implying a verdict from sparse data.")
     return Metric(
-        key="piotroski_f", label="Piotroski F-Score", value=float(score), unit="score",
-        formula=f"Sum of {len(available)} binary signals: "
-                + ", ".join(f"{k}={'✓' if v else '✗'}" for k, v in available.items()),
-        inputs={k: (1.0 if v else 0.0) for k, v in available.items()},
+        key="piotroski_f", label="Piotroski F-Score",
+        value=None if scaled is None else float(scaled), unit="score",
+        formula=f"{passed} of {n_avail} computable binary signals passed"
+                + (f", scaled to a 9-signal basis → {scaled:.1f}" if n_avail < 9 and scaled is not None else "")
+                + ": " + ", ".join(f"{k}={'✓' if v else '✗'}" for k, v in available.items()),
+        inputs={"signals_passed": float(passed),
+                "signals_available": float(n_avail),
+                "raw_score_out_of_available": float(passed),
+                "scaled_score_out_of_9": None if scaled is None else round(scaled, 2),
+                **{k: (1.0 if v else 0.0) for k, v in available.items()}},
         period=curr.period, family="quality",
         caveat=" ".join(caveats) if caveats else None)
 
 
-def quality_tier(f_score: Optional[float]) -> Optional[str]:
+# Below this many computable signals, an F-Score is not a quality judgement.
+MIN_F_SIGNALS = 6
+
+
+def quality_tier(f_score: Optional[float],
+                 signals_available: Optional[int] = None) -> Optional[str]:
+    """Tier from an F-Score on a 9-signal basis.
+
+    `signals_available` gates the tiering: with sparse fundamentals the score
+    carries too little information to justify a label, and returning None
+    ("unclassified") is the honest answer. Callers that pass nothing keep the
+    old permissive behaviour for backward compatibility.
+    """
     if f_score is None:
+        return None
+    if signals_available is not None and signals_available < MIN_F_SIGNALS:
         return None
     if f_score >= 7:
         return "high"
