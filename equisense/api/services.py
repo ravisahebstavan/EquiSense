@@ -296,6 +296,23 @@ def _txns(session: Session) -> list[pf.Transaction]:
             for r in rows]
 
 
+def _dividends_by_company(session: Session, company_ids) -> dict:
+    """{company_id: [(ex_date, dividend_per_share), ...]} for XIRR."""
+    ids = [c for c in company_ids]
+    if not ids:
+        return {}
+    rows = session.execute(
+        select(PriceObservation.company_id, PriceObservation.obs_date,
+               PriceObservation.dividend)
+        .where(PriceObservation.company_id.in_(ids),
+               PriceObservation.dividend.isnot(None),
+               PriceObservation.dividend > 0)).all()
+    out: dict = {}
+    for cid, d, amt in rows:
+        out.setdefault(cid, []).append((d, float(amt)))
+    return out
+
+
 def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
     from .snapshot import get_universe
     universe = {c["id"]: c for c in get_universe(session)["companies"]}
@@ -323,11 +340,14 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
         cap_bands={cid: companies[cid].cap_band for cid in positions},
         quality_tiers=quality_tiers)
 
+    # Fetched BEFORE the holdings loop, which consumes it per position.
+    divs = _dividends_by_company(session, list(positions))
+
     holdings = []
     for cid, pos in sorted(positions.items(), key=lambda kv: -values[kv[0]]):
         if pos.quantity <= 1e-9:
             continue
-        r = pf.position_xirr(txns, cid, values[cid], today)
+        r = pf.position_xirr(txns, cid, values[cid], today, divs.get(cid))
         c = companies[cid]
         holdings.append({
             "company_id": cid, "ticker": c.ticker, "name": c.name,
@@ -342,7 +362,7 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
             "lots": pf.lot_aging(pos, today),
         })
 
-    xirr_metric = pf.portfolio_xirr(txns, values, today)
+    xirr_metric = pf.portfolio_xirr(txns, values, today, divs)
 
     # Profile-limit checks (diagnostic facts only — no trade suggestions, §11.5)
     breaches = []

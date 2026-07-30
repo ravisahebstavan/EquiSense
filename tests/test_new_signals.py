@@ -248,3 +248,47 @@ def test_base_rates_endpoint_serializes_n_eff_and_net():
         assert rec["multiplicity_verdict"]
         assert rec["n_eff"] <= rec["n"], "N_eff can never exceed N"
         break
+
+
+# ------------------------------------------ delivery-aware crowding (Wave S)
+
+def test_crowding_proxy_is_backward_compatible_without_delivery():
+    from equisense.engine.novel import crowding_proxy
+    closes = [100.0 * (1.004 ** i) for i in range(200)]
+    vols = [1e6] * 130 + [3e6] * 70
+    m = crowding_proxy(closes, vols)
+    assert m.value is not None
+    assert m.inputs["delivery_multiplier"] == 1.0
+    assert "Volume-only" in m.caveat
+
+
+def test_low_delivery_amplifies_crowding_high_delivery_damps_it():
+    """A volume surge on LOW delivery vs the stock's own norm is churn — the
+    crowding case the signal exists to catch. On HIGH delivery it is genuine
+    accumulation and the crowding claim is weaker."""
+    from equisense.engine.novel import crowding_proxy
+    closes = [100.0 * (1.004 ** i) for i in range(200)]
+    vols = [1e6] * 130 + [3e6] * 70
+    base = crowding_proxy(closes, vols).value
+    churn = crowding_proxy(closes, vols, delivery_pct=20.0, delivery_mean_pct=50.0)
+    real = crowding_proxy(closes, vols, delivery_pct=75.0, delivery_mean_pct=50.0)
+    assert churn.value > base > real.value
+    assert "delivery" in churn.formula
+
+
+def test_delivery_multiplier_is_bounded():
+    """Flow may shade the reading, never dominate the price/volume core."""
+    from equisense.engine.novel import crowding_proxy
+    closes = [100.0 * (1.004 ** i) for i in range(200)]
+    vols = [1e6] * 130 + [3e6] * 70
+    extreme_low = crowding_proxy(closes, vols, delivery_pct=1.0, delivery_mean_pct=90.0)
+    extreme_high = crowding_proxy(closes, vols, delivery_pct=95.0, delivery_mean_pct=5.0)
+    assert extreme_low.inputs["delivery_multiplier"] <= 1.5
+    assert extreme_high.inputs["delivery_multiplier"] >= 0.6
+
+
+def test_crowding_still_none_without_enough_price_history():
+    from equisense.engine.novel import crowding_proxy
+    m = crowding_proxy([100.0] * 10, [1e6] * 10, delivery_pct=20.0,
+                       delivery_mean_pct=50.0)
+    assert m.value is None

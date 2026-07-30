@@ -25,6 +25,27 @@ UNIVERSE_KEY = "universe"
 SNAP_VERSION = 4  # bump when the item schema changes → forces a rebuild
 
 
+def _bulk_delivery(session: Session) -> dict:
+    """{ticker: {latest, mean}} delivery percentage from the NSE MTO archive.
+
+    The MEAN is the reference the latest reading is judged against: absolute
+    delivery levels differ enormously by name (an ETF sits near 90%, a
+    speculative small cap near 10%), so only the deviation from a stock's OWN
+    norm carries information.
+    """
+    from ..models import DeliveryStat
+    rows = session.execute(
+        select(DeliveryStat.symbol, DeliveryStat.trade_date,
+               DeliveryStat.delivery_pct)
+        .order_by(DeliveryStat.symbol, DeliveryStat.trade_date)).all()
+    acc: dict = {}
+    for sym, _d, pct in rows:
+        acc.setdefault(sym, []).append(float(pct))
+    return {sym: {"latest": vals[-1], "mean": sum(vals) / len(vals),
+                  "observations": len(vals)}
+            for sym, vals in acc.items() if vals}
+
+
 def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
     """One query → {company_id: (dates, closes, volumes, nominal_closes)}.
 
@@ -109,6 +130,7 @@ def build_universe_snapshot(session: Session) -> dict:
     companies = session.scalars(
         select(Company).where(Company.is_index_member == True)).all()   # noqa: E712
     prices = _bulk_prices(session)
+    delivery = _bulk_delivery(session)
     statements = _bulk_statements(session)
     nifty = _nifty(session)
 
@@ -129,7 +151,11 @@ def build_universe_snapshot(session: Session) -> dict:
             "rel_strength": _r(technical.relative_strength(closes, nifty).value),
             "mqi": _r(novel.momentum_quality(closes).value),
             "vol": _r(technical.realized_vol(closes).value),
-            "heat": _r(novel.crowding_proxy(closes, volumes).value),
+            "heat": _r(novel.crowding_proxy(
+                closes, volumes,
+                delivery_pct=(delivery.get(c.ticker) or {}).get("latest"),
+                delivery_mean_pct=(delivery.get(c.ticker) or {}).get("mean")).value),
+            "delivery_pct": _r((delivery.get(c.ticker) or {}).get("latest")),
             "max_effect": None if max5 is None else _r(-max5 * 100),  # negated: low actual MAX scores high
             "sector_rel_mom": None,  # filled below, needs the full cross-section first
             "f_score": None, "z_score": None, "z_zone": None, "ccs": None,
@@ -137,7 +163,7 @@ def build_universe_snapshot(session: Session) -> dict:
             "revenue_cagr_pct": None, "roic_pct": None, "pe": None,
             "dividend_yield_pct": None, "debt_to_equity": None,
             "implied_growth_gap_pct": None, "f_signals_available": None,
-            "z_score_em": None,
+            "z_score_em": None, "delivery_pct": None,
         }
         if stmts and not c.is_financial:
             curr = stmts[-1]

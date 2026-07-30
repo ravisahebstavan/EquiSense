@@ -101,41 +101,101 @@ def xirr(cashflows: list[tuple[date, float]]) -> Optional[float]:
     return (lo + hi) / 2
 
 
+def dividend_cashflows(txns: list[Transaction],
+                       dividends_by_company: dict[int, list[tuple]],
+                       as_of: date) -> list[tuple[date, float]]:
+    """Cash dividends received, based on shares HELD on each ex-date.
+
+    Reconstructed from the transaction ledger rather than stored as a balance,
+    which is the only way to get it right: entitlement depends on the position
+    size on the ex-date, so a dividend must be multiplied by the holding as it
+    stood THEN, not by today's position. Buying after the ex-date earns nothing;
+    selling before it earns nothing.
+    """
+    flows: list[tuple[date, float]] = []
+    by_company: dict[int, list[Transaction]] = {}
+    for t in txns:
+        by_company.setdefault(t.company_id, []).append(t)
+    for cid, events in dividends_by_company.items():
+        ts = sorted(by_company.get(cid, []), key=lambda t: t.trade_date)
+        if not ts:
+            continue
+        for ex_date, dps in sorted(events):
+            if ex_date > as_of or not dps:
+                continue
+            held = 0.0
+            for t in ts:
+                if t.trade_date > ex_date:
+                    break
+                held += t.quantity if t.side == "buy" else -t.quantity
+            if held > 1e-9:
+                flows.append((ex_date, held * float(dps)))
+    return flows
+
+
 def portfolio_xirr(txns: list[Transaction], current_values: dict[int, float],
-                   as_of: date) -> Optional[Metric]:
-    """XIRR of the whole book: every buy is an outflow, every sell an inflow,
-    plus the current market value of open positions as a terminal inflow."""
-    # buys are outflows (negative), sells inflows (positive)
+                   as_of: date,
+                   dividends_by_company: Optional[dict[int, list[tuple]]] = None
+                   ) -> Optional[Metric]:
+    """XIRR of the whole book: buys are outflows, sells and DIVIDENDS are
+    inflows, plus the current market value of open positions as a terminal
+    inflow.
+
+    Dividends were previously omitted entirely. A dividend is cash that actually
+    arrived, so leaving it out understates the money-weighted return by roughly
+    the portfolio's yield — every year, compounding. For an income-tilted Indian
+    book that is a material, one-directional error in the platform's headline
+    performance number.
+    """
     flows: list[tuple[date, float]] = []
     for t in txns:
         if t.side == "buy":
             flows.append((t.trade_date, -(t.quantity * t.price + t.fees)))
         else:
             flows.append((t.trade_date, t.quantity * t.price - t.fees))
+    div_flows = dividend_cashflows(txns, dividends_by_company or {}, as_of)
+    flows.extend(div_flows)
+    dividend_total = sum(v for _d, v in div_flows)
     terminal = sum(current_values.values())
     if terminal > 0:
         flows.append((as_of, terminal))
     r = xirr(flows)
+    ex_div = xirr([f for f in flows if f not in div_flows]) if div_flows else r
     return Metric(
         key="portfolio_xirr", label="Portfolio XIRR",
         value=None if r is None else r * 100, unit="%",
         formula=f"Money-weighted return over {len(flows)} cashflows "
-                f"(buys as outflows, sells as inflows, current value ₹{fmt(terminal)} "
-                f"as terminal inflow on {as_of.isoformat()})",
-        inputs={"cashflow_count": len(flows), "terminal_value": terminal},
-        period=f"as of {as_of.isoformat()}", family="performance")
+                f"(buys as outflows; sells and ₹{fmt(dividend_total)} of dividends "
+                f"as inflows; current value ₹{fmt(terminal)} as terminal inflow on "
+                f"{as_of.isoformat()})",
+        inputs={"cashflow_count": len(flows), "terminal_value": terminal,
+                "dividend_cashflows": len(div_flows),
+                "dividends_received": round(dividend_total, 2),
+                "xirr_excluding_dividends_pct": (None if ex_div is None
+                                                 else round(ex_div * 100, 3))},
+        period=f"as of {as_of.isoformat()}", family="performance",
+        caveat=("Dividends are counted as cash inflows on their ex-date, sized by "
+                "the position held at that time. The ex-dividend XIRR is shown in "
+                "inputs so the income contribution is visible rather than blended "
+                "invisibly into one number."
+                if div_flows else
+                "No dividend events found for the held names over this period — "
+                "the return is price-only."))
 
 
 def position_xirr(txns: list[Transaction], company_id: int,
-                  current_value: float, as_of: date) -> Optional[float]:
+                  current_value: float, as_of: date,
+                  dividends: Optional[list[tuple]] = None) -> Optional[float]:
+    """Money-weighted return for one position, dividends included."""
+    own = [t for t in txns if t.company_id == company_id]
     flows = []
-    for t in txns:
-        if t.company_id != company_id:
-            continue
+    for t in own:
         if t.side == "buy":
             flows.append((t.trade_date, -(t.quantity * t.price + t.fees)))
         else:
             flows.append((t.trade_date, t.quantity * t.price - t.fees))
+    if dividends:
+        flows.extend(dividend_cashflows(own, {company_id: dividends}, as_of))
     if current_value > 0:
         flows.append((as_of, current_value))
     return xirr(flows)

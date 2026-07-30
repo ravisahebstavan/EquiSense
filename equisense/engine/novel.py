@@ -288,27 +288,63 @@ def trend_value_tension(pe_pctile: Optional[float], trend_above_ma_pct: Optional
 # ---------------------------------------------------------------- crowding
 
 def crowding_proxy(closes: Sequence[float], volumes: Sequence[Optional[float]],
-                   period: str = "") -> Metric:
+                   period: str = "",
+                   delivery_pct: Optional[float] = None,
+                   delivery_mean_pct: Optional[float] = None) -> Metric:
     """Participation Heat — EquiSense original crowding proxy.
 
-    Volume surge × recent price extension. High values = late-crowd
-    conditions; entries here have historically worse short-horizon
-    distributions (hypothesis HYP-007, testable against stored history).
+    Volume surge × recent price extension. High values = late-crowd conditions;
+    entries here have historically worse short-horizon distributions (hypothesis
+    HYP-007, testable against stored history).
+
+    DELIVERY REFINEMENT (Wave S). The original construction could not tell a
+    volume surge that represents real accumulation from one that is pure
+    intraday churn, and its own caveat said so: "true crowding needs ownership/
+    flow data (delivery %, FII per-stock) not available from the free source."
+    Delivery percentage IS available — NSE publishes it daily in the MTO file —
+    so when supplied it modulates the score:
+
+      * a surge on LOW delivery versus the stock's own norm is churn, which is
+        the crowding case the signal is trying to catch → amplified;
+      * a surge on HIGH delivery is stock genuinely changing hands and being
+        taken to the demat account, which is a weaker crowding claim → damped.
+
+    The multiplier is bounded to [0.6, 1.5] so a flow input can shade the
+    reading but never dominate the price/volume core, and the score is fully
+    backward compatible when delivery is absent.
     """
     vsurge = volume_anomaly(volumes).value
     r63 = None
     if len(closes) >= 64 and closes[-64] > 0:
         r63 = (closes[-1] / closes[-64] - 1) * 100
+    delivery_mult = 1.0
+    if delivery_pct is not None and delivery_mean_pct:
+        # ratio < 1 => delivery below this stock's own norm => churn
+        ratio = delivery_pct / delivery_mean_pct
+        delivery_mult = _clamp(1.0 + (1.0 - ratio), 0.6, 1.5)
     if vsurge is None or r63 is None:
         value = None
         formula = "needs volume + 63d of prices"
     else:
-        value = vsurge * max(0.0, r63) / 10
-        formula = f"vol surge {vsurge:.2f}x × max(0, 63d return {r63:+.1f}%) / 10"
+        value = vsurge * max(0.0, r63) / 10 * delivery_mult
+        formula = (f"vol surge {vsurge:.2f}x × max(0, 63d return {r63:+.1f}%) / 10"
+                   + (f" × delivery factor {delivery_mult:.2f} "
+                      f"(delivery {delivery_pct:.1f}% vs own mean "
+                      f"{delivery_mean_pct:.1f}%)"
+                      if delivery_pct is not None and delivery_mean_pct else ""))
     return Metric(
         key="crowding_proxy", label="Participation Heat", value=value, unit="score",
         formula=formula,
-        inputs={"volume_surge": vsurge, "return_63d_pct": r63},
+        inputs={"volume_surge": vsurge, "return_63d_pct": r63,
+                "delivery_pct": delivery_pct,
+                "delivery_mean_pct": delivery_mean_pct,
+                "delivery_multiplier": round(delivery_mult, 3)},
         period=period, family="novel",
-        caveat="Proxy only — true crowding needs ownership/flow data "
-               "(delivery %, FII per-stock) not available from the free source.")
+        caveat=("Delivery percentage (NSE MTO file) distinguishes a churn-driven "
+                "volume surge from genuine accumulation; the multiplier is capped "
+                "to ±50% so flow shades the reading without overriding the "
+                "price/volume core."
+                if delivery_pct is not None and delivery_mean_pct else
+                "Volume-only: no delivery data supplied for this name, so a surge "
+                "driven by intraday churn is indistinguishable from real "
+                "accumulation. Ingest the NSE MTO file to close that gap."))

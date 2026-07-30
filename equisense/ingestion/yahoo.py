@@ -129,9 +129,12 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
         symbols = [yahoo_symbol(t) for t in batch]
         # auto_adjust=False keeps BOTH columns: "Close" is split-adjusted only,
         # "Adj Close" is split+dividend adjusted.
+        # actions=True returns Dividends/Stock Splits in the SAME request, so
+        # dividend capture costs nothing extra. Without them, XIRR silently
+        # understates money-weighted return by roughly the dividend yield.
         data = yf.download(symbols, period=f"{years}y", interval="1d",
-                           auto_adjust=False, progress=False, group_by="ticker",
-                           threads=True)
+                           auto_adjust=False, actions=True, progress=False,
+                           group_by="ticker", threads=True)
         for t, sym in zip(batch, symbols):
             cid = ids[t]
             latest = None if refetch else session.scalar(
@@ -142,6 +145,7 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
                 nominal = frame["Close"].dropna()
                 total_ret = frame["Adj Close"] if "Adj Close" in frame else frame["Close"]
                 volumes = frame["Volume"]
+                divs = frame["Dividends"] if "Dividends" in frame else None
             except KeyError:
                 log.warning("no price data for %s", sym)
                 continue
@@ -160,14 +164,20 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
                 adj = float(nom) if adj is None or math.isnan(adj) else float(adj)
                 v = volumes.get(d)
                 v = None if v is None or math.isnan(v) else float(v)
+                dv = None
+                if divs is not None:
+                    raw_dv = divs.get(d)
+                    if raw_dv is not None and not math.isnan(raw_dv) and raw_dv > 0:
+                        dv = float(raw_dv)
                 row = existing.get(day)
                 if row is not None:
                     row.close, row.close_raw, row.volume = adj, float(nom), v
+                    row.dividend = dv
                     inserted += 1
                     continue
                 rows.append({"company_id": cid, "obs_date": day,
                              "close": adj, "close_raw": float(nom),
-                             "volume": v})
+                             "volume": v, "dividend": dv})
             if rows:
                 session.bulk_insert_mappings(PriceObservation, rows)
                 inserted += len(rows)

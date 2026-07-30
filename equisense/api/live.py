@@ -77,7 +77,7 @@ _SIG_CACHE: dict = {"key": None, "signals": None}
 
 SIGNAL_KEYS = ["momentum", "dist_52w", "trend", "rel_strength", "mqi", "vol",
                "heat", "f_score", "z_score", "ccs", "fragility", "exp_gap",
-               "pe_pctile", "sector_rel_mom", "max_effect"]
+               "pe_pctile", "sector_rel_mom", "max_effect", "delivery_pct"]
 
 
 def universe_signals(session: Session) -> dict[str, dict[str, Optional[float]]]:

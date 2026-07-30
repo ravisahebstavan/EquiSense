@@ -107,6 +107,10 @@ class PriceObservation(Base):
     # nominal (see PriceObservation usage notes in ingestion/yahoo.py).
     close_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
     volume: Mapped[float | None] = mapped_column(Float, nullable=True)  # shares traded
+    # Cash dividend per share with this EX-date (0/None on ordinary days).
+    # Required for money-weighted return: a dividend is a real cash inflow, and
+    # omitting it understates XIRR by roughly the yield, every year.
+    dividend: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class MacroObservation(Base):
