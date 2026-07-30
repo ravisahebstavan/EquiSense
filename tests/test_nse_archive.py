@@ -265,19 +265,23 @@ def test_retention_defaults_fit_a_free_tier():
 
 
 def test_prune_removes_only_rows_past_the_window(session_with_chain):
+    """Retention is measured from TODAY, so the test builds both an in-window
+    and an out-of-window row rather than relying on the fixture's fixed date
+    (which is historical and correctly prunes)."""
     from datetime import timedelta
     from equisense.models import DerivativeQuote
     s = session_with_chain
-    old = date.today() - timedelta(days=NA.RETAIN_DERIVATIVE_DAYS + 10)
-    s.bulk_insert_mappings(DerivativeQuote, [{
-        "trade_date": old, "symbol": "NIFTY", "instrument_type": "IDF",
-        "expiry": old + timedelta(days=7), "close": 1.0, "settlement_price": 1.0}])
+    fresh = date.today() - timedelta(days=2)
+    stale = date.today() - timedelta(days=NA.RETAIN_DERIVATIVE_DAYS + 10)
+    s.bulk_insert_mappings(DerivativeQuote, [
+        {"trade_date": d, "symbol": "NIFTY", "instrument_type": "IDF",
+         "expiry": d + timedelta(days=7), "close": 1.0, "settlement_price": 1.0}
+        for d in (fresh, stale)])
     s.commit()
-    before = s.query(DerivativeQuote).count()
     out = NA.prune(s)
-    after = s.query(DerivativeQuote).count()
     assert out["derivative_quotes"]["deleted"] >= 1
-    assert after == before - out["derivative_quotes"]["deleted"]
     assert s.query(DerivativeQuote).filter(
-        DerivativeQuote.trade_date == date(2025, 7, 24)).count() > 0, \
+        DerivativeQuote.trade_date == stale).count() == 0
+    assert s.query(DerivativeQuote).filter(
+        DerivativeQuote.trade_date == fresh).count() == 1, \
         "in-window rows must be untouched"
