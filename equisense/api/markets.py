@@ -461,3 +461,76 @@ def _live_derivative_snapshot(symbol: str, risk_free: float) -> dict:
 
     _LIVE_CACHE[key] = (_t.time(), out)
     return out
+
+
+# ------------------------------------------------------------------- rates
+
+_RATE_CACHE: dict = {"ts": 0.0, "value": None}
+RATE_TTL_SECONDS = 3600
+
+
+def market_rates(session: Session) -> dict:
+    """Risk-free rate and ERP sanity check, DERIVED from free official data.
+
+    Replaces a hardcoded 7.0% risk_free_rate that fed cost of equity -> WACC ->
+    every reverse-DCF implied-growth figure the platform publishes. Two free
+    exchange files are enough: the futures curve gives implied (r − q) and the
+    index close file gives q.
+    """
+    import time as _t
+
+    from ..engine import rates as R
+
+    if _RATE_CACHE["value"] and (_t.time() - _RATE_CACHE["ts"]) < RATE_TTL_SECONDS:
+        return _RATE_CACHE["value"]
+
+    snap = derivative_snapshot(session, "NIFTY")
+    mv = market_valuation(session, "Nifty 50")
+    contracts = []
+    spot = None
+    if snap.get("available"):
+        ts = snap.get("term_structure", {})
+        spot = ts.get("spot")
+        for c in ts.get("contracts", []):
+            try:
+                contracts.append((date.fromisoformat(c["expiry"]), c["futures"]))
+            except Exception:                      # noqa: BLE001
+                continue
+    q = mv.get("div_yield") if mv.get("available") else None
+    pe = mv.get("pe") if mv.get("available") else None
+
+    if not contracts or not spot:
+        out = {"available": False,
+               "reason": "no futures curve available to imply a rate",
+               "fallback_risk_free_pct": R.FALLBACK_RISK_FREE * 100}
+        _RATE_CACHE.update(ts=_t.time(), value=out)
+        return out
+
+    rf = R.implied_risk_free_rate(spot, contracts, q,
+                                  as_of=date.fromisoformat(snap["trade_date"]))
+    erp = R.equity_risk_premium_from_earnings_yield(pe, rf.value)
+    out = {
+        "available": True,
+        "as_of": snap["trade_date"],
+        "risk_free": rf.to_dict(),
+        "erp_check": erp.to_dict(),
+        "effective_risk_free_pct": rf.value if rf.value is not None
+        else R.FALLBACK_RISK_FREE * 100,
+        "source": ("derived from the NSE futures curve and the exchange's own "
+                   "index dividend yield — no hardcoded rate, no paid feed"),
+    }
+    _RATE_CACHE.update(ts=_t.time(), value=out)
+    return out
+
+
+def effective_risk_free(session: Session) -> tuple[float, str]:
+    """(rate as a decimal, provenance). Never raises — valuation must still run
+    when the rate cannot be derived, but it must SAY which rate it used."""
+    from ..engine import rates as R
+    try:
+        r = market_rates(session)
+        if r.get("available") and r.get("risk_free", {}).get("value") is not None:
+            return r["risk_free"]["value"] / 100.0, "market-implied (futures basis + index dividend yield)"
+    except Exception:                              # noqa: BLE001 - never block valuation
+        pass
+    return R.FALLBACK_RISK_FREE, f"stated fallback {R.FALLBACK_RISK_FREE:.2%} (could not derive)"

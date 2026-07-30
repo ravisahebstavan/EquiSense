@@ -742,6 +742,15 @@ def markets_simulate(horizon_days: int = 21, paths: int = 20000,
                                 n_paths=max(1000, min(paths, 60000)))
 
 
+@app.get("/api/markets/rates")
+def markets_rates(s: Session = Depends(db)):
+    """Risk-free rate implied by the futures basis plus the exchange's own index
+    dividend yield, and an earnings-yield ERP sanity check. Replaces a hardcoded
+    7.0% that fed every discounted valuation."""
+    from .markets import market_rates
+    return market_rates(s)
+
+
 @app.get("/api/markets/sources")
 def markets_sources():
     """Data-source reachability. Exists because every archive fetch fails closed

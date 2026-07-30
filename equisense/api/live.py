@@ -214,7 +214,12 @@ def build_evidence(session: Session, company: Company, regime_key: str,
         # company injected a large, one-directional error into the headline
         # valuation output.
         beta_m = valuation.estimate_beta(closes, _macro(session, "^NSEI", 600), period=period)
-        wacc_a = valuation.WaccAssumptions()
+        # Risk-free is DERIVED from the futures basis + the index dividend yield
+        # rather than hardcoded at 7%. It feeds Ke -> WACC -> the implied-growth
+        # solve, so a stale constant biases every valuation in one direction.
+        from .markets import effective_risk_free
+        rf, rf_source = effective_risk_free(session)
+        wacc_a = valuation.WaccAssumptions(risk_free_rate=rf)
         if beta_m.value is not None:
             wacc_a.beta = beta_m.value
         rd = valuation.reverse_dcf(
@@ -233,7 +238,8 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                         f"vs delivered {hist.value:.1f}%)",
                         metrics,
                         caveats=[c for c in (rd["implied_growth"].caveat,
-                                             hist.caveat, beta_m.caveat) if c]))
+                                             hist.caveat, beta_m.caveat,
+                                             f"Risk-free rate {rf:.2%}: {rf_source}.") if c]))
 
     # ---- quality cluster: banking model for financials ----
     # Previously financials emitted NO fundamental evidence at all, so 11 of the
