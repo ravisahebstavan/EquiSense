@@ -64,6 +64,29 @@ def admission_cap(family: str) -> tuple[float, str]:
 
 
 REGISTRY: dict[str, dict] = {
+    "HYP-015": {
+        "name": "variance_risk_premium",
+        "family": "derivatives.vrp",
+        "motivation": "Index option implied volatility systematically exceeds "
+                      "subsequently realised volatility (Carr & Wu 2009; "
+                      "Bollerslev, Tauchen & Zhou 2009) because sellers demand "
+                      "compensation for bearing crash risk. It is the most "
+                      "promising effect available to THIS platform for two "
+                      "reasons: it does not require predicting direction, which "
+                      "is where every price signal here has failed its IC test; "
+                      "and it is harvestable by a retail participant, unlike "
+                      "cross-sectional alpha. NSE's F&O bhavcopy makes the "
+                      "implied side measurable for free.",
+        "spec": "Daily: capture ATM implied volatility for NIFTY/BANKNIFTY from "
+                "the settlement-price chain. For each observation compute "
+                "realised volatility over the FOLLOWING 21 sessions, "
+                "non-overlapping with the observation date. Test mean(IV − RV) "
+                "with a Newey-West t for the overlapping realised windows. "
+                "NOT YET TESTABLE: the IV series cannot be backfilled (one "
+                "exchange file per day), so this needs ~2 months of capture "
+                "before it has the ~40 paired observations it requires.",
+        "status": "registered-deferred",
+    },
     "HYP-012": {
         "name": "delivery_percentile_accumulation",
         "family": "novel.delivery",

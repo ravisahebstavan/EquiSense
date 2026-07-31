@@ -680,3 +680,130 @@ def margin_estimate(legs: Sequence[Leg], underlying: float, T: float,
                    "regularly-updated risk arrays, plus broker add-ons. Use this "
                    "for sizing sanity, never as the margin a broker will block."),
     }
+
+
+# ------------------------------------------------------ variance risk premium
+
+VRP_MIN_OBS = 40
+MIN_VRP_HORIZON = 5    # fewer returns than this makes realised vol meaningless
+
+
+def variance_risk_premium(iv_history: Sequence[tuple], close_history: Sequence[tuple],
+                          horizon_days: int = 21) -> dict:
+    """Implied volatility versus the volatility that SUBSEQUENTLY realised.
+
+    The variance risk premium is among the most robustly documented effects in
+    finance (Carr & Wu 2009; Bollerslev, Tauchen & Zhou 2009): index option
+    implied volatility systematically exceeds subsequent realised volatility,
+    because option sellers demand compensation for bearing crash risk. Unlike
+    stock-selection alpha, it is something a retail participant can actually
+    harvest — and unlike most of what this platform measures, it does not require
+    predicting direction.
+
+    That is also exactly why it must be measured before it is believed. The
+    premium is compensation for a REAL risk: the seller is short a fat left tail,
+    and the payoff profile is many small gains punctuated by rare large losses.
+    A positive average VRP and a catastrophic worst case are the same fact.
+
+    `iv_history`   [(date, atm_iv_pct), ...]
+    `close_history`[(date, close), ...] on the same underlying
+
+    For each IV observation, realised volatility is computed over the FOLLOWING
+    `horizon_days` — never overlapping the IV date itself, which would leak.
+    """
+    # A realised-vol estimate needs a floor of returns to be meaningful, but the
+    # floor must scale with the horizon rather than sit at a constant: a fixed
+    # minimum of 10 sessions made every horizon under 10 days silently produce
+    # ZERO observations and then report "need more paired observations", which
+    # named the wrong cause entirely.
+    if horizon_days < MIN_VRP_HORIZON:
+        return {"computable": False, "horizon_days": horizon_days,
+                "observations": 0,
+                "reason": (f"horizon of {horizon_days} sessions is below the "
+                           f"{MIN_VRP_HORIZON}-session floor — realised "
+                           "volatility from fewer returns is too noisy to "
+                           "compare against implied")}
+    closes = {d: c for d, c in close_history if c and c > 0}
+    dates = sorted(closes)
+    idx = {d: i for i, d in enumerate(dates)}
+    rows = []
+    for d, iv in sorted(iv_history):
+        if iv is None or d not in idx:
+            continue
+        i = idx[d]
+        window = dates[i:i + horizon_days + 1]
+        if len(window) < max(MIN_VRP_HORIZON, horizon_days // 2):
+            continue
+        rets = [math.log(closes[window[k]] / closes[window[k - 1]])
+                for k in range(1, len(window))
+                if closes[window[k - 1]] > 0]
+        if len(rets) < 5:
+            continue
+        m = sum(rets) / len(rets)
+        var = sum((r - m) ** 2 for r in rets) / (len(rets) - 1)
+        rv = math.sqrt(max(var, 0.0)) * math.sqrt(TRADING_DAYS) * 100
+        rows.append({"date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+                     "implied_pct": round(float(iv), 2),
+                     "realised_pct": round(rv, 2),
+                     "premium_pp": round(float(iv) - rv, 2)})
+
+    if len(rows) < VRP_MIN_OBS:
+        return {"computable": False,
+                "observations": len(rows),
+                "reason": (f"need ≥{VRP_MIN_OBS} paired observations, have "
+                           f"{len(rows)} — the IV series cannot be backfilled, so "
+                           "this becomes testable only after ~2 months of daily "
+                           "capture"),
+                "horizon_days": horizon_days}
+
+    prem = [r["premium_pp"] for r in rows]
+    n = len(prem)
+    mean = sum(prem) / n
+    sd = math.sqrt(sum((x - mean) ** 2 for x in prem) / (n - 1))
+    # overlapping realised-vol windows: consecutive observations share returns
+    from ..research.stats import newey_west_se, t_two_sided_p
+    se = newey_west_se(prem, lags=max(1, horizon_days - 1))
+    t = mean / se if se and se > 0 else None
+    worst = min(rows, key=lambda r: r["premium_pp"])
+    return {
+        "computable": True,
+        "observations": n, "horizon_days": horizon_days,
+        "mean_premium_pp": round(mean, 3),
+        "median_premium_pp": round(sorted(prem)[n // 2], 3),
+        "sd_pp": round(sd, 3),
+        "share_positive_pct": round(sum(1 for x in prem if x > 0) / n * 100, 1),
+        "worst_observation": worst,
+        "standard_error": None if se is None else round(se, 4),
+        "t_stat": None if t is None else round(t, 3),
+        "p_value": None if t is None else round(t_two_sided_p(t, n - 1), 5),
+        "recent": rows[-20:],
+        "verdict": _vrp_verdict(mean, t, n),
+        "risk_warning": (
+            "A positive mean premium is COMPENSATION FOR RISK, not free money. "
+            f"The worst single observation here was {worst['premium_pp']:+.1f}pp "
+            f"(implied {worst['implied_pct']:.1f}% vs realised "
+            f"{worst['realised_pct']:.1f}%). Harvesting this premium means "
+            "selling volatility, which is short a fat left tail: many small gains "
+            "and rare large losses. SEBI's own study found ~93% of individual F&O "
+            "participants lost money over FY22-24, and undersized tail risk is "
+            "the usual mechanism."),
+        "method": ("implied vol at t versus realised vol over (t, t+h], "
+                   "non-overlapping with the IV observation; Newey-West t for "
+                   "the overlapping realised windows"),
+        "citation": "Carr & Wu (2009), RFS; Bollerslev, Tauchen & Zhou (2009), RFS",
+    }
+
+
+def _vrp_verdict(mean: float, t: Optional[float], n: int) -> str:
+    if t is None:
+        return "not testable"
+    if abs(t) < 2.0:
+        return (f"no measurable premium: mean {mean:+.2f}pp over {n} observations, "
+                f"t={t:+.2f}")
+    if mean > 0:
+        return (f"implied exceeds subsequent realised by {mean:+.2f}pp on average "
+                f"(t={t:+.2f}, n={n}) — consistent with the documented variance "
+                "risk premium, and the tail risk that justifies it is unchanged")
+    return (f"implied UNDERSTATES subsequent realised by {mean:+.2f}pp (t={t:+.2f}) "
+            "— the opposite of the documented effect; check the IV series before "
+            "acting on it")

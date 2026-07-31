@@ -691,3 +691,123 @@ def institutional_flow(session: Session, ticker: Optional[str] = None) -> dict:
                  "directional claim, which is the single easiest way to misread "
                  "this file."),
     }
+
+
+# ------------------------------------------------ volatility surface capture
+
+def capture_vol_surface(session: Session,
+                        symbols: Optional[list[str]] = None) -> dict:
+    """Persist today's option-surface SUMMARY for each underlying.
+
+    Six numbers per expiry, not the 35,000-row chain. The chain itself stays
+    unstored because nothing studies historical open interest — but an
+    implied-volatility TIME SERIES is a different asset entirely: it is the only
+    route to measuring the variance risk premium, and NSE publishes one file per
+    day, so it cannot be backfilled. Capture has to begin before the study can
+    ever exist.
+
+    Idempotent per (date, symbol, expiry).
+    """
+    from ..models import VolSurfaceObservation
+
+    syms = symbols or ["NIFTY", "BANKNIFTY"]
+    written, skipped = 0, []
+    for sym in syms:
+        snap = derivative_snapshot(session, sym)
+        if not snap.get("available"):
+            skipped.append({"symbol": sym, "reason": snap.get("reason", "unavailable")})
+            continue
+        oc = snap.get("option_chain") or {}
+        if not oc.get("computable"):
+            skipped.append({"symbol": sym, "reason": oc.get("reason", "no chain")})
+            continue
+        try:
+            obs_date = date.fromisoformat(snap["trade_date"])
+            expiry = date.fromisoformat(oc["expiry"])
+        except Exception:                          # noqa: BLE001
+            skipped.append({"symbol": sym, "reason": "unparseable dates"})
+            continue
+        existing = session.scalars(
+            select(VolSurfaceObservation).where(
+                VolSurfaceObservation.obs_date == obs_date,
+                VolSurfaceObservation.symbol == sym.upper(),
+                VolSurfaceObservation.expiry == expiry)).first()
+        row = existing or VolSurfaceObservation(
+            obs_date=obs_date, symbol=sym.upper(), expiry=expiry)
+        row.days_to_expiry = oc.get("days_to_expiry") or 0
+        row.underlying = oc.get("underlying")
+        row.atm_iv_pct = oc.get("atm_iv_pct")
+        row.skew_25d_pct = oc.get("skew_25d_risk_reversal_pct")
+        row.put_call_ratio_oi = oc.get("put_call_ratio_oi")
+        row.total_oi = (oc.get("total_call_oi") or 0) + (oc.get("total_put_oi") or 0)
+        row.iv_points_solved = oc.get("iv_points_solved")
+        if existing is None:
+            session.add(row)
+        written += 1
+    session.commit()
+    return {"captured": written, "skipped": skipped,
+            "note": ("Six floats per underlying per expiry. The chain itself is "
+                     "never stored; this series exists solely to make the "
+                     "variance risk premium measurable, which requires history "
+                     "that cannot be backfilled.")}
+
+
+def variance_premium(session: Session, symbol: str = "NIFTY",
+                     horizon_days: int = 21) -> dict:
+    """Variance risk premium from the accumulated IV series versus realised vol.
+
+    Returns an explicit not-yet-testable payload rather than a number when the
+    series is too short. That state is the NORMAL one for a while: the IV series
+    starts the day capture begins and cannot be backfilled, so this needs about
+    two months of daily capture before it says anything.
+    """
+    from ..engine.derivatives import variance_risk_premium
+    from ..models import VolSurfaceObservation
+
+    sym = symbol.upper()
+    iv_rows = session.execute(
+        select(VolSurfaceObservation.obs_date, VolSurfaceObservation.atm_iv_pct)
+        .where(VolSurfaceObservation.symbol == sym,
+               VolSurfaceObservation.atm_iv_pct.isnot(None))
+        .order_by(VolSurfaceObservation.obs_date)).all()
+    # one IV per date: the nearest live expiry, which is what capture stores
+    iv_by_date: dict = {}
+    for d, iv in iv_rows:
+        iv_by_date.setdefault(d, float(iv))
+    iv_series = sorted(iv_by_date.items())
+
+    closes: list[tuple] = []
+    cid = session.scalar(select(Company.id).where(Company.ticker == sym))
+    if cid is not None:
+        closes = [(d, float(c)) for d, c in session.execute(
+            select(PriceObservation.obs_date, PriceObservation.close_raw)
+            .where(PriceObservation.company_id == cid,
+                   PriceObservation.close_raw.isnot(None))
+            .order_by(PriceObservation.obs_date)).all()]
+    if not closes:
+        # Prefer the MACRO series for indices: ^NSEI carries ~10 years while the
+        # NSE index-close table only starts when archive capture began. Realised
+        # volatility needs depth, so falling back to the 9-day table first would
+        # have made the premium untestable for years rather than months.
+        from ..models import IndexObservation, MacroObservation
+        macro_sym = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK"}.get(sym)
+        if macro_sym:
+            closes = [(d, float(c)) for d, c in session.execute(
+                select(MacroObservation.obs_date, MacroObservation.close)
+                .where(MacroObservation.symbol == macro_sym)
+                .order_by(MacroObservation.obs_date)).all()]
+        if not closes:
+            name = {"NIFTY": "Nifty 50", "BANKNIFTY": "Nifty Bank"}.get(sym)
+            if name:
+                closes = [(d, float(c)) for d, c in session.execute(
+                    select(IndexObservation.obs_date, IndexObservation.close)
+                    .where(IndexObservation.index_name == name)
+                    .order_by(IndexObservation.obs_date)).all()]
+
+    out = variance_risk_premium(iv_series, closes, horizon_days)
+    out["symbol"] = sym
+    out["iv_observations_stored"] = len(iv_series)
+    out["close_observations"] = len(closes)
+    if not out.get("computable"):
+        out["hypothesis"] = "HYP-015 (registered-deferred until the series matures)"
+    return out

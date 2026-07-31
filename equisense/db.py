@@ -116,5 +116,7 @@ def ensure_schema() -> None:
         # hot-path composite indexes (IF NOT EXISTS works on SQLite + Postgres)
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_prices_cid_date "
                           "ON price_observations (company_id, obs_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vol_sym_date "
+                          "ON vol_surface_observations (symbol, obs_date)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_macro_sym_date "
                           "ON macro_observations (symbol, obs_date)"))

@@ -697,12 +697,31 @@ def cron_refresh(s: Session = Depends(db)):
     prices = ingest_prices(s, ids, years=1)
     macro = ingest_macro(s, years=1)
     studies = run_all_studies(s)["records"]
+    # Daily NSE archive capture. Delivery %, index valuation and the option
+    # SURFACE SUMMARY all publish one file per day and cannot be backfilled, so
+    # the series only exists if capture runs every day — missing a day is a
+    # permanent hole, not a delay.
+    from ..ingestion.nse_archive import backfill as nse_backfill, prune
+    from .markets import capture_vol_surface
+    try:
+        nse = nse_backfill(s, days=4, symbols=list(ids))
+    except Exception as exc:                       # noqa: BLE001 - never block the cron
+        nse = {"error": str(exc)[:120]}
+    try:
+        vol = capture_vol_surface(s)
+    except Exception as exc:                       # noqa: BLE001
+        vol = {"error": str(exc)[:120]}
+    try:
+        pruned = prune(s)
+    except Exception as exc:                       # noqa: BLE001
+        pruned = {"error": str(exc)[:120]}
     scored = L.score_due_claims(s)["scored"]
     checkpointed = L.score_interim_checkpoints(s)["checkpointed"]
     snap = build_universe_snapshot(s)
     from .autopilot import get_config, run_autopilot
     auto = run_autopilot(s) if get_config(s)["enabled"] else None
     return {"price_rows": prices, "macro_rows": macro,
+            "nse_archives": nse, "vol_surface": vol, "pruned": pruned,
             "base_rate_records": studies, "claims_scored": scored,
             "checkpoints_scored": checkpointed,
             "snapshot_companies": len(snap["companies"]),
@@ -816,6 +835,23 @@ def storage_view(universe_size: int = 50, s: Session = Depends(db)):
     from ..ingestion.retention import projected_headroom, storage_report
     return {"report": storage_report(s),
             "projection": projected_headroom(s, max(10, min(universe_size, 2000)))}
+
+
+@app.get("/api/markets/vrp")
+def markets_vrp(symbol: str = "NIFTY", horizon_days: int = 21,
+                s: Session = Depends(db)):
+    """Variance risk premium: implied volatility versus the volatility that
+    subsequently realised. Not testable until the IV series has accumulated —
+    it publishes one file per day and cannot be backfilled."""
+    from .markets import variance_premium
+    return variance_premium(s, symbol, horizon_days)
+
+
+@app.post("/api/markets/capture-surface")
+def markets_capture_surface(s: Session = Depends(db)):
+    """Persist today's option-surface summary (six floats per expiry)."""
+    from .markets import capture_vol_surface
+    return capture_vol_surface(s)
 
 
 @app.get("/api/markets/sources")

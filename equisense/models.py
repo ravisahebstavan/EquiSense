@@ -130,6 +130,33 @@ class MacroObservation(Base):
     close: Mapped[float] = mapped_column(Float)
 
 
+class VolSurfaceObservation(Base):
+    """Daily summary of one underlying's option surface — six numbers, not the
+    35,000-row chain.
+
+    The full chain is fetched live and discarded because nothing studies
+    historical open interest. But the SUMMARY is different: an implied-volatility
+    time series is the only way to measure the variance risk premium (implied vol
+    versus subsequently realised vol), which is among the most robustly
+    documented effects in finance and, unlike stock-selection alpha, is
+    harvestable by a retail trader. At ~6 floats per underlying per day the cost
+    is negligible and it cannot be backfilled — NSE publishes one file per day —
+    so capture has to start before the study can ever run.
+    """
+    __tablename__ = "vol_surface_observations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    obs_date: Mapped[date] = mapped_column(Date, index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    expiry: Mapped[date] = mapped_column(Date)
+    days_to_expiry: Mapped[int] = mapped_column(Integer)
+    underlying: Mapped[float | None] = mapped_column(Float)
+    atm_iv_pct: Mapped[float | None] = mapped_column(Float)
+    skew_25d_pct: Mapped[float | None] = mapped_column(Float)   # put IV − call IV
+    put_call_ratio_oi: Mapped[float | None] = mapped_column(Float)
+    total_oi: Mapped[float | None] = mapped_column(Float)
+    iv_points_solved: Mapped[int | None] = mapped_column(Integer)
+
+
 class BaseRateRecord(Base):
     """Cached T2 base-rate study result (RESEARCH_BLUEPRINT §7.1, §10.1).
     Computed from the platform's own stored price history — never asserted."""
