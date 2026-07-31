@@ -69,13 +69,23 @@ def recommend_size(i: SizingInputs) -> dict:
     cap_position = i.book_value * i.max_position_pct / 100
     heat_room = max(0.0, (MAX_PORTFOLIO_HEAT * 100 - i.open_heat_pct)) / 100 * i.book_value \
         / (stop_dist_pct / 100) if stop_dist_pct > 0 else 0.0
-    cap_liquidity = (i.adv_cr or 0) * 1e7 * ADV_PARTICIPATION * EXIT_DAYS if i.adv_cr else raw_value
+    # Unknown ADV must not RELAX the cap. It used to fall back to `raw_value`,
+    # i.e. no liquidity constraint at all, precisely when the ability to exit is
+    # unverifiable — the opposite of how impact_cost_pct treats the same missing
+    # input ("punitive default rather than optimistic silence"). Absent ADV, the
+    # size is halved and the constraint is named, so the ignorance is priced and
+    # visible instead of silently free.
+    if i.adv_cr:
+        cap_liquidity = i.adv_cr * 1e7 * ADV_PARTICIPATION * EXIT_DAYS
+    else:
+        cap_liquidity = raw_value * 0.5
 
     value = max(0.0, min(raw_value, cap_position, heat_room, cap_liquidity))
     shares = int(value / i.price) if i.price > 0 else 0
     binding = min(
         [("risk_budget", raw_value), ("position_cap", cap_position),
-         ("heat_room", heat_room), ("liquidity_cap", cap_liquidity)],
+         ("heat_room", heat_room),
+         ("liquidity_cap" if i.adv_cr else "liquidity_unverified", cap_liquidity)],
         key=lambda kv: kv[1])[0]
 
     return {
@@ -94,6 +104,7 @@ def recommend_size(i: SizingInputs) -> dict:
             "position_cap": round(cap_position, 2),
             "heat_room_value": round(heat_room, 2),
             "liquidity_cap_value": round(cap_liquidity, 2),
+            "adv_known": i.adv_cr is not None,
             "stop_rule": f"{STOP_ATR_MULT} × daily vol {i.daily_vol_pct:.2f}%",
         },
         "caveat": "Advisory only. The 0.5 provisional haircut applies until the "

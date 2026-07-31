@@ -174,3 +174,35 @@ def test_xirr_reports_price_only_when_there_are_no_dividends():
     txns = [Transaction(1, "buy", 100, 100.0, _d(2024, 1, 1))]
     m = portfolio_xirr(txns, {1: 11_000.0}, _d(2026, 1, 1))
     assert "price-only" in m.caveat
+
+
+# ------------------------------------- missing inputs must not relax the size
+
+def test_unknown_adv_halves_the_size_instead_of_removing_the_cap():
+    """The liquidity cap used to fall back to `raw_value` — no constraint at
+    all — precisely when the ability to exit is unverifiable. impact_cost_pct
+    treats the same missing input punitively ("punitive default rather than
+    optimistic silence"); sizing now agrees with it."""
+    from equisense.engine.sizing import SizingInputs, recommend_size
+    mk = lambda adv: recommend_size(SizingInputs(
+        book_value=1_000_000.0, price=100.0, daily_vol_pct=30.7 / 252 ** 0.5,
+        conviction_band="moderate", net_score=0.5, adv_cr=adv,
+        max_position_pct=10.0))
+    unknown, known = mk(None), mk(5.0)
+    assert unknown["recommended_value"] < known["recommended_value"]
+    assert unknown["binding_constraint"] == "liquidity_unverified"
+    assert unknown["working"]["adv_known"] is False
+    assert known["working"]["adv_known"] is True
+    # the ignorance is priced, not free
+    assert unknown["recommended_value"] == pytest.approx(
+        known["recommended_value"] / 2, rel=0.02)
+
+
+def test_ample_adv_does_not_bind():
+    """The haircut must apply to unknown ADV only — a liquid name is unaffected."""
+    from equisense.engine.sizing import SizingInputs, recommend_size
+    r = recommend_size(SizingInputs(
+        book_value=1_000_000.0, price=100.0, daily_vol_pct=30.7 / 252 ** 0.5,
+        conviction_band="moderate", net_score=0.5, adv_cr=50.0,
+        max_position_pct=10.0))
+    assert r["binding_constraint"] == "risk_budget"

@@ -154,7 +154,16 @@ def qualified_candidates(session: Session, top_n: int = 8,
             continue
 
         gates = []
-        daily_vol = (item["signals"].get("vol") or 25.0) / (252 ** 0.5)
+        # No invented volatility. The fallback here used to be a hardcoded 25%
+        # annualized, which is BELOW 79% of this universe (median 30.7%), so an
+        # unknown vol produced a tighter stop and therefore a ~1.23x LARGER
+        # position than a typical name would have been given — missing data
+        # resolving in the optimistic direction, on the one input that sets the
+        # stop. live.py already skips sizing when vol is unknown; this now matches.
+        vol_ann = item["signals"].get("vol")
+        if not vol_ann:
+            continue
+        daily_vol = vol_ann / (252 ** 0.5)
         sizing = recommend_size(SizingInputs(
             book_value=book_value or 1_000_000.0, price=item["price"],
             daily_vol_pct=daily_vol, conviction_band=synth.conviction_band,
