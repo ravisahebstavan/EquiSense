@@ -768,6 +768,18 @@ def markets_flow(ticker: str | None = None, s: Session = Depends(db)):
     return institutional_flow(s, ticker)
 
 
+@app.get("/api/storage")
+def storage_view(universe_size: int = 50, s: Session = Depends(db)):
+    """Storage headroom, classified by REPLACEABILITY rather than size.
+
+    The operationally important fact: the largest table is also the most
+    disposable (one Yahoo request restores a decade), while the data that
+    genuinely cannot be rebuilt is a rounding error on the total."""
+    from ..ingestion.retention import projected_headroom, storage_report
+    return {"report": storage_report(s),
+            "projection": projected_headroom(s, max(10, min(universe_size, 2000)))}
+
+
 @app.get("/api/markets/sources")
 def markets_sources():
     """Data-source reachability. Exists because every archive fetch fails closed

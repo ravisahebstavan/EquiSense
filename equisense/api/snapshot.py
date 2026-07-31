@@ -56,16 +56,20 @@ def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
     rows = session.execute(
         select(PriceObservation.company_id, PriceObservation.obs_date,
                PriceObservation.close, PriceObservation.volume,
-               PriceObservation.close_raw)
+               PriceObservation.close_raw, PriceObservation.open_price,
+               PriceObservation.high_price, PriceObservation.low_price)
         .order_by(PriceObservation.company_id, PriceObservation.obs_date)).all()
-    out: dict[int, tuple[list, list, list, list]] = {}
-    for cid, d, c, v, raw in rows:
+    out: dict[int, tuple] = {}
+    for cid, d, c, v, raw, op, hi, lo in rows:
         if cid not in out:
-            out[cid] = ([], [], [], [])
+            out[cid] = ([], [], [], [], [], [], [])
         out[cid][0].append(d)
         out[cid][1].append(c)
         out[cid][2].append(v)
         out[cid][3].append(raw)
+        out[cid][4].append(op)
+        out[cid][5].append(hi)
+        out[cid][6].append(lo)
     return out
 
 
@@ -137,7 +141,16 @@ def build_universe_snapshot(session: Session) -> dict:
     items = []
     ret63_by_ticker: dict[str, Optional[float]] = {}
     for c in companies:
-        dates, closes, volumes, nominal = prices.get(c.id, ([], [], [], []))
+        dates, closes, volumes, nominal, opens, highs, lows = prices.get(
+            c.id, ([], [], [], [], [], [], []))
+        # OHLC is on the NOMINAL scale, so pair it with close_raw. Yang-Zhang on
+        # a total-return close mixed with nominal H/L would compare incompatible
+        # series bar by bar.
+        ohlc_ok = (nominal and opens and highs and lows
+                   and all(x is not None for x in nominal[-260:])
+                   and all(x is not None for x in opens[-260:])
+                   and all(x is not None for x in highs[-260:])
+                   and all(x is not None for x in lows[-260:]))
         if len(closes) < 60:
             continue
         stmts = statements.get(c.id, [])
@@ -150,7 +163,20 @@ def build_universe_snapshot(session: Session) -> dict:
             "trend": _r(technical.trend_200dma(closes).value),
             "rel_strength": _r(technical.relative_strength(closes, nifty).value),
             "mqi": _r(novel.momentum_quality(closes).value),
-            "vol": _r(technical.realized_vol(closes).value),
+            # Yang-Zhang when OHLC is available: gap-inclusive and ~5.5x more
+            # efficient than close-to-close, and this value sets the stop
+            # distance and therefore the position size.
+            "vol": _r((technical.best_available_vol(
+                nominal if ohlc_ok else closes,
+                opens if ohlc_ok else None,
+                highs if ohlc_ok else None,
+                lows if ohlc_ok else None, window=21)).value),
+            "vol_estimator": (technical.best_available_vol(
+                nominal if ohlc_ok else closes,
+                opens if ohlc_ok else None,
+                highs if ohlc_ok else None,
+                lows if ohlc_ok else None,
+                window=21).inputs.get("estimator")),
             "heat": _r(novel.crowding_proxy(
                 closes, volumes,
                 delivery_pct=(delivery.get(c.ticker) or {}).get("latest"),
@@ -163,7 +189,7 @@ def build_universe_snapshot(session: Session) -> dict:
             "revenue_cagr_pct": None, "roic_pct": None, "pe": None,
             "dividend_yield_pct": None, "debt_to_equity": None,
             "implied_growth_gap_pct": None, "f_signals_available": None,
-            "z_score_em": None, "delivery_pct": None,
+            "z_score_em": None, "delivery_pct": None, "vol_estimator": None,
         }
         if stmts and not c.is_financial:
             curr = stmts[-1]

@@ -106,6 +106,13 @@ class PriceObservation(Base):
     # this split are total-return only and must not silently masquerade as
     # nominal (see PriceObservation usage notes in ingestion/yahoo.py).
     close_raw: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Intraday range, NOMINAL scale (same convention as close_raw). Range-based
+    # volatility estimators are ~6x more efficient than close-to-close for the
+    # same window, and volatility feeds the stop distance and therefore the
+    # position size — so estimator error here costs money directly.
+    open_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    low_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     volume: Mapped[float | None] = mapped_column(Float, nullable=True)  # shares traded
     # Cash dividend per share with this EX-date (0/None on ordinary days).
     # Required for money-weighted return: a dividend is a real cash inflow, and

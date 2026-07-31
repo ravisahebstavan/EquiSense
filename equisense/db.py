@@ -76,6 +76,9 @@ _SOFT_MIGRATIONS = [
     ("price_observations", "volume", "FLOAT"),
     ("price_observations", "close_raw", "FLOAT"),   # nominal (split-only) close
     ("price_observations", "dividend", "FLOAT"),    # cash dividend on the ex-date
+    ("price_observations", "open_price", "FLOAT"),
+    ("price_observations", "high_price", "FLOAT"),
+    ("price_observations", "low_price", "FLOAT"),
     ("base_rates", "n_eff", "INTEGER"),
     ("base_rates", "cohort_breadth_pct", "FLOAT"),
     ("base_rates", "net_median_excess_pct", "FLOAT"),

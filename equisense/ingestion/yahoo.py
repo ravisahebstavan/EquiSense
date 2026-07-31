@@ -15,7 +15,7 @@ import time
 from datetime import date, datetime, timezone
 
 import yfinance as yf
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from ..models import Company, FilingPeriod, MacroObservation, PriceObservation
@@ -146,6 +146,11 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
                 total_ret = frame["Adj Close"] if "Adj Close" in frame else frame["Close"]
                 volumes = frame["Volume"]
                 divs = frame["Dividends"] if "Dividends" in frame else None
+                # OHLC arrives in the SAME request already being made. Storing it
+                # costs nothing and unlocks range-based volatility estimators.
+                o_s = frame["Open"] if "Open" in frame else None
+                h_s = frame["High"] if "High" in frame else None
+                l_s = frame["Low"] if "Low" in frame else None
             except KeyError:
                 log.warning("no price data for %s", sym)
                 continue
@@ -169,15 +174,24 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
                     raw_dv = divs.get(d)
                     if raw_dv is not None and not math.isnan(raw_dv) and raw_dv > 0:
                         dv = float(raw_dv)
+                def _px(series):
+                    if series is None:
+                        return None
+                    x = series.get(d)
+                    return None if x is None or math.isnan(x) else float(x)
+
+                op, hi, lo_ = _px(o_s), _px(h_s), _px(l_s)
                 row = existing.get(day)
                 if row is not None:
                     row.close, row.close_raw, row.volume = adj, float(nom), v
                     row.dividend = dv
+                    row.open_price, row.high_price, row.low_price = op, hi, lo_
                     inserted += 1
                     continue
                 rows.append({"company_id": cid, "obs_date": day,
                              "close": adj, "close_raw": float(nom),
-                             "volume": v, "dividend": dv})
+                             "volume": v, "dividend": dv,
+                             "open_price": op, "high_price": hi, "low_price": lo_})
             if rows:
                 session.bulk_insert_mappings(PriceObservation, rows)
                 inserted += len(rows)
@@ -392,3 +406,65 @@ def run_full_ingest(session: Session, years: int = 10,
             "filing_rows": fundamentals, "seconds": round(time.time() - t0, 1),
             "index": index_key, "tickers": list(ids),
             "as_of": datetime.now(timezone.utc).isoformat()}
+
+
+def backfill_ohlc(session: Session, ids: dict[str, int], years: int = 10,
+                  chunk: int = 10) -> dict:
+    """Populate open/high/low on existing price rows, one company per commit.
+
+    Separate from `ingest_prices(refetch=True)` for an operational reason: that
+    path loads every stored row into the identity map and issues one ORM UPDATE
+    per row inside a single transaction. For 50 names x ~2,500 bars that is
+    ~130,000 buffered updates, which a free-tier Postgres connection does not
+    survive (observed: server terminated abnormally, whole transaction rolled
+    back).
+
+    This instead issues one bulk UPDATE per company keyed on (company_id,
+    obs_date) and commits between companies, so a failure costs one name rather
+    than the entire backfill, and memory stays flat.
+    """
+    tickers = list(ids)
+    updated = skipped = 0
+    failures: list[str] = []
+    for i in range(0, len(tickers), chunk):
+        batch = tickers[i:i + chunk]
+        symbols = [yahoo_symbol(t) for t in batch]
+        try:
+            data = yf.download(symbols, period=f"{years}y", interval="1d",
+                               auto_adjust=False, actions=False, progress=False,
+                               group_by="ticker", threads=True)
+        except Exception as exc:                   # noqa: BLE001
+            log.warning("OHLC batch download failed for %s: %s", batch, exc)
+            failures.extend(batch)
+            continue
+        for t, sym in zip(batch, symbols):
+            cid = ids[t]
+            try:
+                frame = data[sym] if len(symbols) > 1 else data
+                o_s, h_s, l_s = frame["Open"], frame["High"], frame["Low"]
+            except (KeyError, TypeError):
+                failures.append(t)
+                continue
+            payload = []
+            for d, op in o_s.items():
+                hi, lo = h_s.get(d), l_s.get(d)
+                if any(x is None or math.isnan(x) for x in (op, hi, lo)):
+                    continue
+                payload.append({"cid": cid, "d": d.date(), "o": float(op),
+                                "h": float(hi), "l": float(lo)})
+            if not payload:
+                skipped += 1
+                continue
+            try:
+                session.execute(text(
+                    "UPDATE price_observations SET open_price=:o, high_price=:h, "
+                    "low_price=:l WHERE company_id=:cid AND obs_date=:d"), payload)
+                session.commit()
+                updated += len(payload)
+            except Exception as exc:               # noqa: BLE001
+                session.rollback()
+                log.warning("OHLC backfill failed for %s: %s", t, exc)
+                failures.append(t)
+        time.sleep(0.2)
+    return {"rows_updated": updated, "companies_skipped": skipped,
+            "failures": failures}
