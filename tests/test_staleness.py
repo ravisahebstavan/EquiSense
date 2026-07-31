@@ -132,3 +132,58 @@ def test_frozen_name_does_not_drag_the_sector_average(db):
     assert fresh, "sector-relative momentum should be computed"
     assert all(abs(v) < 1e-6 for v in fresh), (
         f"a frozen name leaked into the sector average: {sorted(set(fresh))[:5]}")
+
+
+# ------------------------------------------------- refresh window sizing
+
+def test_refresh_window_grows_to_cover_the_furthest_behind_name(db):
+    """A fixed 5-bar window is only correct while nothing ever falls behind.
+    One network failure over a long weekend is enough to exceed it, and then the
+    refresh inserts the newest bars and leaves a PERMANENT hole mid-series —
+    after which the name reports as fresh, because its last observation is
+    current. A hole is worse than a lag: it corrupts every return, volatility
+    and base rate computed across it, and nothing routine ever heals it."""
+    import datetime as dt
+
+    import equisense.models as M
+    from equisense.ingestion.yahoo import _refresh_period
+
+    today = dt.datetime.now(dt.timezone.utc).date()
+
+    def seed(ticker, days_behind):
+        c = M.Company(ticker=ticker, name=ticker, sector="IT", is_index_member=True)
+        db.add(c); db.flush()
+        db.add(M.PriceObservation(company_id=c.id, close=100.0,
+                                  obs_date=today - dt.timedelta(days=days_behind)))
+        db.commit()
+        return {ticker: c.id}
+
+    assert _refresh_period(db, seed("CURRENT", 1)) == "5d"
+    ids = seed("WEEKBEHIND", 12)
+    assert _refresh_period(db, ids) == "1mo", "a 12-day gap needs more than 5 bars"
+    ids.update(seed("MONTHSBEHIND", 60))
+    assert _refresh_period(db, ids) == "3mo"
+    ids.update(seed("YEARBEHIND", 300))
+    assert _refresh_period(db, ids) == "1y", "the window follows the WORST name"
+
+
+def test_a_name_with_no_history_does_not_drag_the_whole_batch(db):
+    """That is a backfill job, not a refresh one; widening the window for it
+    would cost every other name in the batch and gain nothing."""
+    import datetime as dt
+
+    import equisense.models as M
+    from equisense.ingestion.yahoo import _refresh_period
+
+    today = dt.datetime.now(dt.timezone.utc).date()
+    c1 = M.Company(ticker="HASDATA", name="a", sector="IT", is_index_member=True)
+    c2 = M.Company(ticker="EMPTY", name="b", sector="IT", is_index_member=True)
+    db.add_all([c1, c2]); db.flush()
+    db.add(M.PriceObservation(company_id=c1.id, obs_date=today, close=100.0))
+    db.commit()
+    assert _refresh_period(db, {"HASDATA": c1.id, "EMPTY": c2.id}) == "5d"
+
+
+def test_refresh_period_on_an_empty_batch_is_harmless(db):
+    from equisense.ingestion.yahoo import _refresh_period
+    assert _refresh_period(db, {}) == "5d"

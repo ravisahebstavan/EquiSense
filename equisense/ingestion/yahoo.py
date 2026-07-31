@@ -199,13 +199,46 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
     return inserted
 
 
+def _refresh_period(session: Session, ids: dict[str, int]) -> str:
+    """Yahoo period long enough to cover the FURTHEST-BEHIND name in `ids`.
+
+    A fixed 5-bar window is only correct while nothing ever falls behind. The
+    moment a name misses more than five sessions — one network failure over a
+    long weekend is enough — a 5-bar refresh inserts the newest bars and leaves
+    a permanent hole in the middle of the series, and the name then reports as
+    FRESH because its last observation is current. A hole is worse than a lag:
+    it silently corrupts every return, volatility and base-rate computed across
+    it, and nothing routine ever heals it.
+    """
+    if not ids:
+        return "5d"
+    last = session.execute(
+        select(PriceObservation.company_id, func.max(PriceObservation.obs_date))
+        .where(PriceObservation.company_id.in_(list(ids.values())))
+        .group_by(PriceObservation.company_id)).all()
+    today = datetime.now(timezone.utc).date()
+    # a name with no rows at all is a backfill job, not a refresh one; sizing the
+    # window to it would drag the whole batch to 10y for no benefit
+    behind = max((today - d).days for _cid, d in last) if last else 0
+    for days, period in ((5, "5d"), (25, "1mo"), (80, "3mo"),
+                         (170, "6mo"), (350, "1y")):
+        if behind <= days:
+            return period
+    return "2y"
+
+
 def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
-    """Near-live price refresh: re-fetch the last 5 daily bars and UPSERT —
-    today's running bar updates intraday (Yahoo serves the live running
-    candle, typically ≤15 min delayed for NSE). This is what keeps paper
-    fills anchored to executable reality while the site is open."""
+    """Near-live price refresh: re-fetch recent daily bars and UPSERT — today's
+    running bar updates intraday (Yahoo serves the live running candle,
+    typically ≤15 min delayed for NSE). This is what keeps paper fills anchored
+    to executable reality while the site is open.
+
+    The window is sized to the furthest-behind name rather than fixed, so a name
+    that missed a week heals itself instead of acquiring a permanent gap.
+    """
     symbols = [yahoo_symbol(t) for t in ids]
-    data = yf.download(symbols, period="5d", interval="1d", auto_adjust=False,
+    period = _refresh_period(session, ids)
+    data = yf.download(symbols, period=period, interval="1d", auto_adjust=False,
                        progress=False, group_by="ticker", threads=True)
     updated = inserted = 0
     latest_prices: dict[str, float] = {}
@@ -244,6 +277,7 @@ def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
             latest_prices[t] = round(float(nominal.iloc[-1]), 2)
     session.commit()
     return {"updated": updated, "inserted": inserted, "prices": latest_prices,
+            "window": period,
             "as_of_utc": datetime.now(timezone.utc).isoformat()}
 
 
