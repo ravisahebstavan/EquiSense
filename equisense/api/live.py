@@ -91,6 +91,13 @@ def universe_signals(session: Session) -> dict[str, dict[str, Optional[float]]]:
         return _SIG_CACHE["signals"]
     out: dict[str, dict[str, Optional[float]]] = {k: {} for k in SIGNAL_KEYS}
     for item in universe["companies"]:
+        # A name whose price stopped updating is kept in the universe (the user
+        # may hold it and must see it) but excluded from the REFERENCE
+        # DISTRIBUTION: xsec_strength ranks against this set, so a frozen name
+        # shifts every other name's percentile — the same failure the departed
+        # index constituents caused, from a different direction.
+        if item.get("stale_sessions"):
+            continue
         t = item["ticker"]
         for k in SIGNAL_KEYS:
             out[k][t] = item["signals"].get(k)

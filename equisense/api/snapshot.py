@@ -22,7 +22,13 @@ from ..models import (AppSnapshot, Company, FilingPeriod, MacroObservation,
                       PriceObservation)
 
 UNIVERSE_KEY = "universe"
-SNAP_VERSION = 4  # bump when the item schema changes → forces a rebuild
+SNAP_VERSION = 5  # bump when the item schema changes → forces a rebuild
+
+# A name whose last price is more than this many TRADING SESSIONS behind the
+# universe is treated as not currently priced. Sessions, not calendar days:
+# weekends and the long Indian holiday calendar would otherwise make a healthy
+# name look stale, and a genuinely frozen one look fine across a holiday week.
+STALE_SESSIONS = 3
 
 
 def _bulk_delivery(session: Session) -> dict:
@@ -138,7 +144,14 @@ def build_universe_snapshot(session: Session) -> dict:
     statements = _bulk_statements(session)
     nifty = _nifty(session)
 
+    # The universe's own trading calendar, so staleness is measured against the
+    # sessions that actually happened rather than the wall clock.
+    all_dates = sorted({d for cid in prices for d in prices[cid][0]})
+    session_no = {d: i for i, d in enumerate(all_dates)}
+    last_session = len(all_dates) - 1
+
     items = []
+    stale: dict[str, int] = {}
     ret63_by_ticker: dict[str, Optional[float]] = {}
     for c in companies:
         dates, closes, volumes, nominal, opens, highs, lows = prices.get(
@@ -226,6 +239,15 @@ def build_universe_snapshot(session: Session) -> dict:
             sig["pe_pctile"] = _r(novel.pe_percentile_vs_history(
                 closes, dates, stmts, nominal_closes=nom).value)
 
+        # Staleness had been measured only as max(obs_date) across the WHOLE
+        # table, so a single current name made the entire dataset read fresh and
+        # a name frozen weeks ago was invisible. Measured per name: five Nifty-50
+        # constituents were sitting 17 sessions behind while the median name in
+        # the universe had moved 3.9% (p75 7.0%, max 18.7%).
+        lag = last_session - session_no.get(dates[-1], last_session)
+        if lag > STALE_SESSIONS:
+            stale[c.ticker] = lag
+
         window = closes[-252:]  # 1y of closes, downsampled to ≤40 points
         step = max(1, len(window) // 40)
         adv = technical.adv_crore(closes, volumes)
@@ -237,6 +259,7 @@ def build_universe_snapshot(session: Session) -> dict:
             else round((closes[-1] / closes[-2] - 1) * 100, 2),
             "adv_cr": None if adv is None else round(adv, 2),
             "spark": [round(v, 1) for v in window[::step]][-40:],
+            "stale_sessions": stale.get(c.ticker, 0),
             "signals": sig,
         })
 
@@ -246,7 +269,9 @@ def build_universe_snapshot(session: Session) -> dict:
     sector_rets: dict[str, list[float]] = defaultdict(list)
     for item in items:
         r = ret63_by_ticker.get(item["ticker"])
-        if r is not None:
+        # A frozen name's 63d return is frozen too, so letting it into the
+        # sector average would tilt every peer's sector-relative momentum.
+        if r is not None and not item["stale_sessions"]:
             sector_rets[item["sector"]].append(r)
     sector_avg = {s: sum(v) / len(v) for s, v in sector_rets.items() if v}
     for item in items:
@@ -258,7 +283,8 @@ def build_universe_snapshot(session: Session) -> dict:
     as_of = max((prices[cid][0][-1] for cid in prices), default=None)
     snap = {"as_of": str(as_of), "version": SNAP_VERSION,
             "built_at": datetime.utcnow().isoformat(),
-            "companies": items}
+            "companies": items,
+            "stale_names": dict(sorted(stale.items(), key=lambda kv: -kv[1]))}
     row = session.get(AppSnapshot, UNIVERSE_KEY)
     if row is None:
         row = AppSnapshot(key=UNIVERSE_KEY, as_of=snap["as_of"], payload="")

@@ -23,6 +23,23 @@ STALE_PRICE_DAYS = 4      # > this (covers weekends+holiday) → warning
 STALE_MACRO_DAYS = 6
 
 
+def per_company_staleness(session: Session, max_lag_days: int = STALE_PRICE_DAYS
+                          ) -> dict[str, int]:
+    """{ticker: calendar days behind the universe} for names that stopped
+    updating. Only index members count — a departed constituent is expected to
+    go quiet and flagging it would be noise."""
+    latest = session.scalar(select(func.max(PriceObservation.obs_date)))
+    if latest is None:
+        return {}
+    rows = session.execute(
+        select(Company.ticker, func.max(PriceObservation.obs_date))
+        .join(PriceObservation, PriceObservation.company_id == Company.id)
+        .where(Company.is_index_member == True)   # noqa: E712
+        .group_by(Company.ticker)).all()
+    out = {t: (latest - d).days for t, d in rows if (latest - d).days > max_lag_days}
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
 def data_status(session: Session) -> dict:
     today = date.today()
     warnings: list[str] = []
@@ -38,6 +55,19 @@ def data_status(session: Session) -> dict:
         warnings.append("no price data ingested")
     elif price_stale > STALE_PRICE_DAYS:
         warnings.append(f"prices are {price_stale} days old — refresh recommended")
+
+    # The global max above is a POOR freshness test on its own: one current name
+    # makes the whole dataset read fresh while individual names sit frozen for
+    # weeks. Measured per name, five Nifty-50 constituents were 17 sessions
+    # behind and nothing in the system said so.
+    stale_names = per_company_staleness(session)
+    if stale_names:
+        worst = ", ".join(f"{t} ({n}d)" for t, n in list(stale_names.items())[:5])
+        warnings.append(
+            f"{len(stale_names)} name(s) have stopped updating while the rest of "
+            f"the universe moved on: {worst}"
+            f"{' …' if len(stale_names) > 5 else ''}. They are excluded from the "
+            "cross-sectional reference distribution until they refresh.")
 
     macro_rows = session.execute(
         select(MacroObservation.symbol, func.max(MacroObservation.obs_date),
@@ -77,7 +107,12 @@ def data_status(session: Session) -> dict:
 
     # Quality score: decomposed, never a mystery number (Phase III rule)
     comp = {
-        "price_freshness": 0.0 if price_stale is None else max(0.0, 1 - max(0, price_stale - 3) / 7),
+        # Penalised by BREADTH of staleness as well as its age: a dataset where
+        # 5% of names are frozen is not "fresh" merely because one name traded
+        # today, which is exactly what the max-date-only score used to claim.
+        "price_freshness": (0.0 if price_stale is None else
+                            max(0.0, 1 - max(0, price_stale - 3) / 7)
+                            * (1 - min(1.0, len(stale_names) / max(1, n_companies)))),
         "volume_completeness": 0.0 if not n_prices else 1 - (null_vol / n_prices),
         "fundamental_coverage": 0.0 if not n_companies else
         filing_companies / max(1, n_companies - n_financial),
