@@ -32,6 +32,13 @@ class Position:
     invested: float            # ₹, cost basis of open quantity
     realized_pnl: float        # ₹, from sells (FIFO)
     lots: list[dict]           # open lots: {date, quantity, price} for tax aging
+    # Quantity sold with no matching open lot. Almost always a data-entry error
+    # (a mistyped quantity, a missing buy, a sell recorded before its purchase),
+    # and previously it was absorbed in silence: the FIFO loop simply ran out of
+    # lots and stopped, so selling 500 when 50 were held produced the same
+    # position and the same realised P&L as selling 50. A typo could not be
+    # distinguished from a correct entry.
+    unmatched_sell_qty: float = 0.0
 
 
 def positions_from_ledger(txns: list[Transaction]) -> dict[int, Position]:
@@ -44,8 +51,10 @@ def positions_from_ledger(txns: list[Transaction]) -> dict[int, Position]:
     for cid, ts in by_company.items():
         lots: list[dict] = []
         realized = 0.0
+        unmatched = 0.0
         for t in ts:
             if t.side == "buy":
+                # a zero-quantity row cannot carry a per-share fee
                 lots.append({"date": t.trade_date, "quantity": t.quantity,
                              "price": t.price + (t.fees / t.quantity if t.quantity else 0)})
             else:
@@ -53,18 +62,44 @@ def positions_from_ledger(txns: list[Transaction]) -> dict[int, Position]:
                 while remaining > 1e-9 and lots:
                     lot = lots[0]
                     take = min(lot["quantity"], remaining)
-                    realized += take * (t.price - lot["price"]) - (t.fees * take / t.quantity)
+                    fee_share = (t.fees * take / t.quantity) if t.quantity else 0.0
+                    realized += take * (t.price - lot["price"]) - fee_share
                     lot["quantity"] -= take
                     remaining -= take
                     if lot["quantity"] <= 1e-9:
                         lots.pop(0)
+                if remaining > 1e-9:
+                    unmatched += remaining
         qty = sum(l["quantity"] for l in lots)
         invested = sum(l["quantity"] * l["price"] for l in lots)
-        if qty > 1e-9 or abs(realized) > 1e-9:
+        if qty > 1e-9 or abs(realized) > 1e-9 or unmatched > 1e-9:
             out[cid] = Position(company_id=cid, quantity=qty,
                                 avg_cost=invested / qty if qty > 1e-9 else 0.0,
-                                invested=invested, realized_pnl=realized, lots=lots)
+                                invested=invested, realized_pnl=realized, lots=lots,
+                                unmatched_sell_qty=unmatched)
     return out
+
+
+def ledger_integrity(positions: dict[int, Position]) -> dict:
+    """Data-entry problems the FIFO matcher would otherwise absorb silently.
+
+    Surfacing this matters more than it looks: an unmatched sell means the
+    recorded history is not a possible sequence of trades, so every figure
+    derived from it — cost basis, realised P&L, XIRR, tax-lot aging — is
+    computed on a book that never existed.
+    """
+    bad = {cid: p.unmatched_sell_qty for cid, p in positions.items()
+           if p.unmatched_sell_qty > 1e-9}
+    return {
+        "ok": not bad,
+        "unmatched_sells": bad,
+        "warning": (None if not bad else
+                    f"{len(bad)} position(s) record sells with no matching open "
+                    "lot. Usually a mistyped quantity, a missing buy, or a sell "
+                    "dated before its purchase. Cost basis, realised P&L, XIRR "
+                    "and tax-lot aging are all unreliable for these names until "
+                    "the ledger is corrected."),
+    }
 
 
 # --------------------------------------------------------------------- XIRR

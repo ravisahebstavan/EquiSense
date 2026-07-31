@@ -16,7 +16,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import ledger
-from ..engine.portfolio import Transaction, positions_from_ledger, xirr
+from ..engine.portfolio import (Transaction, ledger_integrity,
+                                positions_from_ledger, xirr)
 from ..models import (AppSnapshot, Company, MacroObservation, PaperTrade,
                       PriceObservation)
 
@@ -152,6 +153,11 @@ def account(session: Session, include_curve: bool = True) -> dict:
                               + sum(p.realized_pnl for cid, p in positions.items()
                                     if p.quantity <= 1e-9), 2),
         "positions": sorted(pos_rows, key=lambda r: -r["value"]),
+        # place_trade() rejects an oversell, so this should always be clean.
+        # That is exactly why it is worth reporting: if it ever fires, the
+        # validation was bypassed and the cash balance above is wrong too —
+        # `cash` is summed from raw trades, so a phantom sell mints phantom cash.
+        "data_integrity": ledger_integrity(positions),
         "trades": [{
             "id": t.id, "ticker": companies[t.company_id].ticker, "side": t.side,
             "quantity": t.quantity, "price": t.price, "date": str(t.trade_date),

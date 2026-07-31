@@ -603,6 +603,8 @@ async function viewDashboard() {
         <div class="sub" style="margin-top:6px">REG-001: conditioning showed no OOS value — regime is descriptive.</div>
       </div>
       <div class="panel span4"><h2>Portfolio</h2>
+        ${pf.data_integrity && !pf.data_integrity.ok
+          ? `<div class="breach">⚠ Ledger integrity: ${esc(pf.data_integrity.warning)}</div>` : ""}
         ${pf.holdings.length ? `
         <div class="tiles" style="grid-template-columns:1fr 1fr">
           <div class="tile"><div class="label">Value</div><div class="value">${fmtMoney(pf.total_value)}</div></div>
@@ -1052,6 +1054,17 @@ async function renderRealBook(body) {
       <div class="tile"><div class="label">Realized</div><div class="value ${p.realized_pnl >= 0 ? "pos" : "neg"}">${fmtMoney(p.realized_pnl)}</div></div>
       <div class="tile"><div class="label">XIRR</div><div class="value ${(x.value ?? 0) >= 0 ? "pos" : "neg"}">${fmtN(x.value, 2)}%</div></div>
     </div>
+    ${p.data_integrity && !p.data_integrity.ok ? `<div class="panel"><h2>⚠ Ledger integrity</h2>
+      <div class="breach">${esc(p.data_integrity.warning)}</div>
+      <div class="tablewrap"><table><thead><tr><th>Company</th>
+        <th class="num">Sold with no matching lot</th></tr></thead><tbody>
+        ${Object.entries(p.data_integrity.unmatched_sells).map(([t, q]) =>
+          `<tr><td>${esc(t)}</td><td class="num">${fmtN(q, 4)}</td></tr>`).join("")}
+      </tbody></table></div>
+      <div class="sub">Every figure on this page is derived from the ledger, so
+        correct the entries before reading anything below as accurate. A fully
+        oversold name does not appear in Holdings at all — its quantity nets to
+        zero — which is why this check exists separately.</div></div>` : ""}
     ${p.profile_limit_breaches.length ? `<div class="panel"><h2>Conflicts with your stated rules</h2>
       ${p.profile_limit_breaches.map(b => `<div class="breach">⚠ ${esc(b)}</div>`).join("")}
       <div class="sub">Diagnostics only — EquiSense never suggests trades.</div></div>` : ""}

@@ -375,6 +375,12 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
             breaches.append(f"{sector} is {w:.1f}% of the book — above your stated "
                             f"{profile.max_sector_pct:.0f}% sector limit.")
 
+    # Deliberately NOT folded into `breaches`: a policy breach means the book is
+    # correctly recorded and outside your rules; an unmatched sell means the book
+    # is not correctly recorded at all. Merging them would let a broken ledger
+    # read as a mere preference violation.
+    integrity = pf.ledger_integrity(positions)
+
     invested_total = sum(p.invested for p in positions.values())
     return {
         "as_of": today.isoformat(),
@@ -392,6 +398,17 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
             "by_quality_tier": conc["by_quality_tier"],
         },
         "profile_limit_breaches": breaches,
+        # An unmatched sell means the ledger is not a possible trade sequence,
+        # so every number above it is computed on a book that never existed.
+        # It used to be absorbed in silence — worse, a fully-oversold name drops
+        # out of `holdings` entirely (quantity 0), so the one place it could have
+        # been noticed showed nothing at all.
+        "data_integrity": {
+            **integrity,
+            "unmatched_sells": {companies[cid].ticker: round(q, 4)
+                                for cid, q in integrity["unmatched_sells"].items()
+                                if cid in companies},
+        },
     }
 
 
