@@ -66,6 +66,11 @@ NIFTY50 = {
 # Macro series (all keyless via Yahoo): symbol -> (name, role)
 MACRO_SERIES = {
     "^NSEI":     ("NIFTY 50", "index"),
+    # Bank Nifty carries its own option chain and is one of the two underlyings
+    # whose implied volatility is captured daily. Without a deep close history
+    # the realised-vol side of its variance premium has nothing to compare
+    # against, leaving half that study untestable for years.
+    "^NSEBANK":  ("NIFTY Bank", "index"),
     "^INDIAVIX": ("India VIX", "vix"),
     "INR=X":     ("USD/INR", "currency"),
     "BZ=F":      ("Brent Crude", "commodity"),
