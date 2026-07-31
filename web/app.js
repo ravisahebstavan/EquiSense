@@ -1784,7 +1784,8 @@ async function viewLab(section = "hypotheses") {
    engine's own caveat rather than a cleaned-up summary of it. */
 
 const MARKET_TABS = [
-  ["derivatives", "Derivatives"], ["risk", "Risk (Monte Carlo)"],
+  ["derivatives", "Derivatives"], ["vrp", "Variance Premium"],
+  ["risk", "Risk (Monte Carlo)"],
   ["relations", "Cross-Asset"], ["valuation", "Valuation Regime"],
   ["flow", "Institutional Flow"],
 ];
@@ -1801,7 +1802,8 @@ async function viewMarkets(tab) {
     b.addEventListener("click", () => location.hash = `#/markets/${b.dataset.tab}`));
   const body = document.getElementById("mk-body");
   try {
-    if (tab === "risk") await renderMarketRisk(body);
+    if (tab === "vrp") await renderVrp(body);
+    else if (tab === "risk") await renderMarketRisk(body);
     else if (tab === "relations") await renderRelations(body);
     else if (tab === "valuation") await renderValuationRegime(body);
     else if (tab === "flow") await renderFlow(body);
@@ -1867,6 +1869,58 @@ async function renderDerivatives(body) {
       </div></div>`;
   const go = document.getElementById("mk-go");
   if (go) go.addEventListener("click", () => renderDerivatives(body));
+}
+
+async function renderVrp(body) {
+  const d = await api("/markets/vrp?symbol=NIFTY&horizon_days=21");
+  const cap = `<button id="vrp-capture" style="margin-top:10px">Capture today's surface</button>`;
+  if (!d.computable) {
+    body.innerHTML = `<div class="panel"><h3>Variance risk premium — accumulating</h3>
+      <div class="tiles">
+        <div class="tile"><div class="label">IV observations</div>
+          <div class="value">${d.iv_observations_stored ?? 0}</div>
+          <div class="sub">need ~40</div></div>
+        <div class="tile"><div class="label">Price history</div>
+          <div class="value">${(d.close_observations ?? 0).toLocaleString()}</div>
+          <div class="sub">realised-vol side ready</div></div>
+      </div>
+      <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">
+        ${esc(d.reason || "")}</div>
+      <div class="sub" style="margin-top:8px">${esc(d.hypothesis || "")}</div>
+      ${cap}</div>`;
+  } else {
+    const rows = (d.recent || []).map(r => `<tr><td>${esc(r.date)}</td>
+      <td class="num">${fmtN(r.implied_pct, 2)}%</td>
+      <td class="num">${fmtN(r.realised_pct, 2)}%</td>
+      <td class="num" style="color:${r.premium_pp > 0 ? "var(--good-text)" : "var(--critical)"}">
+        ${signed(r.premium_pp)}pp</td></tr>`).join("");
+    body.innerHTML = `<div class="panel"><h3>Variance risk premium — implied vs subsequently realised</h3>
+      <div class="tiles">
+        <div class="tile"><div class="label">Mean premium</div>
+          <div class="value">${signed(d.mean_premium_pp)}pp</div>
+          <div class="sub">t = ${signed(d.t_stat)}</div></div>
+        <div class="tile"><div class="label">Positive</div>
+          <div class="value">${fmtN(d.share_positive_pct, 1)}%</div>
+          <div class="sub">of ${d.observations} observations</div></div>
+        <div class="tile"><div class="label">Worst observation</div>
+          <div class="value" style="color:var(--critical)">${signed((d.worst_observation || {}).premium_pp)}pp</div>
+          <div class="sub">${esc((d.worst_observation || {}).date || "")}</div></div>
+      </div>
+      <div class="sub" style="margin-top:10px">${esc(d.verdict || "")}</div>
+      <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--critical)">
+        ${esc(d.risk_warning || "")}</div>
+      <div class="tablewrap" style="margin-top:10px"><table><thead><tr><th>Date</th>
+        <th>Implied</th><th>Realised</th><th>Premium</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <div class="sub" style="margin-top:8px">${esc(d.method || "")} · ${esc(d.citation || "")}</div>
+      ${cap}</div>`;
+  }
+  const b = document.getElementById("vrp-capture");
+  if (b) b.addEventListener("click", async () => {
+    b.disabled = true; b.textContent = "Capturing…";
+    await api("/markets/capture-surface", { method: "POST" });
+    renderVrp(body);
+  });
 }
 
 async function renderMarketRisk(body) {
