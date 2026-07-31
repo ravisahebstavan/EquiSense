@@ -533,8 +533,12 @@ def live_dossier(company_id: int, s: Session = Depends(db)):
     profile = services.active_profile(s)
     view = services.portfolio_view(s, profile)
     book = view["total_value"] or 1_000_000
-    return build_dossier(s, c, book_value=book,
-                         max_position_pct=profile.max_position_pct)
+    from ..compliance import apply_boundary
+    # A dossier carries a verdict, a conviction band and a position size — an
+    # actionable instruction in substance. Outside PERSONAL mode those fields
+    # are withheld while every measurement and caveat is preserved.
+    return apply_boundary(build_dossier(s, c, book_value=book,
+                                        max_position_pct=profile.max_position_pct))
 
 
 @app.get("/api/live/base-rates")
@@ -778,6 +782,16 @@ def storage_view(universe_size: int = 50, s: Session = Depends(db)):
     from ..ingestion.retention import projected_headroom, storage_report
     return {"report": storage_report(s),
             "projection": projected_headroom(s, max(10, min(universe_size, 2000)))}
+
+
+@app.get("/api/compliance")
+def compliance_view():
+    """Distribution boundary: what may leave the single-user context, the
+    monetisation surface, and the honest state of the platform's own evidence."""
+    from ..compliance import (current_mode, edge_disclosure,
+                              monetisation_surface, REGULATORY_NOTICE)
+    return {"mode": current_mode(), "regulatory_notice": REGULATORY_NOTICE,
+            "edge": edge_disclosure(), "monetisation": monetisation_surface()}
 
 
 @app.get("/api/markets/sources")
