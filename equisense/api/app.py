@@ -570,6 +570,44 @@ def live_base_rates(s: Session = Depends(db)):
             } for r in rows]}
 
 
+@app.get("/api/live/ic")
+def live_ic(s: Session = Depends(db)):
+    """Information Coefficient per signal, with each result's own detection
+    limit — so a null reads as 'absent' or 'unresolvable' rather than
+    ambiguously either."""
+    from ..research.ic import run_ic_studies
+    from ..models import AppSnapshot
+    import json
+    row = s.get(AppSnapshot, "ic_studies")
+    if row is not None:
+        try:
+            return json.loads(row.payload)
+        except Exception:                          # noqa: BLE001
+            pass
+    return {"computable": False,
+            "reason": "not yet computed — POST /api/live/ic/run"}
+
+
+@app.post("/api/live/ic/run")
+def live_ic_run(s: Session = Depends(db)):
+    """Recompute IC across the stored history. Cached because it is a full
+    pass over the price panel."""
+    import json
+    from datetime import date as _date
+
+    from ..models import AppSnapshot
+    from ..research.ic import run_ic_studies
+    out = run_ic_studies(s)
+    row = s.get(AppSnapshot, "ic_studies")
+    if row is None:
+        row = AppSnapshot(key="ic_studies", as_of=str(_date.today()), payload="")
+        s.add(row)
+    row.payload = json.dumps(out)
+    row.as_of = str(_date.today())
+    s.commit()
+    return out
+
+
 @app.post("/api/live/studies/run")
 def live_run_studies(s: Session = Depends(db)):
     from ..research.base_rates import run_all_studies

@@ -128,3 +128,33 @@ def test_markets_view_uses_real_helpers_not_invented_ones():
     names = {n for grp in used for n in grp.split()}
     for n in names:
         assert f".{n}" in css or n in ("primary",), f'CSS class "{n}" is not styled'
+
+
+def test_ic_panel_is_defined_not_just_called():
+    """Caught a real silent failure: a string-replace anchored on the wrong
+    function signature inserted the CALL but not the DEFINITION, leaving a tab
+    that throws at runtime and renders nothing."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    assert "async function renderIcPanel(body)" in js, "definition missing"
+    assert 'section === "ic"' in js, "route branch missing"
+    assert '"ic", "Signal IC"' in js, "tab entry missing"
+
+
+def test_every_view_function_called_in_the_router_exists():
+    """Generalises the above: any render/view function the router dispatches to
+    must actually be defined."""
+    import re
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    called = set(re.findall(r"await ((?:view|render)[A-Za-z]+)\(", js))
+    defined = set(re.findall(r"(?:async )?function ((?:view|render)[A-Za-z]+)\(", js))
+    missing = called - defined
+    assert not missing, f"called but never defined: {sorted(missing)}"
+
+
+def test_ic_endpoints_are_registered():
+    from equisense.api.app import app
+    paths = {r.path for r in app.routes}
+    assert "/api/live/ic" in paths
+    assert "/api/live/ic/run" in paths

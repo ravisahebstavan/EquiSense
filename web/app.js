@@ -1523,10 +1523,69 @@ async function viewResearch() {
   });
 }
 
+
+/* ------------------------------------------------- signal information coefficient */
+/* Does each signal actually predict? Every result carries its own DETECTION
+   LIMIT, because a null IC is ambiguous without one: "the signal is absent" and
+   "the cross-section is too narrow to resolve it" call for opposite responses. */
+
+async function renderIcPanel(body) {
+  const d = await api("/live/ic");
+  if (!d.computable) {
+    body.innerHTML = `<div class="panel"><strong>Information Coefficient not computed.</strong>
+      <div class="sub" style="margin-top:6px">${esc(d.reason || "")}</div>
+      <button id="ic-run" class="primary" style="margin-top:10px">Run IC studies</button></div>`;
+    const b = document.getElementById("ic-run");
+    if (b) b.addEventListener("click", async () => {
+      b.disabled = true; b.textContent = "Running…";
+      await api("/live/ic/run", { method: "POST" });
+      renderIcPanel(body);
+    });
+    return;
+  }
+  const rows = Object.entries(d.signals).map(([hyp, sg]) => {
+    if (!sg.computable)
+      return `<tr><td>${esc(hyp)}</td><td colspan="6" class="sub">${esc(sg.reason || "")}</td></tr>`;
+    const h = sg.best_horizon, e = sg.by_horizon[h];
+    if (!e || !e.computable)
+      return `<tr><td>${esc(hyp)}</td><td colspan="6" class="sub">${esc((e || {}).reason || "")}</td></tr>`;
+    const passes = Math.abs(e.t_stat || 0) >= 2;
+    const label = passes ? "PASS" : (e.underpowered ? "underpowered" : "no edge");
+    return `<tr><td>${esc(hyp)}</td><td class="num">${h}d</td>
+      <td class="num">${signed(e.mean_ic, 4)}</td>
+      <td class="num">${signed(e.t_stat)}</td>
+      <td class="num sub">${fmtN(e.minimum_detectable_ic, 4)}</td>
+      <td class="num sub">${e.dates}</td>
+      <td style="color:${passes ? "var(--good-text)" : "var(--muted)"}">${label}</td></tr>`;
+  }).join("");
+  body.innerHTML = `
+    <div class="panel"><h3>Information Coefficient — does each signal actually predict?</h3>
+      <div class="sub" style="margin-bottom:8px">${d.universe} names · ${d.history_days} days ·
+        per-date cross-sectional rank correlation (Fama-MacBeth), Newey-West t for
+        overlapping windows</div>
+      <div class="tablewrap"><table><thead><tr><th>Hypothesis</th><th>Horizon</th>
+        <th>Mean IC</th><th>t</th><th>Min detectable</th><th>Dates</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">
+        <strong>Passing IC t-test: ${d.passing_ic_t_test.length ? esc(d.passing_ic_t_test.join(", ")) : "NONE"}.</strong>
+        Read every null against the detection limit beside it. Where |IC| sits below
+        that limit the study could not have resolved the effect even if it were real —
+        widening the cross-section is what changes that, not abandoning the signal.</div>
+      <div class="sub" style="margin-top:8px">${esc(d.note || "")}</div>
+      <button id="ic-rerun" style="margin-top:10px">Recompute</button></div>`;
+  const b = document.getElementById("ic-rerun");
+  if (b) b.addEventListener("click", async () => {
+    b.disabled = true; b.textContent = "Running…";
+    await api("/live/ic/run", { method: "POST" });
+    renderIcPanel(body);
+  });
+}
+
 /* ================================================================== lab */
 
 async function viewLab(section = "hypotheses") {
   const tabs = [["hypotheses", "Hypotheses"], ["baserates", "Base Rates"],
+                ["ic", "Signal IC"],
                 ["calibration", "Calibration & Ledger"], ["backtest", "Backtest"],
                 ["data", "Data Health"]];
   app.innerHTML = `
@@ -1537,6 +1596,8 @@ async function viewLab(section = "hypotheses") {
   app.querySelectorAll("[data-tab]").forEach(b =>
     b.addEventListener("click", () => location.hash = `#/lab/${b.dataset.tab}`));
   const body = document.getElementById("lab-body");
+
+  if (section === "ic") { await renderIcPanel(body); return; }
 
   if (section === "hypotheses") {
     const br = await api("/live/base-rates");
