@@ -62,7 +62,17 @@ def xsec_strength(values: dict[str, Optional[float]], key: str,
     peers = [x for x in values.values() if x is not None]
     if len(peers) < 10:
         return None  # a percentile among 9 peers is noise, not context
-    rank = sum(1 for x in peers if x <= v) / len(peers)
+
+    # MIDRANK for ties. Counting `x <= v` gives every member of a tied group the
+    # rank of the group's TOP, which is systematically bullish wherever ties are
+    # common — and on integer signals they are the norm. Measured on a realistic
+    # 50-name Piotroski distribution, the modal F=7 cohort scored +0.48 instead
+    # of +0.24: an error of 0.24 on a [-1,+1] scale, always in the same
+    # direction. With every value identical the old form returned +1.0, i.e.
+    # maximum bullish conviction from a signal carrying no information at all.
+    less = sum(1 for x in peers if x < v)
+    equal = sum(1 for x in peers if x == v)
+    rank = (less + 0.5 * equal) / len(peers)
     s = 2 * (rank - 0.5)
     return -s if invert else s
 

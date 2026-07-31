@@ -48,14 +48,43 @@ def test_n_effective_overlap_correction():
 # ------------------------------------------- percentile normalization (A2)
 
 def test_xsec_strength_is_rank_based():
+    """Midrank percentile: (below + half the ties) / n.
+
+    The old `x <= v` convention was ASYMMETRIC — the minimum mapped to -0.90
+    while the maximum mapped to +1.00, so the scale had a built-in bullish tilt
+    even with no ties at all. Midrank makes it symmetric."""
     values = {f"S{i}": float(i) for i in range(20)}
     top = xsec_strength(values, "S19")
     bottom = xsec_strength(values, "S0")
     mid = xsec_strength(values, "S10")
-    assert top == pytest.approx(1.0)
-    assert bottom == pytest.approx(-0.9)   # rank 1/20 → 2·(0.05−0.5)
+    assert top == pytest.approx(0.95)      # (19 + 0.5)/20 → 2·(0.975−0.5)
+    assert bottom == pytest.approx(-0.95)  # (0 + 0.5)/20  → 2·(0.025−0.5)
+    assert top == pytest.approx(-bottom), "the scale must be symmetric"
     assert -0.1 < mid < 0.2
-    assert xsec_strength(values, "S19", invert=True) == pytest.approx(-1.0)
+    assert xsec_strength(values, "S19", invert=True) == pytest.approx(-0.95)
+
+
+def test_xsec_strength_centres_a_fully_tied_universe():
+    """The bug this replaced: with every value identical, `x <= v` gave EVERY
+    name rank 1.0 — maximum bullish conviction from a signal carrying no
+    information whatsoever."""
+    tied = {f"S{i}": 5.0 for i in range(20)}
+    assert xsec_strength(tied, "S0") == pytest.approx(0.0)
+
+
+def test_xsec_strength_ties_do_not_inflate_the_modal_cohort():
+    """Integer signals like Piotroski F make ties the norm, not the exception.
+    Measured on a realistic 50-name distribution the modal F=7 cohort scored
+    +0.48 under the old convention against a correct +0.24 — an error of 0.24
+    on a [-1,+1] scale, always in the same direction."""
+    dist = [7] * 12 + [6] * 10 + [8] * 8 + [5] * 7 + [9] * 5 + [4] * 4 + [3] * 4
+    values = {f"S{i}": float(v) for i, v in enumerate(dist)}
+    name = next(k for k, v in values.items() if v == 7.0)
+    n = len(values)
+    less = sum(1 for v in values.values() if v < 7.0)
+    eq = sum(1 for v in values.values() if v == 7.0)
+    assert xsec_strength(values, name) == pytest.approx(2 * ((less + 0.5 * eq) / n - 0.5))
+    assert xsec_strength(values, name) < 0.30, "the modal cohort must not read as strong"
 
 
 def test_xsec_strength_needs_enough_peers():
@@ -67,7 +96,7 @@ def test_xsec_strength_outlier_robust():
     values = {f"S{i}": float(i) for i in range(19)}
     values["MOON"] = 1e9  # absurd outlier
     # rank-based: outlier takes top slot but does not distort others' strengths
-    assert xsec_strength(values, "S18") == pytest.approx(2 * (19 / 20 - 0.5))
+    assert xsec_strength(values, "S18") == pytest.approx(2 * ((18 + 0.5) / 20 - 0.5))
 
 
 # ----------------------------------------------------- admission caps (A3)
@@ -153,3 +182,63 @@ def test_calibration_report_counts_wrongful_abstentions(tmp_path, monkeypatch):
     assert rep["scored_abstentions"] == 2
     assert rep["wrongful_abstention_rate"] == pytest.approx(0.5)
     assert rep["hit_rate"] == 1.0
+
+
+# -------------------------------------------------- ledger integrity (Wave S)
+
+def test_unmatched_sell_is_counted_not_absorbed():
+    """FIFO used to run out of lots and stop, silently. Selling 50 while holding
+    10 produced the same position and the same realised P&L as selling 10, so a
+    mistyped quantity was indistinguishable from a correct entry."""
+    import datetime as dt
+    from equisense.engine.portfolio import (Transaction, ledger_integrity,
+                                            positions_from_ledger)
+    pos = positions_from_ledger([
+        Transaction(1, "buy", 10, 100.0, dt.date(2024, 1, 1)),
+        Transaction(1, "sell", 50, 110.0, dt.date(2024, 2, 1))])
+    assert pos[1].quantity == pytest.approx(0.0)
+    assert pos[1].unmatched_sell_qty == pytest.approx(40.0)
+    rep = ledger_integrity(pos)
+    assert rep["ok"] is False
+    assert rep["unmatched_sells"] == {1: pytest.approx(40.0)}
+    assert "no matching open lot" in rep["warning"]
+
+
+def test_sell_before_buy_is_flagged_even_though_the_position_looks_fine():
+    """The dangerous case: quantity and cost basis end up plausible, so nothing
+    downstream looks wrong — but realised P&L is missing a leg."""
+    import datetime as dt
+    from equisense.engine.portfolio import (Transaction, ledger_integrity,
+                                            positions_from_ledger)
+    pos = positions_from_ledger([
+        Transaction(1, "sell", 5, 110.0, dt.date(2024, 1, 1)),
+        Transaction(1, "buy", 10, 100.0, dt.date(2024, 2, 1))])
+    assert pos[1].quantity == pytest.approx(10.0)       # looks like a clean lot
+    assert pos[1].realized_pnl == pytest.approx(0.0)    # ...but earned nothing
+    assert ledger_integrity(pos)["ok"] is False
+
+
+def test_a_correct_ledger_reports_clean():
+    import datetime as dt
+    from equisense.engine.portfolio import (Transaction, ledger_integrity,
+                                            positions_from_ledger)
+    pos = positions_from_ledger([
+        Transaction(1, "buy", 10, 100.0, dt.date(2024, 1, 1)),
+        Transaction(1, "sell", 4, 110.0, dt.date(2024, 2, 1))])
+    rep = ledger_integrity(pos)
+    assert rep == {"ok": True, "unmatched_sells": {}, "warning": None}
+    assert pos[1].realized_pnl == pytest.approx(40.0)
+
+
+def test_fully_oversold_name_is_absent_from_holdings_but_present_in_the_warning():
+    """Why the check has to live outside the holdings table: the position nets
+    to zero quantity, so the one place a user would look shows nothing."""
+    import datetime as dt
+    from equisense.engine.portfolio import (Transaction, ledger_integrity,
+                                            positions_from_ledger)
+    pos = positions_from_ledger([
+        Transaction(7, "buy", 10, 100.0, dt.date(2024, 1, 1)),
+        Transaction(7, "sell", 500, 110.0, dt.date(2024, 2, 1))])
+    visible = [cid for cid, p in pos.items() if p.quantity > 1e-9]
+    assert visible == []
+    assert ledger_integrity(pos)["unmatched_sells"] == {7: pytest.approx(490.0)}

@@ -21,10 +21,20 @@ def _trend(closes: Sequence[float], window: int = 200) -> Optional[float]:
 
 
 def _pctile(closes: Sequence[float], lookback: int = 756) -> Optional[float]:
+    """Midrank percentile of the latest value within its own history.
+
+    Counting `v <= current` puts a value tied with its own history at the 100th
+    percentile — so a flat VIX classified a perfectly calm market as STRESSED,
+    since every identical reading counted as being at or below itself. Midrank
+    places a fully tied value at 50.
+    """
     hist = closes[-lookback:]
     if len(hist) < 60:
         return None
-    return sum(1 for v in hist if v <= closes[-1]) / len(hist) * 100
+    cur = closes[-1]
+    less = sum(1 for v in hist if v < cur)
+    equal = sum(1 for v in hist if v == cur)
+    return (less + 0.5 * equal) / len(hist) * 100
 
 
 def _ret(closes: Sequence[float], days: int) -> Optional[float]:

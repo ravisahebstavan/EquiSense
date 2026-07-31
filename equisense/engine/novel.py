@@ -226,7 +226,10 @@ def pe_percentile_vs_history(closes: Sequence[float], close_dates: Sequence[date
         return Metric(key="pe_percentile", label="P/E Percentile vs Own History",
                       value=None, unit="pctile", formula="insufficient P/E history",
                       inputs={}, period=period, family="novel")
-    pctile = sum(1 for p in pes if p <= pe_now) / len(pes) * 100
+    # midrank: a P/E tied with its own history sits at 50, not 100
+    _less = sum(1 for p in pes if p < pe_now)
+    _eq = sum(1 for p in pes if p == pe_now)
+    pctile = (_less + 0.5 * _eq) / len(pes) * 100
     return Metric(
         key="pe_percentile", label="P/E Percentile vs Own History",
         value=pctile, unit="pctile",
