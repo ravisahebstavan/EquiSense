@@ -176,5 +176,9 @@ def test_ic_runner_source_uses_pd_notna():
     src = (Path(__file__).resolve().parent.parent
            / "equisense" / "research" / "ic.py").read_text()
     block = src[src.index("def run_ic_studies"):]
-    assert "pd.notna(v)" in block
-    assert "v == v" not in block, "the NA-unsafe check must not return"
+    # strip comments first — the fix is DOCUMENTED with the old pattern, and
+    # matching raw text would flag the explanation rather than the code
+    code = "\n".join(ln for ln in block.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "pd.notna(v)" in code
+    assert "v == v" not in code, "the NA-unsafe check must not return"
