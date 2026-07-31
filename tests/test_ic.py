@@ -126,3 +126,27 @@ def test_weights_stay_uniform_when_nothing_passes():
     w = ic_weights(evs)
     assert set(w["weights"].values()) == {1.0}
     assert "UNIFORM" in w["status"]
+
+
+def test_minimum_detectable_ic_falls_with_names_and_dates():
+    """A null IC is ambiguous without its detection limit: 'signal absent' and
+    'cross-section too narrow to resolve it' call for opposite responses."""
+    from equisense.research.ic import minimum_detectable_ic as mdi
+    assert mdi(500, 100, 126) < mdi(200, 100, 126) < mdi(55, 100, 126)
+    assert mdi(55, 400, 126) < mdi(55, 100, 126)
+    assert mdi(1, 100, 126) != mdi(1, 100, 126)      # nan on degenerate input
+
+
+def test_underpowered_nulls_are_labelled_as_such():
+    """The live finding: at 55 names every measured |IC| sat below the 0.067
+    detection limit, so 'no signal passes' was partly a power statement."""
+    ev = evaluate_ic(_build(0.01), horizon_days=126)
+    assert ev["minimum_detectable_ic"] > 0
+    if ev["underpowered"]:
+        assert "POWER statement" in ev["verdict"]
+
+
+def test_a_strong_signal_is_not_flagged_underpowered():
+    ev = evaluate_ic(_build(0.15), horizon_days=63)
+    assert ev["underpowered"] is False
+    assert abs(ev["mean_ic"]) > ev["minimum_detectable_ic"]
