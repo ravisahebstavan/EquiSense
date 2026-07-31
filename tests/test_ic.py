@@ -150,3 +150,31 @@ def test_a_strong_signal_is_not_flagged_underpowered():
     ev = evaluate_ic(_build(0.15), horizon_days=63)
     assert ev["underpowered"] is False
     assert abs(ev["mean_ic"]) > ev["minimum_detectable_ic"]
+
+
+def test_ic_runner_survives_pandas_NA_in_a_feature_frame():
+    """Real bug found only at scale: the self-inequality NaN check `v == v`
+    raises on pandas' NA sentinel ("boolean value of NA is ambiguous"), and
+    feat_momentum_quality introduces NA via .replace(0, pd.NA) whenever a stock
+    has zero realised volatility in the window. At 55 names none did; at 200 one
+    did, and the entire study crashed rather than skipping that cell."""
+    import pandas as pd
+
+    frame = pd.DataFrame({"A": [1.0, 2.0], "B": [pd.NA, 3.0]})
+    row = frame.iloc[1]
+    # the old check raises; pd.notna must be used instead
+    with pytest.raises(TypeError):
+        {k: float(v) for k, v in frame.iloc[0].items() if v is not None and v == v}
+    safe = {k: float(v) for k, v in row.items() if pd.notna(v)}
+    assert safe == {"A": 2.0, "B": 3.0}
+
+
+def test_ic_runner_source_uses_pd_notna():
+    """Pins the fix at the source, since the failure only reproduces with a
+    price panel large enough to contain a zero-volatility name."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent
+           / "equisense" / "research" / "ic.py").read_text()
+    block = src[src.index("def run_ic_studies"):]
+    assert "pd.notna(v)" in block
+    assert "v == v" not in block, "the NA-unsafe check must not return"

@@ -390,10 +390,13 @@ def run_ic_studies(session, horizons: Sequence[int] = (21, 63, 126),
                 if t not in feat.index or t not in fwd.index:
                     continue
                 frow, orow = feat.loc[t], fwd.loc[t]
-                sig = {k: float(v) for k, v in frow.items()
-                       if v is not None and v == v}
-                ret = {k: float(v) for k, v in orow.items()
-                       if v is not None and v == v}
+                # pd.notna, NOT `v == v`. The self-inequality NaN check raises
+                # on pandas' NA sentinel ("boolean value of NA is ambiguous"),
+                # and feat_momentum_quality introduces NA via .replace(0, pd.NA).
+                # At 55 names no stock happened to hit zero volatility; at 200
+                # one did, and the whole study crashed.
+                sig = {k: float(v) for k, v in frow.items() if pd.notna(v)}
+                ret = {k: float(v) for k, v in orow.items() if pd.notna(v)}
                 if sig and ret:
                     rows.append((t, sig, ret))
             per_horizon[h] = rows
