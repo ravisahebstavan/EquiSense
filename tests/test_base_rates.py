@@ -85,3 +85,26 @@ def test_studies_are_computed_before_the_database_is_touched():
         "the DELETE opens a transaction that then sits idle through the whole "
         "computation - compute first, write last")
     assert "bulk_insert_mappings" in src, "per-row session.add() is N round trips"
+
+
+def test_long_studies_release_the_read_transaction_before_computing():
+    """The first SELECT opens a transaction that stays open until commit or
+    rollback, so minutes of computation afterwards are minutes of
+    idle-in-transaction. Postgres terminates that connection
+    ("IdleInTransactionSessionTimeout") and the write at the end fails.
+
+    Moving only the WRITE was not enough — the transaction opens at the first
+    READ. Every study that loads a panel and then computes must release it.
+    Asserted on source because no SQLite test can reproduce a server-side
+    idle-transaction timeout.
+    """
+    import inspect
+
+    from equisense.research import base_rates, factor_portfolio, ic, information
+    for fn, label in ((base_rates.run_all_studies, "run_all_studies"),
+                      (ic.run_ic_studies, "run_ic_studies"),
+                      (factor_portfolio.run_factor_studies, "run_factor_studies"),
+                      (information.load_ohlc_panel, "load_ohlc_panel")):
+        src = inspect.getsource(fn)
+        assert "session.rollback()" in src, (
+            f"{label} holds a read transaction open across its computation")

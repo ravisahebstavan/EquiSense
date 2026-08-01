@@ -196,3 +196,27 @@ def test_factor_portfolio_endpoints_are_registered():
     paths = {r.path for r in app.routes}
     assert "/api/live/factor-portfolio" in paths
     assert "/api/live/factor-portfolio/run" in paths
+
+
+def test_research_cli_exposes_every_heavy_study():
+    """The Lab's run buttons POST to endpoints that do minutes of work, which a
+    serverless request cannot survive. The CLI is the supported path, so it has
+    to cover all three studies and cache to the SAME keys the read endpoints
+    look at — otherwise running it locally would leave the site still empty."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent
+           / "equisense" / "research" / "__main__.py").read_text()
+    for study in ("ic", "factors", "baserates"):
+        assert f'"{study}"' in src, f"{study} missing from the CLI"
+    assert '"ic_studies"' in src, "IC results must cache where GET /live/ic reads"
+    assert '"factor_studies"' in src, "factor results must cache where GET reads"
+
+
+def test_lab_run_buttons_warn_about_the_serverless_timeout():
+    """A button that always fails on the deployed site is worse than no button;
+    the guidance has to travel with it."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    assert js.count("python -m equisense.research all") == 2, (
+        "both the IC and factor run buttons need the CLI fallback note")
+    assert "time out" in js

@@ -69,6 +69,9 @@ def load_ohlc_panel(session: Session) -> dict[str, pd.DataFrame]:
     for col in ("open", "high", "low", "close", "close_raw", "volume"):
         out[col] = df.pivot_table(index="date", columns="ticker",
                                   values=col).sort_index()
+    # Close the read transaction: callers compute for minutes afterwards, and
+    # an open idle transaction is what Postgres terminates.
+    session.rollback()
     return out
 
 

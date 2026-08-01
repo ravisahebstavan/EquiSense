@@ -359,6 +359,13 @@ def run_ic_studies(session, horizons: Sequence[int] = (21, 63, 126),
         return {"computable": False,
                 "reason": f"need ≥{MIN_NAMES_PER_DATE} names with price history"}
     sector_map = load_sector_map(session)
+    # Release the READ transaction before the long computation. The first
+    # SELECT above opens a transaction and it stays open until commit/rollback,
+    # so the minutes of compute that follow are minutes of idle-in-transaction —
+    # Postgres kills that ("IdleInTransactionSessionTimeout") and the write at
+    # the end fails. Moving only the write was not enough; the transaction opens
+    # at the first read, not at the first write.
+    session.rollback()
 
     builders = {hyp: cfg["feature"] for hyp, cfg in STUDIES.items()}
     builders["HYP-010"] = lambda c, v: feat_sector_relative_momentum(c, v, sector_map)

@@ -340,6 +340,14 @@ def run_all_studies(session: Session) -> dict:
     all_studies["HYP-011"] = {
         "feature": feat_max_effect, "select": ("quantile", 0.2), "horizons": [21, 63]}
 
+    # Release the READ transaction before the long computation. The first
+    # SELECT above opens a transaction and it stays open until commit/rollback,
+    # so the minutes of compute that follow are minutes of idle-in-transaction —
+    # Postgres kills that ("IdleInTransactionSessionTimeout") and the write at
+    # the end fails. Moving only the write was not enough; the transaction opens
+    # at the first read, not at the first write.
+    session.rollback()
+
     # Compute BEFORE touching the database. This used to DELETE first, then run
     # the studies — minutes of pure computation — and only then insert, holding
     # a transaction open and idle the whole time. Neon's free tier closes idle

@@ -1547,7 +1547,7 @@ async function renderIcPanel(body) {
   if (!d.computable) {
     body.innerHTML = `<div class="panel"><strong>Information Coefficient not computed.</strong>
       <div class="sub" style="margin-top:6px">${esc(d.reason || "")}</div>
-      <button id="ic-run" class="primary" style="margin-top:10px">Run IC studies</button></div>`;
+      <button id="ic-run" class="primary" style="margin-top:10px">Run IC studies</button><div class="sub" style="margin-top:8px">These studies are a full pass over the price panel and take several minutes — a serverless request will time out before they finish. Run <code>python -m equisense.research all</code> locally against the same database; the results cache to the same place this page reads.</div></div>`;
     const b = document.getElementById("ic-run");
     if (b) b.addEventListener("click", async () => {
       b.disabled = true; b.textContent = "Running…";
@@ -1599,7 +1599,7 @@ async function renderFactorPanel(body) {
   if (!d.computable) {
     body.innerHTML = `<div class="panel"><strong>Factor P&L not computed.</strong>
       <div class="sub" style="margin-top:6px">${esc(d.reason || "")}</div>
-      <button id="fp-run" class="primary" style="margin-top:10px">Run factor studies</button></div>`;
+      <button id="fp-run" class="primary" style="margin-top:10px">Run factor studies</button><div class="sub" style="margin-top:8px">These studies are a full pass over the price panel and take several minutes — a serverless request will time out before they finish. Run <code>python -m equisense.research all</code> locally against the same database; the results cache to the same place this page reads.</div></div>`;
     const b = document.getElementById("fp-run");
     if (b) b.addEventListener("click", async () => {
       b.disabled = true; b.textContent = "Running…";
