@@ -18,7 +18,8 @@ from ..engine.synthesis import synthesize
 from ..models import PriceObservation
 from ..research.base_rates import get_base_rate
 from ..research.learning import cluster_weights
-from .live import _corr, current_regime, universe_signals
+from .live import (_corr, cluster_correlation, current_regime,
+                   universe_signals)
 from .snapshot import get_universe
 
 # Naive/risk-parity-style concentration heuristic: two names correlated above
@@ -127,6 +128,8 @@ def qualified_candidates(session: Session, top_n: int = 8,
                          cash: float | None = None) -> dict:
     universe = get_universe(session)
     sigs = universe_signals(session)
+    # measured once per snapshot, not per name
+    corr = cluster_correlation(session)
     regime = current_regime(session)
     rk = regime["conditioning_key"]
     br_cache = {
@@ -142,7 +145,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
     for item in universe["companies"]:
         scanned += 1
         E = evidence_from_snapshot(item, sigs, rk, br_cache)
-        synth = synthesize(E, weights=weights)
+        synth = synthesize(E, weights=weights, cluster_corr=corr)
         v = synth.verdict
         if v == "long_candidate":
             verdicts["long"] += 1

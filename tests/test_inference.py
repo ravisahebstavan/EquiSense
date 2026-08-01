@@ -294,3 +294,52 @@ def test_shrinkage_pulls_a_noisy_matrix_toward_independence():
 def test_shrinkage_degenerates_to_identity_on_no_data():
     out = shrink_correlation([[1.0, 0.8], [0.8, 1.0]], n_obs=0)
     assert out == [[1.0, 0.0], [0.0, 1.0]]
+
+
+# ----------------------------------- measured cluster correlation (wired in)
+
+def test_clamped_correlation_can_only_raise_the_null_never_lower_it():
+    """The guarantee that makes it safe to wire a MEASURED matrix into a
+    real-money decision path.
+
+    null_sd accepted cluster_corr from the start, but no production caller ever
+    supplied it, so every verdict was computed assuming the clusters are
+    independent. They are not — measured across the universe |rho| averages
+    0.20 and reaches 0.43 — and independence is the ANTI-conservative error:
+    redundant agreeing evidence reads as independent confirmation.
+
+    Correcting that must not open the opposite hole. A negative correlation
+    mathematically SHRINKS the null and so manufactures conviction, and the
+    measured negatives (to -0.41) rest on ~39 complete cases. Clamping them to
+    zero makes the correction one-directional: redundancy is always penalised,
+    diversification is never credited on a noisy estimate.
+    """
+    clusters = ["flow", "quality", "risk", "trend", "value"]
+    measured = [[1.000, -0.019, 0.433, -0.382, 0.072],
+                [-0.019, 1.000, 0.067, -0.074, 0.248],
+                [0.433, 0.067, 1.000, 0.084, -0.239],
+                [-0.382, -0.074, 0.084, 1.000, -0.406],
+                [0.072, 0.248, -0.239, -0.406, 1.000]]
+    shrunk = shrink_correlation(measured, n_obs=39)
+    clamped = [[(1.0 if i == j else max(0.0, v)) for j, v in enumerate(row)]
+               for i, row in enumerate(shrunk)]
+    corr = {"clusters": clusters, "matrix": clamped}
+
+    for subset in ([("trend", "value")], [("trend", "flow")], [("flow", "risk")],
+                   [("quality", "value")], [("trend", "quality", "risk")]):
+        counts = {c: 2 for c in subset[0]}
+        assert null_sd(counts, cluster_corr=corr) >= null_sd(counts) - 1e-12, (
+            f"{subset[0]} lowered the null — a noisy negative bought conviction")
+
+    every = {c: 2 for c in clusters}
+    assert null_sd(every, cluster_corr=corr) >= null_sd(every) - 1e-12
+
+
+def test_unclamped_negative_correlation_would_have_bought_conviction():
+    """Documents exactly what the clamp prevents, so the guard is not silently
+    removed later as a redundant line."""
+    corr = {"clusters": ["trend", "value"], "matrix": [[1.0, -0.247], [-0.247, 1.0]]}
+    counts = {"trend": 2, "value": 2}
+    assert null_sd(counts, cluster_corr=corr) < null_sd(counts)
+    ratio = null_sd(counts, cluster_corr=corr) / null_sd(counts)
+    assert ratio < 0.90, "a -0.25 correlation shrinks the null by >10%"

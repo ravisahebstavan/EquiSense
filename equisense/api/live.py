@@ -11,6 +11,7 @@ Orchestration only — all math lives in the engines.
 from __future__ import annotations
 
 import math
+from statistics import fmean
 from datetime import date
 from typing import Optional
 
@@ -74,6 +75,7 @@ def current_regime(session: Session) -> dict:
 # ------------------------------------------------- cross-sectional signals
 
 _SIG_CACHE: dict = {"key": None, "signals": None}
+_CORR_CACHE: dict = {"key": None, "corr": None}
 
 SIGNAL_KEYS = ["momentum", "dist_52w", "trend", "rel_strength", "mqi", "vol",
                "heat", "f_score", "z_score", "ccs", "fragility", "exp_gap",
@@ -102,6 +104,89 @@ def universe_signals(session: Session) -> dict[str, dict[str, Optional[float]]]:
         for k in SIGNAL_KEYS:
             out[k][t] = item["signals"].get(k)
     _SIG_CACHE.update(key=key, signals=out)
+    return out
+
+
+def cluster_correlation(session: Session) -> Optional[dict]:
+    """Measured cross-sectional correlation between the evidence CLUSTERS.
+
+    `null_sd` accepts this and has always accepted it, but nothing ever supplied
+    it, so every verdict in production was computed under the assumption that
+    the clusters are independent. They are not: measured across the universe,
+    |rho| between cluster scores averages 0.20 and reaches 0.43.
+
+    Independence is the ANTI-conservative assumption wherever clusters are
+    positively correlated — agreeing-but-redundant evidence looks like
+    independent confirmation, the null is too small and conviction too large.
+
+    Two deliberate conservatisms, because this is estimated from the few names
+    that carry every cluster (~39, against 10 free parameters):
+
+      1. Linear shrinkage toward independence, sized by that n.
+      2. NEGATIVE correlations are clamped to zero. Redundancy must always be
+         penalised, but a diversification CREDIT — which shrinks the null and
+         manufactures conviction — should not be granted on a noisy estimate.
+         Measured negatives reach -0.41 and would otherwise buy ~13% more
+         conviction in thin two-cluster cases. Same asymmetry the sizing engine
+         uses: missing or uncertain information must never enlarge a position.
+    """
+    from .snapshot import get_universe
+    from ..engine.evidence import xsec_strength
+    from ..engine.synthesis import shrink_correlation
+
+    universe = get_universe(session)
+    key = universe.get("as_of")
+    if _CORR_CACHE["key"] == key:
+        return _CORR_CACHE["corr"]
+
+    from .candidates import SIGNAL_EVIDENCE      # late: avoids an import cycle
+    sigs = universe_signals(session)
+    live_names = [c["ticker"] for c in universe["companies"]
+                  if not c.get("stale_sessions")]
+    per_cluster: dict[str, dict[str, list[float]]] = {}
+    for sig_key, _engine, _family, cluster, invert, _tmpl in SIGNAL_EVIDENCE:
+        if sig_key not in sigs:
+            continue
+        for t in live_names:
+            st = xsec_strength(sigs[sig_key], t, invert=invert)
+            if st is not None:
+                per_cluster.setdefault(cluster, {}).setdefault(t, []).append(st)
+
+    clusters = sorted(per_cluster)
+    if len(clusters) < 2:
+        _CORR_CACHE.update(key=key, corr=None)
+        return None
+    score = {c: {t: fmean(v) for t, v in per_cluster[c].items()} for c in clusters}
+    common = [t for t in live_names if all(t in score[c] for c in clusters)]
+    if len(common) < 20:            # below this the estimate is not worth using
+        _CORR_CACHE.update(key=key, corr=None)
+        return None
+
+    cols = {c: [score[c][t] for t in common] for c in clusters}
+    means = {c: fmean(cols[c]) for c in clusters}
+    dev = {c: [x - means[c] for x in cols[c]] for c in clusters}
+    ss = {c: math.sqrt(sum(d * d for d in dev[c])) for c in clusters}
+    matrix = []
+    for a in clusters:
+        row = []
+        for b in clusters:
+            if a == b:
+                row.append(1.0)
+            elif ss[a] <= 0 or ss[b] <= 0:
+                row.append(0.0)
+            else:
+                cov = sum(x * y for x, y in zip(dev[a], dev[b]))
+                row.append(cov / (ss[a] * ss[b]))
+        matrix.append(row)
+    matrix = shrink_correlation(matrix, n_obs=len(common))
+    # clamp negatives — see docstring
+    matrix = [[(1.0 if i == j else max(0.0, v)) for j, v in enumerate(row)]
+              for i, row in enumerate(matrix)]
+    out = {"clusters": clusters, "matrix": matrix, "n_obs": len(common),
+           "note": "shrunk toward independence at n=%d; negative correlations "
+                   "clamped to 0 so redundancy is penalised but diversification "
+                   "is never credited on a noisy estimate" % len(common)}
+    _CORR_CACHE.update(key=key, corr=out)
     return out
 
 
@@ -385,7 +470,7 @@ def build_dossier(session: Session, company: Company, book_value: float = 1_000_
     regime = current_regime(session)
     book = portfolio_state(session)
     evidence, ctx = build_evidence(session, company, regime["conditioning_key"], book)
-    synth = synthesize(evidence)
+    synth = synthesize(evidence, cluster_corr=cluster_correlation(session))
 
     sizing, costs = None, None
     if synth.verdict == "long_candidate" and ctx["price"] and ctx["daily_vol_pct"]:
