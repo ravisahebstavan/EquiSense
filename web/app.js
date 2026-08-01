@@ -1594,11 +1594,76 @@ async function renderIcPanel(body) {
   });
 }
 
+async function renderFactorPanel(body) {
+  const d = await api("/live/factor-portfolio");
+  if (!d.computable) {
+    body.innerHTML = `<div class="panel"><strong>Factor P&L not computed.</strong>
+      <div class="sub" style="margin-top:6px">${esc(d.reason || "")}</div>
+      <button id="fp-run" class="primary" style="margin-top:10px">Run factor studies</button></div>`;
+    const b = document.getElementById("fp-run");
+    if (b) b.addEventListener("click", async () => {
+      b.disabled = true; b.textContent = "Running…";
+      await api("/live/factor-portfolio/run", { method: "POST" });
+      renderFactorPanel(body);
+    });
+    return;
+  }
+  const rows = Object.entries(d.signals).map(([hyp, sg]) => {
+    if (!sg.computable)
+      return `<tr><td>${esc(hyp)}</td><td colspan="8" class="sub">${esc(sg.reason || "")}</td></tr>`;
+    // show the horizon with the best TRADEABLE (long-only) net return
+    let bh = null, best = null;
+    for (const [h, v] of Object.entries(sg.by_horizon)) {
+      const lo = v.long_only || {};
+      if (!lo.computable) continue;
+      if (best === null || (lo.net_annual_pct || 0) > (best.long_only.net_annual_pct || 0)) {
+        best = v; bh = h;
+      }
+    }
+    if (!best) return `<tr><td>${esc(hyp)}</td><td colspan="8" class="sub">no computable horizon</td></tr>`;
+    const lo = best.long_only, ls = best.long_short;
+    const ok = (lo.net_annual_pct || 0) > 0 && Math.abs(lo.t_stat || 0) >= 2 && !ls.tail_driven;
+    const ac = (sg.autocorrelation || {}).mean_autocorrelation;
+    return `<tr><td>${esc(hyp)}</td><td class="num">${esc(bh)}d</td>
+      <td class="num ${(lo.net_annual_pct || 0) >= 0 ? "pos" : "neg"}"><strong>${signed(lo.net_annual_pct, 2)}%</strong></td>
+      <td class="num">${signed(lo.t_stat)}</td>
+      <td class="num sub">${signed(ls.net_annual_pct, 2)}%</td>
+      <td class="num sub">${fmtN(ls.monotonicity, 2)}</td>
+      <td class="num sub">${fmtN(ls.turnover_per_rebalance, 2)}</td>
+      <td class="num sub">${fmtN(ac, 2)}</td>
+      <td style="color:${ok ? "var(--good-text)" : "var(--muted)"}">
+        ${ls.tail_driven ? "TAIL-DRIVEN" : (ok ? "tradeable" : "no edge")}</td></tr>`;
+  }).join("");
+  body.innerHTML = `
+    <div class="panel"><h3>Factor P&amp;L — what each signal actually pays</h3>
+      <div class="sub" style="margin-bottom:8px">${d.universe} names · ${d.history_days} days ·
+        quantile portfolios rebalanced monthly, net of the India statutory round trip</div>
+      <div class="tablewrap"><table><thead><tr><th>Hypothesis</th><th>Horizon</th>
+        <th>Long-only net %/yr</th><th>t</th><th>Long-short net</th><th>Monotone</th>
+        <th>Turnover</th><th>Autocorr</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">
+        <strong>Read the long-only column.</strong> Single-stock shorting is not
+        available in the NSE cash segment, so the long-short spread is a
+        factor-evaluation number, not a tradeable one. A TAIL-DRIVEN flag means the
+        mean spread and the median spread disagree — the effect lives in a few
+        extreme names rather than the typical one, and a small book cannot
+        concentrate into it.</div>
+      <div class="sub" style="margin-top:8px">${esc(d.note || "")}</div>
+      <button id="fp-rerun" style="margin-top:10px">Recompute</button></div>`;
+  const b = document.getElementById("fp-rerun");
+  if (b) b.addEventListener("click", async () => {
+    b.disabled = true; b.textContent = "Running…";
+    await api("/live/factor-portfolio/run", { method: "POST" });
+    renderFactorPanel(body);
+  });
+}
+
 /* ================================================================== lab */
 
 async function viewLab(section = "hypotheses") {
   const tabs = [["hypotheses", "Hypotheses"], ["baserates", "Base Rates"],
-                ["ic", "Signal IC"],
+                ["ic", "Signal IC"], ["factors", "Factor P&L"],
                 ["calibration", "Calibration & Ledger"], ["backtest", "Backtest"],
                 ["data", "Data Health"]];
   app.innerHTML = `
@@ -1611,6 +1676,7 @@ async function viewLab(section = "hypotheses") {
   const body = document.getElementById("lab-body");
 
   if (section === "ic") { await renderIcPanel(body); return; }
+  if (section === "factors") { await renderFactorPanel(body); return; }
 
   if (section === "hypotheses") {
     const br = await api("/live/base-rates");

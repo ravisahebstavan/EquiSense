@@ -158,3 +158,41 @@ def test_ic_endpoints_are_registered():
     paths = {r.path for r in app.routes}
     assert "/api/live/ic" in paths
     assert "/api/live/ic/run" in paths
+
+
+def test_factor_panel_is_defined_routed_and_tabbed():
+    """Same guard as the IC panel, for the same reason: a string-replace that
+    inserts the CALL but not the DEFINITION leaves a tab that throws at runtime
+    and renders a blank page with no server-side error to notice."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    assert "async function renderFactorPanel(body)" in js, "definition missing"
+    assert 'section === "factors"' in js, "route branch missing"
+    assert '"factors", "Factor P&L"' in js, "tab entry missing"
+
+
+def test_factor_panel_uses_real_helpers_and_styled_classes():
+    """A helper or CSS class that does not exist renders a blank panel silently."""
+    import re
+    from pathlib import Path
+    web = Path(__file__).resolve().parent.parent / "web"
+    js = (web / "app.js").read_text()
+    css = (web / "style.css").read_text()
+    start = js.index("async function renderFactorPanel(body)")
+    block = js[start:js.index("/* ============", start)]
+    for helper in ("fmtN", "esc", "signed", "api"):
+        assert re.search(rf"(const|function) {helper}\b", js), f"{helper} undefined"
+        # and if the block calls it, it must be the real name
+    assert "fmt(" not in block.replace("fmtN(", ""), "fmt() does not exist; it is fmtN()"
+    used = set(re.findall(r'class="([a-z0-9 _&;-]+)"', block))
+    names = {n for grp in used for n in grp.split()}
+    for n in names:
+        assert f".{n}" in css or n in ("primary", "pos", "neg"), \
+            f'CSS class "{n}" is not styled'
+
+
+def test_factor_portfolio_endpoints_are_registered():
+    from equisense.api.app import app
+    paths = {r.path for r in app.routes}
+    assert "/api/live/factor-portfolio" in paths
+    assert "/api/live/factor-portfolio/run" in paths

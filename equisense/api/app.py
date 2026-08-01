@@ -608,6 +608,42 @@ def live_ic_run(s: Session = Depends(db)):
     return out
 
 
+@app.get("/api/live/factor-portfolio")
+def live_factor_portfolio(s: Session = Depends(db)):
+    """What each factor PAYS: quantile spreads, turnover, and return net of the
+    India round trip — long-only (tradeable) alongside long-short (evaluation)."""
+    import json
+
+    from ..models import AppSnapshot
+    row = s.get(AppSnapshot, "factor_studies")
+    if row is not None:
+        try:
+            return json.loads(row.payload)
+        except Exception:                          # noqa: BLE001
+            pass
+    return {"computable": False,
+            "reason": "not yet computed — POST /api/live/factor-portfolio/run"}
+
+
+@app.post("/api/live/factor-portfolio/run")
+def live_factor_portfolio_run(s: Session = Depends(db)):
+    """Recompute and cache. A full pass over the price panel, like the IC run."""
+    import json
+    from datetime import date as _date
+
+    from ..models import AppSnapshot
+    from ..research.factor_portfolio import run_factor_studies
+    out = run_factor_studies(s)
+    row = s.get(AppSnapshot, "factor_studies")
+    if row is None:
+        row = AppSnapshot(key="factor_studies", as_of=str(_date.today()), payload="")
+        s.add(row)
+    row.payload = json.dumps(out, default=str)
+    row.as_of = str(_date.today())
+    s.commit()
+    return out
+
+
 @app.post("/api/live/studies/run")
 def live_run_studies(s: Session = Depends(db)):
     from ..research.base_rates import run_all_studies

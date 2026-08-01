@@ -356,3 +356,90 @@ def factor_autocorrelation(by_date, n_quantiles: int = DEFAULT_QUANTILES) -> dic
             else "almost no persistence — this reprices the whole universe every "
                  "rebalance and is very unlikely to survive costs"),
     }
+
+
+def run_factor_studies(session, horizons=(21, 63, 126),
+                       sampling_days: int = 21) -> dict:
+    """Quantile-portfolio evaluation of every registered feature.
+
+    Deliberately built on the SAME builders as run_ic_studies, so the two views
+    describe one object: IC says whether a factor ranks, this says what it pays.
+    Where they disagree the disagreement is informative — rank IC is blind to
+    fat tails and mean spreads are dominated by them, which is why the median
+    spread and the tail_driven flag travel with every result.
+    """
+    import pandas as pd
+
+    from .base_rates import (STUDIES, feat_max_effect,
+                             feat_sector_relative_momentum, load_price_panel,
+                             load_sector_map)
+
+    closes, volumes = load_price_panel(session)
+    if closes.empty or closes.shape[1] < MIN_NAMES_PER_DATE:
+        return {"computable": False,
+                "reason": f"need >={MIN_NAMES_PER_DATE} names with price history"}
+    sector_map = load_sector_map(session)
+    builders = {hyp: cfg["feature"] for hyp, cfg in STUDIES.items()}
+    builders["HYP-010"] = lambda c, v: feat_sector_relative_momentum(c, v, sector_map)
+    builders["HYP-011"] = feat_max_effect
+
+    month_ends = closes.index[::sampling_days]
+    results: dict[str, dict] = {}
+    for hyp, build in builders.items():
+        try:
+            feat = build(closes, volumes)
+        except Exception as exc:                       # noqa: BLE001
+            results[hyp] = {"computable": False, "reason": f"builder failed: {exc}"}
+            continue
+        if feat is None or getattr(feat, "empty", True):
+            results[hyp] = {"computable": False, "reason": "empty feature frame"}
+            continue
+        if feat.dtypes.astype(str).str.contains("bool").any():
+            results[hyp] = {"computable": False,
+                            "reason": "boolean cohort feature — no ranking to bucket"}
+            continue
+
+        by_h = {}
+        for h in horizons:
+            fwd = closes.shift(-h) / closes - 1
+            rows = []
+            for t in month_ends:
+                if t not in feat.index or t not in fwd.index:
+                    continue
+                frow, orow = feat.loc[t], fwd.loc[t]
+                # pd.notna, not `v == v` — the NA sentinel raises on self-inequality
+                sig = {k: float(v) for k, v in frow.items() if pd.notna(v)}
+                ret = {k: float(v) for k, v in orow.items() if pd.notna(v)}
+                if sig and ret:
+                    rows.append((t, sig, ret))
+            ls = factor_quantile_study(rows, h, sampling_days)
+            lo = long_only_leg(rows, h, sampling_days)
+            by_h[h] = {"long_short": ls, "long_only": lo}
+        ac_rows = []
+        for t in month_ends:
+            if t not in feat.index:
+                continue
+            frow = feat.loc[t]
+            ac_rows.append((t, {k: float(v) for k, v in frow.items()
+                                if pd.notna(v)}, {}))
+        results[hyp] = {"computable": True, "by_horizon": by_h,
+                        "autocorrelation": factor_autocorrelation(ac_rows)}
+
+    tradeable = sorted(
+        h for h, r in results.items() if r.get("computable") and any(
+            (v["long_only"].get("net_annual_pct") or 0) > 0
+            and abs(v["long_only"].get("t_stat") or 0) >= 2.0
+            and not v["long_short"].get("tail_driven", False)
+            for v in r["by_horizon"].values()))
+    return {
+        "computable": True, "signals": results,
+        "universe": int(closes.shape[1]), "history_days": int(closes.shape[0]),
+        "tradeable_long_only": tradeable,
+        "note": ("Long-only is the tradeable figure for an NSE cash account; the "
+                 "long-short spread is a factor-evaluation number requiring a "
+                 "short leg the cash segment does not offer. Excess is measured "
+                 "against the EQUAL-WEIGHTED universe, not NIFTY: the panel is "
+                 "today's index membership backfilled and returns ~12pp/yr more "
+                 "than the published NIFTY 500, so absolute levels are "
+                 "survivorship-inflated and only the excess is trustworthy."),
+    }
