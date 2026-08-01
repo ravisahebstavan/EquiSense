@@ -167,14 +167,28 @@ def account(session: Session, include_curve: bool = True) -> dict:
     if include_curve and trades:
         out["curve"] = _equity_curve(session, trades, starting_cash)
         out["benchmark"] = _nifty_counterfactual(session, trades, starting_cash)
+        # Both indices, so the size premium is visible instead of buried in the
+        # choice of benchmark. NIFTY 50 returned 10.94%/yr over the stored decade
+        # against NIFTY 500's 12.33% — measuring a ~500-name strategy against the
+        # narrow index would credit it with that gap as alpha.
+        out["benchmark_nifty50"] = _nifty_counterfactual(
+            session, trades, starting_cash, symbol="^NSEI")
         if out["benchmark"] and out["total_return_pct"] is not None:
             out["alpha_pct"] = round(out["total_return_pct"]
                                      - out["benchmark"]["total_return_pct"], 2)
+            b50 = out.get("benchmark_nifty50")
+            if b50 and b50.get("total_return_pct") is not None:
+                out["alpha_vs_nifty50_pct"] = round(
+                    out["total_return_pct"] - b50["total_return_pct"], 2)
             out["alpha_note"] = (
-                "Account return minus NIFTY with the IDENTICAL cashflows on the "
-                "identical dates — the honest alpha measure. Statistically "
-                "meaningful only after many independent decisions; until then "
-                "it is weather, not climate.")
+                "Account return minus NIFTY 500 with the IDENTICAL cashflows on "
+                "the identical dates — the honest alpha measure, benchmarked "
+                "against the universe actually being screened. The NIFTY 50 "
+                "comparison is shown alongside: it is a narrower, "
+                "cap-weighted index and beating it is easier, so quoting only "
+                "that number would flatter the strategy by roughly the size "
+                "premium. Statistically meaningful only after many independent "
+                "decisions; until then it is weather, not climate.")
     return out
 
 
@@ -216,13 +230,33 @@ def _equity_curve(session: Session, trades: list[PaperTrade],
 
 
 def _nifty_counterfactual(session: Session, trades: list[PaperTrade],
-                          starting_cash: float) -> dict | None:
-    """Same cashflows, same dates, bought NIFTY instead. The benchmark that
-    cannot be argued with."""
-    closes = dict(session.execute(
-        select(MacroObservation.obs_date, MacroObservation.close)
-        .where(MacroObservation.symbol == "^NSEI")
-        .order_by(MacroObservation.obs_date)).all())
+                          starting_cash: float,
+                          symbol: str = "^CRSLDX") -> dict | None:
+    """Same cashflows, same dates, bought the INDEX instead. The benchmark that
+    cannot be argued with.
+
+    Defaults to NIFTY 500, not NIFTY 50. The candidate screen ranks a ~500-name
+    universe, so NIFTY 50 is the wrong opportunity set: it is 50 cap-weighted
+    names that returned 10.94%/yr over the stored decade against 12.33%/yr for
+    NIFTY 500. Benchmarking a broad-universe strategy against the narrow index
+    hands it ~1.4%/yr of pure size premium and calls it alpha. Both are reported
+    so the comparison is explicit rather than assumed.
+    """
+    def load(sym):
+        return dict(session.execute(
+            select(MacroObservation.obs_date, MacroObservation.close)
+            .where(MacroObservation.symbol == sym)
+            .order_by(MacroObservation.obs_date)).all())
+
+    closes = load(symbol)
+    used = symbol
+    if not closes and symbol != "^NSEI":
+        # Degrade to the always-present index rather than dropping the benchmark
+        # entirely. Losing the comparison is worse than comparing against a
+        # narrower index, but which one was used is REPORTED, never silent —
+        # the two differ by roughly the size premium.
+        closes = load("^NSEI")
+        used = "^NSEI"
     if not closes:
         return None
     dates = sorted(closes)
@@ -254,6 +288,9 @@ def _nifty_counterfactual(session: Session, trades: list[PaperTrade],
             units -= amount / p
     p_now = closes[dates[-1]]
     equity = cash + units * p_now
+    label = {"^CRSLDX": "NIFTY 500", "^NSEI": "NIFTY 50"}.get(used, used)
     return {"equity": round(equity, 2),
             "total_return_pct": round((equity / starting_cash - 1) * 100, 2),
+            "index": label, "symbol": used,
+            "fell_back": used != symbol,
             "as_of": str(dates[-1])}

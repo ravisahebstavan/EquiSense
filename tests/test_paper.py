@@ -93,3 +93,40 @@ def test_reset(sess):
     reset_account(s, 500_000)
     a = account(s)
     assert a["cash"] == 500_000 and not a["positions"] and not a["trades"]
+
+
+def test_benchmark_falls_back_to_nifty50_and_says_so(sess):
+    """A missing NIFTY 500 series must not silently delete the benchmark — but
+    the substitution has to be visible, because the two indices differ by
+    roughly the size premium (10.94%/yr vs 12.33%/yr over the stored decade)."""
+    from equisense.api.paper import _nifty_counterfactual, place_trade
+    from equisense.models import PaperTrade
+    from sqlalchemy import select as _select
+    s, cid = sess
+    place_trade(s, cid, "buy", 100)
+    trades = s.scalars(_select(PaperTrade)).all()
+    b = _nifty_counterfactual(s, trades, 1_000_000.0, symbol="^CRSLDX")
+    assert b is not None, "benchmark must not vanish when the index is absent"
+    assert b["fell_back"] is True
+    assert b["symbol"] == "^NSEI" and b["index"] == "NIFTY 50"
+
+
+def test_benchmark_prefers_nifty500_when_present(sess):
+    """The screen ranks a ~500-name universe, so NIFTY 500 is the honest
+    opportunity set; NIFTY 50 would hand it the size premium as alpha."""
+    import datetime as dt
+
+    from equisense.api.paper import _nifty_counterfactual, place_trade
+    from equisense.models import MacroObservation, PaperTrade
+    from sqlalchemy import select as _select
+    s, cid = sess
+    place_trade(s, cid, "buy", 100)
+    for i in range(40):
+        s.add(MacroObservation(symbol="^CRSLDX", role="index",
+                               obs_date=dt.date(2024, 1, 1) + dt.timedelta(days=i),
+                               close=20000.0 + i))
+    s.commit()
+    trades = s.scalars(_select(PaperTrade)).all()
+    b = _nifty_counterfactual(s, trades, 1_000_000.0, symbol="^CRSLDX")
+    assert b["fell_back"] is False
+    assert b["index"] == "NIFTY 500"
