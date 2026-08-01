@@ -763,12 +763,27 @@ def cron_refresh(s: Session = Depends(db)):
         pruned = prune(s)
     except Exception as exc:                       # noqa: BLE001
         pruned = {"error": str(exc)[:120]}
+    # Register today's forecasts BEFORE scoring, so a claim made today is in the
+    # chain and starts its horizon now. This is the step that lets the system
+    # learn at all: calibrated probabilities, calibrated magnitudes and learned
+    # cluster weights all unlock from realised forecasts, and a forecast only
+    # exists once a dossier is registered. Previously that happened solely when
+    # a human clicked "Generate dossier", so the calibration ledger sat at zero
+    # and every weight stayed provisional indefinitely.
+    from .autopilot import register_daily_forecasts
+    try:
+        forecasts = register_daily_forecasts(s)
+    except Exception as exc:                       # noqa: BLE001 - never block the cron
+        forecasts = {"error": str(exc)[:160]}
     scored = L.score_due_claims(s)["scored"]
     checkpointed = L.score_interim_checkpoints(s)["checkpointed"]
     snap = build_universe_snapshot(s)
     from .autopilot import get_config, run_autopilot
     auto = run_autopilot(s) if get_config(s)["enabled"] else None
     return {"price_rows": prices, "macro_rows": macro,
+            "forecasts_registered": (len(forecasts.get("registered", []))
+                                     if isinstance(forecasts, dict)
+                                     and "registered" in forecasts else forecasts),
             "nse_archives": nse, "vol_surface": vol, "pruned": pruned,
             "base_rate_records": studies, "claims_scored": scored,
             "checkpoints_scored": checkpointed,

@@ -77,6 +77,61 @@ def _held_verdicts(session: Session, tickers: list[str]) -> dict[str, str]:
     return out
 
 
+def register_daily_forecasts(session: Session, top_n: int = 6) -> dict:
+    """Issue and register a dossier for the day's top candidates, traded or not.
+
+    This is what makes the system able to learn. Every gated capability here —
+    calibrated probabilities (30 scored claims), calibrated magnitudes, learned
+    cluster weights (150 per family) — unlocks from REALISED forecasts, and a
+    forecast only exists once a dossier is registered in the hash-chained
+    ledger. Until now a dossier was only ever created when a human clicked
+    "Generate dossier", so the calibration ledger sat at zero indefinitely and
+    every weight stayed provisional forever.
+
+    Registering forecasts is deliberately decoupled from TRADING. A prediction
+    the system is held to costs nothing and is the only way to find out whether
+    its verdicts are any good; waiting until capital is committed would both
+    slow the record to a trickle and bias it toward the subset that passed the
+    sizing and liquidity gates. Abstentions are registered too — chronic
+    abstention on winners is itself a measured cost.
+
+    Idempotent per day: re-running does not double-register a name.
+    """
+    from .. import ledger as L
+    from .live import build_dossier
+    from .candidates import qualified_candidates
+
+    today = date.today().isoformat()
+    already = {
+        (r.get("company") or {}).get("ticker")
+        for r in L.read_all()
+        if r.get("kind") == "dossier" and str(r.get("created_at", ""))[:10] == today
+    }
+    picks = qualified_candidates(session, top_n=top_n)
+    registered, skipped = [], []
+    for c in picks.get("candidates", [])[:top_n]:
+        if c["ticker"] in already:
+            skipped.append(c["ticker"])
+            continue
+        company = session.get(Company, c["id"])
+        if company is None:
+            continue
+        try:
+            d = build_dossier(session, company)
+        except Exception as exc:                       # noqa: BLE001 - never block the cron
+            skipped.append(f"{c['ticker']}:{type(exc).__name__}")
+            continue
+        registered.append({"ticker": c["ticker"],
+                           "verdict": d["synthesis"]["verdict"],
+                           "hash": d.get("ledger", {}).get("hash", "")[:16]})
+    return {"registered": registered, "skipped": skipped,
+            "already_today": sorted(t for t in already if t),
+            "note": ("Forecasts are registered whether or not they are traded — "
+                     "the calibration record is what unlocks learned weights, and "
+                     "tying it to executed trades would both starve it and bias "
+                     "it toward names that happened to clear the sizing gates.")}
+
+
 def run_autopilot(session: Session, force: bool = False) -> dict:
     from .candidates import qualified_candidates
     from .live import build_dossier

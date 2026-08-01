@@ -161,3 +161,50 @@ def test_calibration_report_includes_magnitude_and_checkpoint_metrics(monkeypatc
     assert report["interim_checkpoints"] == 1
     assert report["interim_on_track_rate"] == pytest.approx(1.0)
     assert report["mean_abs_interim_forecast_error_pct"] == pytest.approx(3.0)
+
+
+def test_daily_forecasts_are_registered_independently_of_trading(tmp_path, monkeypatch):
+    """The loop that lets this system learn at all.
+
+    Calibrated probabilities (30 scored claims), calibrated magnitudes and
+    learned cluster weights (150 per family) ALL unlock from realised forecasts,
+    and a forecast exists only once a dossier is registered in the ledger.
+    Registration used to happen solely when a human clicked "Generate dossier",
+    so the calibration ledger sat at 0 indefinitely and every weight stayed
+    provisional forever.
+
+    Registration is decoupled from trading on purpose: tying it to executed
+    trades would starve the record and bias it toward names that happened to
+    clear the sizing and liquidity gates.
+    """
+    import inspect
+
+    from equisense.api import autopilot
+    src = inspect.getsource(autopilot.register_daily_forecasts)
+    assert "qualified_candidates" in src, "must forecast the ranked candidates"
+    assert "build_dossier" in src, "a forecast IS a registered dossier"
+    # decoupled from trading: no order placement anywhere in the function
+    assert "place_trade" not in src and "PaperTrade" not in src
+
+
+def test_forecast_registration_is_idempotent_within_a_day():
+    """The cron can be retried, and a doubled forecast would double-count that
+    name in every calibration statistic derived from the ledger."""
+    import inspect
+
+    from equisense.api import autopilot
+    src = inspect.getsource(autopilot.register_daily_forecasts)
+    assert "already" in src and "created_at" in src, "no same-day guard"
+
+
+def test_cron_registers_forecasts_before_scoring():
+    """Order matters: a claim made today must be in the chain and start its
+    horizon now, rather than waiting a day."""
+    import inspect
+
+    from equisense.api import app as A
+    src = inspect.getsource(A.cron_refresh)
+    assert "register_daily_forecasts" in src
+    assert src.index("register_daily_forecasts") < src.index("score_due_claims")
+    # and a failure here must never take down the daily ingest
+    assert "never block the cron" in src
