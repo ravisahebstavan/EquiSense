@@ -168,3 +168,29 @@ def test_zero_variance_and_zero_volume_do_not_detonate():
     for f in (feat_gap_drift, feat_information_shock, feat_confirmed_momentum,
               feat_unconfirmed_momentum):
         f(p["close"], p["volume"], p)      # must not raise
+
+
+def test_information_hypotheses_are_registered_with_their_measured_outcomes():
+    """The registry is the system's memory of what has already been tested.
+    Recording the REFUTATIONS is the point — otherwise the same appealing idea
+    gets re-litigated every time someone rereads the momentum literature."""
+    from equisense.research.registry import REGISTRY
+    assert REGISTRY["HYP-017"]["status"] == "REFUTED"
+    assert "DRAMATICALLY WORSE" in REGISTRY["HYP-017"]["result"]
+    assert REGISTRY["HYP-020"]["status"] == "REFUTED_OUT_OF_SAMPLE"
+    assert "out-of-sample" in REGISTRY["HYP-020"]["result"].lower()
+    # the control must record that it BEAT the treatment - that is what exposed
+    # HYP-017 as a construction failure rather than an ordinary null
+    assert REGISTRY["HYP-018"]["status"] == "control"
+    assert "BEATING" in REGISTRY["HYP-018"]["result"]
+
+
+def test_information_ids_do_not_collide_with_existing_hypotheses():
+    """HYP-001..015 were already allocated; the information family starts at 016.
+    A collision silently overwrites another hypothesis's registration."""
+    from equisense.research.information import INFORMATION_STUDIES
+    from equisense.research.registry import REGISTRY
+    assert REGISTRY["HYP-015"]["name"] == "variance_risk_premium"
+    for hyp in INFORMATION_STUDIES:
+        assert int(hyp.split("-")[1]) >= 16, f"{hyp} collides with an earlier ID"
+        assert hyp in REGISTRY, f"{hyp} is built but not registered"

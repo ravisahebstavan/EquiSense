@@ -186,21 +186,21 @@ def feat_unconfirmed_momentum(closes, volumes, panel=None) -> pd.DataFrame:
 # control exactly like every price-only hypothesis. The panel is bound by the
 # caller via a closure, matching how HYP-010 binds its sector map.
 INFORMATION_STUDIES = {
-    "HYP-012": {"builder": feat_gap_drift,
+    "HYP-016": {"builder": feat_gap_drift,
                 "name": "confirmed_news_drift",
                 "statement": "Signed, volume-confirmed overnight gaps over the "
                              "last month predict the next weeks' returns "
                              "(post-announcement drift)."},
-    "HYP-013": {"builder": feat_confirmed_momentum,
+    "HYP-017": {"builder": feat_confirmed_momentum,
                 "name": "information_confirmed_momentum",
                 "statement": "Momentum agreeing with recent confirmed news "
                              "outperforms momentum generally."},
-    "HYP-014": {"builder": feat_unconfirmed_momentum,
+    "HYP-018": {"builder": feat_unconfirmed_momentum,
                 "name": "unconfirmed_momentum_control",
-                "statement": "CONTROL for HYP-013: momentum without news "
+                "statement": "CONTROL for HYP-017: momentum without news "
                              "confirmation should be weaker if the information "
                              "content is what matters."},
-    "HYP-015": {"builder": feat_information_shock,
+    "HYP-019": {"builder": feat_information_shock,
                 "name": "information_intensity",
                 "statement": "Unsigned count of confirmed news events — an "
                              "attention/uncertainty measure, not a direction."},

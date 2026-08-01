@@ -174,6 +174,81 @@ REGISTRY: dict[str, dict] = {
                 "conditioning role only if ΔBrier favors conditional.",
         "status": "registered",
     },
+    # ---- information-arrival family (measured 2026-08-01, full 500-name panel)
+    "HYP-016": {
+        "name": "confirmed_news_drift",
+        "family": "information.drift",
+        "motivation": "Post-earnings-announcement drift (Ball & Brown 1968; "
+                      "Bernard & Thomas 1989): information diffuses into prices "
+                      "over weeks, so recent confirmed news should predict the "
+                      "coming weeks' returns. Overnight gaps are the cleanest "
+                      "free proxy for news arrival.",
+        "spec": "Monthly: sum of signed overnight gaps exceeding 2 trailing SD "
+                "with volume >1.5x trailing median, over the prior 21 sessions; "
+                "forward 21/63/126d.",
+        "status": "measured_weak",
+        "result": "IC +0.007 to +0.011 (t=0.8-1.1), spread t=1.3-1.8, turnover "
+                  "0.68. Directionally present but not significant, and turnover "
+                  "consumes it: +0.7% to +2.9%/yr net. NOT tradeable as built.",
+    },
+    "HYP-017": {
+        "name": "information_confirmed_momentum",
+        "family": "information.confirmation",
+        "motivation": "A human reading the tape distinguishes a stock drifting "
+                      "up on disclosures from one drifting up on nothing. Test "
+                      "whether news confirmation strengthens momentum.",
+        "spec": "12-1 momentum retained only where the prior month's confirmed "
+                "news drift agrees in sign; neutralised otherwise.",
+        "status": "REFUTED",
+        "result": "Net +1.30%/yr at 63d against +14.79%/yr for plain momentum — "
+                  "confirmation made momentum DRAMATICALLY WORSE. Zeroing "
+                  "non-agreeing names destroys the cross-sectional ranking that "
+                  "carries the edge. The hypothesis as constructed is refuted.",
+    },
+    "HYP-018": {
+        "name": "unconfirmed_momentum_control",
+        "family": "information.confirmation",
+        "motivation": "CONTROL for HYP-017. Without it, any result for the "
+                      "confirmed variant could be a selection artefact of a "
+                      "smaller, higher-momentum universe rather than evidence "
+                      "that information content matters.",
+        "spec": "The exact complement of HYP-017.",
+        "status": "control",
+        "result": "Net +9.54%/yr at 63d, BEATING the confirmed variant's +1.30%. "
+                  "The control earning more than the treatment is what exposed "
+                  "HYP-017 as a construction failure rather than a null result.",
+    },
+    "HYP-019": {
+        "name": "information_intensity",
+        "family": "information.intensity",
+        "motivation": "Unsigned count of confirmed news events — an attention "
+                      "and uncertainty measure, not a direction.",
+        "spec": "Count of |gap| > 2 SD with volume confirmation over 21 sessions.",
+        "status": "measured_null",
+        "result": "IC -0.006 to -0.008, monotonicity ~0.0, all t < 1.2. No "
+                  "standalone directional content.",
+    },
+    "HYP-020": {
+        "name": "momentum_within_high_information_universe",
+        "family": "information.conditioning",
+        "motivation": "HYP-017 failed by zeroing names. The correct form of the "
+                      "same idea: use information intensity to select the "
+                      "UNIVERSE, then rank momentum within it, preserving the "
+                      "cross-sectional ordering.",
+        "spec": "Restrict to names with >=2 confirmed news events in the prior "
+                "month; rank 12-1 momentum within that subset.",
+        "status": "REFUTED_OUT_OF_SAMPLE",
+        "result": "IN-SAMPLE it looked outstanding: IC +0.093 vs +0.067 for the "
+                  "full universe, spread t=4.08, monotone, +25.9%/yr net even "
+                  "after 0.87 turnover, and robust to a 10x cost assumption "
+                  "(+12%/yr at a 2.22% round trip). OUT OF SAMPLE the entire "
+                  "advantage disappears: walk-forward OOS IC +0.060 against "
+                  "+0.062 for plain momentum on all names. The in-sample edge "
+                  "was the product of searching three universe constructions "
+                  "(all / quiet / noisy). Do NOT trade this in preference to "
+                  "plain momentum: it carries 4x the turnover for no "
+                  "out-of-sample gain.",
+    },
     "HYP-001": {
         "name": "momentum_12_1_top_quintile",
         "family": "technical.trend",
