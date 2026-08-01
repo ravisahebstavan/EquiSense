@@ -340,7 +340,7 @@ def ic_weights(ic_by_signal: dict[str, dict],
 # --------------------------------------------------------------- study runner
 
 def run_ic_studies(session, horizons: Sequence[int] = (21, 63, 126),
-                   sampling_days: int = 21) -> dict:
+                   sampling_days: int = 21, panel=None) -> dict:
     """IC for every registered feature against the platform's own price history.
 
     Reuses the SAME feature builders the base-rate studies use, so a signal
@@ -354,7 +354,10 @@ def run_ic_studies(session, horizons: Sequence[int] = (21, 63, 126),
                              feat_sector_relative_momentum, load_price_panel,
                              load_sector_map)
 
-    closes, volumes = load_price_panel(session)
+    # `panel` lets a caller running several studies load the price panel ONCE
+    # and share it. Each load is a full table read; the CLI runs three studies
+    # back to back and paid for it three times.
+    closes, volumes = load_price_panel(session) if panel is None else panel
     if closes.empty or closes.shape[1] < MIN_NAMES_PER_DATE:
         return {"computable": False,
                 "reason": f"need ≥{MIN_NAMES_PER_DATE} names with price history"}

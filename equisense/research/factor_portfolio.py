@@ -359,7 +359,7 @@ def factor_autocorrelation(by_date, n_quantiles: int = DEFAULT_QUANTILES) -> dic
 
 
 def run_factor_studies(session, horizons=(21, 63, 126),
-                       sampling_days: int = 21) -> dict:
+                       sampling_days: int = 21, panel=None) -> dict:
     """Quantile-portfolio evaluation of every registered feature.
 
     Deliberately built on the SAME builders as run_ic_studies, so the two views
@@ -374,7 +374,8 @@ def run_factor_studies(session, horizons=(21, 63, 126),
                              feat_sector_relative_momentum, load_price_panel,
                              load_sector_map)
 
-    closes, volumes = load_price_panel(session)
+    # see run_ic_studies: `panel` shares one load across several studies
+    closes, volumes = load_price_panel(session) if panel is None else panel
     if closes.empty or closes.shape[1] < MIN_NAMES_PER_DATE:
         return {"computable": False,
                 "reason": f"need >={MIN_NAMES_PER_DATE} names with price history"}

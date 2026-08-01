@@ -324,8 +324,9 @@ def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
     return results
 
 
-def run_all_studies(session: Session) -> dict:
-    closes, volumes = load_price_panel(session)
+def run_all_studies(session: Session, panel=None) -> dict:
+    # see run_ic_studies: `panel` shares one load across several studies
+    closes, volumes = load_price_panel(session) if panel is None else panel
     nifty = load_nifty(session)
     regimes = pd.Series(regime_series(nifty.tolist()), index=nifty.index)
     regimes = regimes.reindex(closes.index, method="ffill").fillna("unknown")
