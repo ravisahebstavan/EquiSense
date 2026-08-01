@@ -9,6 +9,7 @@ import datetime as dt
 import pytest
 
 from equisense.research.factor_portfolio import (DEFAULT_QUANTILES,
+                                                 long_only_leg,
                                                  _quantile_buckets,
                                                  factor_autocorrelation,
                                                  factor_quantile_study)
@@ -185,3 +186,48 @@ def test_a_broad_effect_is_not_flagged_as_tail_driven():
     assert r["spread_mean_pct"] > 0
     assert r["tail_driven"] is False
     assert "MEDIAN spread" not in r["verdict"]
+
+
+def test_long_only_leg_is_smaller_than_the_long_short_spread():
+    """Single-stock shorting is unavailable in the NSE cash segment, so the
+    spread is a factor-evaluation number and the long leg is the tradeable one.
+    Measured on the real panel the long leg is worth 56-78% of the spread."""
+    rows = []
+    for k, d in enumerate(_dates(40)):
+        # rotate the ranking so the baskets actually turn over and a cost exists
+        values = {f"S{i}": float((i + k * 3) % 50) for i in range(50)}
+        forwards = {f"S{i}": (values[f"S{i}"] - 24.5) * 0.001 for i in range(50)}
+        rows.append((d, values, forwards))
+    ls = factor_quantile_study(rows, horizon_days=21, sampling_days=21)
+    lo = long_only_leg(rows, horizon_days=21, sampling_days=21)
+    assert ls["cost_annual_pct"] > 0, "the setup must generate turnover"
+    assert lo["computable"]
+    assert 0 < lo["net_annual_pct"] < ls["net_annual_pct"]
+    # one basket trades, not two, so the long-only cost must be the smaller
+    assert lo["cost_annual_pct"] < ls["cost_annual_pct"]
+
+
+def test_long_only_caveat_states_the_benchmark_and_survivorship_traps():
+    """Both traps are silent and both inflate the headline. Quoting excess over
+    NIFTY instead of the equal-weighted universe would credit the factor with
+    ~13pp/yr of pure size beta, and the panel's absolute returns are
+    survivorship-inflated because it is today's membership backfilled. The
+    caveat travels with the number so the two cannot be separated."""
+    rows = [(d, {f"S{i}": float(i) for i in range(50)},
+             {f"S{i}": i / 1000.0 for i in range(50)}) for d in _dates(40)]
+    c = long_only_leg(rows, horizon_days=21)["caveat"].lower()
+    assert "equal-weighted" in c and "nifty" in c
+    assert "survivorship" in c
+    assert "size beta" in c or "not momentum alpha" in c
+
+
+def test_broad_indices_are_configured_as_benchmarks():
+    """Every factor result was being benchmarked against an equal-weighted
+    basket rebuilt from TODAY'S index membership. Measured against the published
+    NIFTY 500 that basket returns +12.34%/yr too much — survivorship plus
+    equal-weighting. The published series contain the names that fell out, so
+    they turn the bias from a caveat into a measurement."""
+    from equisense.ingestion.universe import MACRO_SERIES
+    for sym in ("^CRSLDX", "^CNX100", "^NSEMDCP50", "NIFTYSMLCAP250.NS"):
+        assert sym in MACRO_SERIES, f"{sym} missing from MACRO_SERIES"
+    assert MACRO_SERIES["^CRSLDX"][0] == "NIFTY 500"

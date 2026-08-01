@@ -71,6 +71,19 @@ MACRO_SERIES = {
     # the realised-vol side of its variance premium has nothing to compare
     # against, leaving half that study untestable for years.
     "^NSEBANK":  ("NIFTY Bank", "index"),
+    # Broad and size-segment indices, added because every factor result here was
+    # being benchmarked against an EQUAL-WEIGHTED basket rebuilt from today's
+    # index membership — which is survivorship-inflated, since names that fell
+    # out of the index over the decade are absent from the panel. These are
+    # published index series: they include the names that failed, so the gap
+    # between them and the reconstructed basket MEASURES the bias instead of
+    # leaving it as a caveat. ^CRSLDX is also the correct benchmark for a
+    # Nifty-500 universe; NIFTY 50 is a 50-name cap-weighted index and using it
+    # credits any broad strategy with a size premium it did not earn.
+    "^CRSLDX":   ("NIFTY 500", "index"),
+    "^CNX100":   ("NIFTY 100", "index"),
+    "^NSEMDCP50": ("NIFTY Midcap 50", "index"),
+    "NIFTYSMLCAP250.NS": ("NIFTY Smallcap 250", "index"),
     "^INDIAVIX": ("India VIX", "vix"),
     "INR=X":     ("USD/INR", "currency"),
     "BZ=F":      ("Brent Crude", "commodity"),

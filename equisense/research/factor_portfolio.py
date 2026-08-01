@@ -227,6 +227,103 @@ def _verdict(mean_spread, t_stat, mono, net_annual, gross_annual,
     return "; ".join(parts)
 
 
+def long_only_leg(by_date, horizon_days: int, sampling_days: int = 21,
+                  n_quantiles: int = DEFAULT_QUANTILES,
+                  round_trip_cost: float = ROUND_TRIP_STATUTORY) -> dict:
+    """What a LONG-ONLY Indian cash book actually earns from this factor.
+
+    The long-short spread is the right way to EVALUATE a factor and the wrong
+    number to trade on here: single-stock shorting is not available in the NSE
+    cash segment, so the short leg is unreachable. What is reachable is the top
+    quantile held against the universe. Measured on this panel that leg is worth
+    56-78% of the long-short figure depending on the factor (momentum 12-1: 65%
+    at 63d), so the tradeable number is materially smaller than the spread but
+    not the "less than half" the textbook framing would suggest — worth stating
+    as a measurement rather than an assumption, because it is the number the
+    account actually earns.
+
+    Costs are charged ONE-sided (one basket, not two), which is the only thing
+    that goes in the trader's favour here.
+    """
+    dates, excess, buckets_seq, med_excess = [], [], [], []
+    for dt, values, forwards in sorted(by_date, key=lambda r: r[0]):
+        common = {n: v for n, v in values.items()
+                  if n in forwards and v is not None and v == v
+                  and forwards[n] is not None and forwards[n] == forwards[n]}
+        if len(common) < MIN_NAMES_PER_DATE:
+            continue
+        buckets = _quantile_buckets(common, n_quantiles)
+        if buckets is None:
+            continue
+        top = [forwards[t] for t in buckets[n_quantiles]]
+        universe = [forwards[t] for t in common]
+        # equal-weighted universe return is the benchmark a retail book is
+        # realistically choosing between: this factor, or simply owning the lot
+        bench_mean, bench_med = _mean(universe), _median(universe)
+        t_mean, t_med = _mean(top), _median(top)
+        if None in (bench_mean, t_mean):
+            continue
+        dates.append(dt)
+        excess.append(t_mean - bench_mean)
+        med_excess.append((t_med or 0.0) - (bench_med or 0.0))
+        buckets_seq.append(buckets)
+
+    if len(dates) < MIN_DATES:
+        return {"computable": False,
+                "reason": f"only {len(dates)} usable dates, need >={MIN_DATES}"}
+
+    n = len(excess)
+    mean_ex = sum(excess) / n
+    lag = max(0, horizon_days // sampling_days - 1)
+    se = newey_west_se(excess, lags=lag)
+    t_stat = (mean_ex / se) if (se and se > 0) else None
+
+    turns = []
+    for prev, cur in zip(buckets_seq, buckets_seq[1:]):
+        a, b = set(prev[n_quantiles]), set(cur[n_quantiles])
+        if b:
+            turns.append(1.0 - len(a & b) / len(b))
+    turnover = _mean(turns) or 0.0
+    k = max(1, horizon_days // sampling_days)
+    eff_turn = turnover / k
+
+    periods_per_year = 252.0 / horizon_days
+    rebalances_per_year = 252.0 / sampling_days
+    gross = mean_ex * periods_per_year * 100.0
+    # ONE basket trades, so no factor of 2
+    cost = eff_turn * round_trip_cost * rebalances_per_year * 100.0
+    return {
+        "computable": True, "horizon_days": horizon_days, "dates": n,
+        "excess_mean_pct": round(mean_ex * 100, 4),
+        "excess_median_pct": round((_mean(med_excess) or 0.0) * 100, 4),
+        "t_stat": None if t_stat is None else round(t_stat, 3),
+        "hit_rate": round(sum(1 for e in excess if e > 0) / n, 4),
+        "turnover_per_rebalance": round(turnover, 4),
+        "gross_annual_pct": round(gross, 3),
+        "cost_annual_pct": round(cost, 3),
+        "net_annual_pct": round(gross - cost, 3),
+        "benchmark": "equal-weighted universe",
+        "caveat":
+            "Excess over an EQUAL-WEIGHTED UNIVERSE, long-only, one-sided costs. "
+            "This is the tradeable figure for an NSE cash account; the long-short "
+            "spread reported alongside is a factor-evaluation number requiring a "
+            "short leg the cash segment does not offer. "
+            "The benchmark choice is not cosmetic. Measured on this panel the "
+            "equal-weighted universe returned ~24.9%/yr while NIFTY returned "
+            "~11.7%/yr, so quoting excess over NIFTY would credit this factor "
+            "with ~23%/yr when roughly 13pp of that is simply owning Indian "
+            "mid/small caps through a decade in which they ran hard — size beta, "
+            "not momentum alpha. "
+            "The absolute returns are additionally survivorship-inflated: the "
+            "panel is TODAY'S index membership backfilled, and only one departed "
+            "constituent is retained, so names that fell out over the decade are "
+            "largely absent. The EXCESS is far more trustworthy than either "
+            "absolute leg, because the top quantile and the benchmark are drawn "
+            "from the same biased set and the bias largely cancels in the "
+            "difference. Read the excess; do not read the level.",
+    }
+
+
 def factor_autocorrelation(by_date, n_quantiles: int = DEFAULT_QUANTILES) -> dict:
     """Rank autocorrelation of the factor between consecutive rebalances.
 
