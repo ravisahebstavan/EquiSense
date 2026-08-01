@@ -225,20 +225,61 @@ def test_universe_snapshot_is_not_refetched_within_a_request(db):
     assert again is first, "the payload was parsed again"
 
 
-def test_new_prices_invalidate_the_snapshot_cache(db):
-    """Keyed on the latest price date, so an ingest invalidates it immediately.
-    A plain time-based cache could serve a snapshot that no longer matches the
-    prices underneath it."""
+def test_new_prices_are_picked_up_once_the_freshness_probe_expires(db):
+    """The cache key is the latest price date, so an ingest changes it — but the
+    probe that reads that date is throttled, so the pickup is bounded by
+    FRESHNESS_PROBE_TTL_S rather than instant. That is the deliberate trade: 11
+    `max(obs_date)` round trips per page load cost 2.75s, and prices change at
+    most once a day. Anything that writes prices in-process invalidates
+    explicitly (see the refresh endpoint), so the delay only ever applies to an
+    external writer such as the ingest CLI."""
     import datetime as dt
 
     import equisense.models as M
     from equisense.api import snapshot as S
     _seed(db, {f"N{i}": 0 for i in range(12)})
-    S._UNIVERSE_CACHE.update(key=None, snap=None)
+    S.invalidate_universe_cache()
     first = S.get_universe(db)
+
     cid = db.query(M.Company).filter_by(ticker="N0").one().id
     newest = max(p.obs_date for p in db.query(M.PriceObservation).all())
     db.add(M.PriceObservation(company_id=cid, obs_date=newest + dt.timedelta(days=1),
                               close=999.0, close_raw=999.0, volume=1))
     db.commit()
-    assert S.get_universe(db) is not first, "stale snapshot served after an ingest"
+
+    # within the probe window the cached snapshot is still served
+    assert S.get_universe(db) is first
+
+    # once the probe expires the new price date changes the key and it rebuilds
+    S._UNIVERSE_CACHE["checked_at"] = 0.0
+    assert S.get_universe(db) is not first, "stale snapshot survived the TTL"
+
+
+def test_freshness_probe_is_throttled_but_a_rebuild_invalidates_immediately(db):
+    """The snapshot cache stopped the payload being re-parsed, but
+    `SELECT max(obs_date)` still ran on EVERY call to compute the cache key —
+    11 round trips on one page load, 2.75s of pure latency. Throttled, because
+    prices change at most once a day. The throttle is only safe if a rebuild or
+    an ingest drops it, or the refresh button appears to do nothing."""
+    from equisense.api import snapshot as S
+    _seed(db, {f"N{i}": 0 for i in range(12)})
+    S.invalidate_universe_cache()
+
+    first = S.get_universe(db)
+    assert S.get_universe(db) is first          # served from cache
+
+    rebuilt = S.build_universe_snapshot(db)
+    assert S.get_universe(db) is rebuilt, (
+        "a rebuild must be visible immediately, not after the TTL")
+
+    S.invalidate_universe_cache()
+    assert S._UNIVERSE_CACHE["snap"] is None
+
+
+def test_refresh_endpoint_invalidates_the_universe_cache():
+    import inspect
+
+    from equisense.api import app as A
+    src = inspect.getsource(A)
+    assert "invalidate_universe_cache()" in src, (
+        "refresh_quotes lands new bars but leaves a stale cached snapshot")

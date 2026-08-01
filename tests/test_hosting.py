@@ -275,3 +275,53 @@ def test_company_page_shows_delivery_percentage():
     assert "async function renderDeliveryPanel(host, ticker)" in js
     assert "/markets/delivery/" in js
     assert "renderDeliveryPanel(slot" in js, "defined but never called"
+
+
+def test_dashboard_does_not_ship_sparklines_it_cannot_draw():
+    """The payload carried all 395 companies WITH 40-point sparklines — 471 KB
+    to render 8 rows, a quarter of it arrays the view discards. The full ranking
+    still ships (it is cheap and callers count on it); only the price history is
+    limited to rows that can display one."""
+    import inspect
+
+    from equisense.api import services
+    src = inspect.getsource(services.dashboard)
+    assert "top: int" in src, "no bound on how many sparklines are serialised"
+    assert 'r["spark"] = []' in src
+
+
+def test_dashboard_still_returns_the_full_ranking():
+    """Trimming the sparklines must not trim the ranking — counts and any
+    future view depend on the complete list."""
+    import inspect
+
+    from equisense.api import services
+    src = inspect.getsource(services.dashboard)
+    assert '"ranked": ranked[' not in src, "the ranking itself was truncated"
+
+
+def test_status_does_not_walk_the_hash_chain_by_default():
+    """Chain verification is O(n) BY DESIGN — it re-hashes every record from
+    genesis, and that is the feature (caching it on ledger metadata silently
+    defeated tamper detection when tried). It just does not belong on every page
+    load: it cost 5.8s of pure Python. Skipped by default, offered explicitly —
+    the fix the ledger module's own docstring prescribes."""
+    import inspect
+
+    from equisense.api import status
+    src = inspect.getsource(status.data_status)
+    assert "verify_ledger" in src
+    assert "record_count()" in src, "must report size without re-hashing"
+
+    from equisense import ledger
+    cnt = inspect.getsource(ledger.record_count)
+    assert "read_all" not in cnt, "record_count must not read the payloads"
+
+
+def test_status_still_verifies_when_asked():
+    import inspect
+
+    from equisense.api import status
+    src = inspect.getsource(status.data_status)
+    assert "ledger.verify_chain()" in src, "explicit verification path removed"
+    assert "LEDGER CHAIN BROKEN" in src

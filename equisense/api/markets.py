@@ -552,34 +552,53 @@ def relationships(session: Session, lookback: int = 900,
     from ..engine import crossasset as CA
     from ..models import MacroObservation
 
-    def macro_returns(sym: str) -> dict:
-        rows = session.execute(
-            select(MacroObservation.obs_date, MacroObservation.close)
-            .where(MacroObservation.symbol == sym)
-            .order_by(MacroObservation.obs_date.desc()).limit(lookback)).all()
-        return CA.returns_from_dated_closes(rows)
+    # Batched, not per-symbol. This ran one query per macro series and TWO per
+    # held ticker (an id lookup, then its prices) — 19 round trips for a single
+    # page. Over a network database each round trip is a few hundred
+    # milliseconds, so the query COUNT, not the data volume, was the latency.
+    MACRO = {"NIFTY": "^NSEI", "USDINR": "INR=X", "BRENT": "BZ=F",
+             "GOLD": "GC=F", "SP500": "^GSPC"}
+    macro_rows: dict[str, list] = {}
+    for sym, d, c in session.execute(
+            select(MacroObservation.symbol, MacroObservation.obs_date,
+                   MacroObservation.close)
+            .where(MacroObservation.symbol.in_(list(MACRO.values())))
+            .order_by(MacroObservation.symbol,
+                      MacroObservation.obs_date.desc())).all():
+        bucket = macro_rows.setdefault(sym, [])
+        if len(bucket) < lookback:
+            bucket.append((d, c))
+    dated = {label: CA.returns_from_dated_closes(macro_rows.get(sym, []))
+             for label, sym in MACRO.items()}
 
-    def equity_returns(ticker: str) -> dict:
-        cid = session.scalar(select(Company.id).where(Company.ticker == ticker))
-        if cid is None:
+    def equity_returns_batch(tickers: list[str]) -> dict[str, dict]:
+        if not tickers:
             return {}
-        rows = session.execute(
-            select(PriceObservation.obs_date, PriceObservation.close)
-            .where(PriceObservation.company_id == cid)
-            .order_by(PriceObservation.obs_date.desc()).limit(lookback)).all()
-        return CA.returns_from_dated_closes(rows)
-
-    dated = {"NIFTY": macro_returns("^NSEI"), "USDINR": macro_returns("INR=X"),
-             "BRENT": macro_returns("BZ=F"), "GOLD": macro_returns("GC=F"),
-             "SP500": macro_returns("^GSPC")}
+        ids = dict(session.execute(
+            select(Company.ticker, Company.id)
+            .where(Company.ticker.in_(tickers))).all())
+        if not ids:
+            return {}
+        by_cid: dict[int, list] = {}
+        for cid, d, c in session.execute(
+                select(PriceObservation.company_id, PriceObservation.obs_date,
+                       PriceObservation.close)
+                .where(PriceObservation.company_id.in_(list(ids.values())))
+                .order_by(PriceObservation.company_id,
+                          PriceObservation.obs_date.desc())).all():
+            bucket = by_cid.setdefault(cid, [])
+            if len(bucket) < lookback:
+                bucket.append((d, c))
+        return {t: CA.returns_from_dated_closes(by_cid.get(cid, []))
+                for t, cid in ids.items()}
     held = [t for t in (extra_tickers or []) if t]
     if not held:
         from .live import portfolio_state
         book = portfolio_state(session)
-        for cid in (book.get("weights") or {}):
-            t = session.scalar(select(Company.ticker).where(Company.id == cid))
-            if t:
-                held.append(t)
+        wids = list(book.get("weights") or {})
+        if wids:
+            held.extend(t for (t,) in session.execute(
+                select(Company.ticker).where(Company.id.in_(wids))).all())
     if not held:
         # No book: fall back to the most LIQUID current constituents rather than
         # an arbitrary slice. `limit(N)` without an order returns whatever the
@@ -595,8 +614,9 @@ def relationships(session: Session, lookback: int = 900,
                 select(Company.ticker)
                 .where(Company.is_index_member == True)
                 .order_by(Company.ticker).limit(6)).all())  # noqa: E712
+    eq = equity_returns_batch(held[:12])
     for t in held[:12]:
-        r = equity_returns(t)
+        r = eq.get(t) or {}
         if r:
             dated[t] = r
 

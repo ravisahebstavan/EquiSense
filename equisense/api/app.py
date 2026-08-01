@@ -314,6 +314,11 @@ def live_quotes(s: Session = Depends(db)):
     from ..ingestion.yahoo import market_open_ist, refresh_quotes, sync_universe
     ids = sync_universe(s)
     result = refresh_quotes(s, ids)
+    # New bars landed, so the cached snapshot and its freshness probe are both
+    # stale. Without this the refresh button could appear to do nothing for up
+    # to FRESHNESS_PROBE_TTL_S.
+    from .snapshot import invalidate_universe_cache
+    invalidate_universe_cache()
     result["market"] = market_open_ist()
     return result
 
@@ -699,10 +704,15 @@ def live_vault():
 
 
 @app.get("/api/live/status")
-def live_status(s: Session = Depends(db)):
-    """Data-trust surface: freshness, coverage, quality score, warnings."""
+def live_status(s: Session = Depends(db), verify_ledger: bool = False):
+    """Data-trust surface: freshness, coverage, quality score, warnings.
+
+    `verify_ledger` walks the hash chain, which is an O(n) re-hash from genesis
+    and cost 5.8s of pure Python on every page load when it was unconditional.
+    Off by default; the Data Health panel offers it as an explicit action.
+    """
     from .status import data_status
-    return data_status(s)
+    return data_status(s, verify_ledger=verify_ledger)
 
 
 @app.get("/api/live/refresh/stream")

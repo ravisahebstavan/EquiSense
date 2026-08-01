@@ -292,6 +292,11 @@ def build_universe_snapshot(session: Session) -> dict:
     row.as_of = snap["as_of"]
     row.payload = json.dumps(snap)
     session.commit()
+    # Rebuilding IS the invalidation: any caller that just rebuilt must see its
+    # own result, not a cached predecessor.
+    import time as _time
+    _UNIVERSE_CACHE.update(key=(snap["as_of"], SNAP_VERSION), snap=snap,
+                           checked_at=_time.time())
     return snap
 
 
@@ -302,23 +307,43 @@ def build_universe_snapshot(session: Session) -> dict:
 # latest price date AND the schema version, so an ingest or a version bump
 # invalidates it immediately; a plain time-based cache could serve a snapshot
 # that no longer matches the prices underneath it.
-_UNIVERSE_CACHE: dict = {"key": None, "snap": None}
+_UNIVERSE_CACHE: dict = {"key": None, "snap": None, "checked_at": 0.0}
+
+# How long the freshness probe itself may be trusted. The cache above stopped
+# the payload being re-parsed, but `SELECT max(obs_date)` still ran on EVERY
+# call to compute the cache key — 11 round trips on one page load, 2.75s of
+# pure latency. Prices change at most once a day and the refresh pipeline
+# rebuilds the snapshot explicitly, so re-probing more than once every few
+# seconds buys nothing.
+FRESHNESS_PROBE_TTL_S = 15.0
+
+
+def invalidate_universe_cache() -> None:
+    """Drop the cached snapshot. Called after an ingest so a refresh is visible
+    immediately rather than up to FRESHNESS_PROBE_TTL_S later."""
+    _UNIVERSE_CACHE.update(key=None, snap=None, checked_at=0.0)
 
 
 def get_universe(session: Session, allow_rebuild: bool = True) -> dict:
     """Single-row read; rebuilds only when prices are newer than the snapshot."""
+    import time as _time
+    if (_UNIVERSE_CACHE["snap"] is not None
+            and _time.time() - _UNIVERSE_CACHE["checked_at"] < FRESHNESS_PROBE_TTL_S):
+        return _UNIVERSE_CACHE["snap"]
     latest = session.scalar(select(func.max(PriceObservation.obs_date)))
     ckey = (str(latest), SNAP_VERSION)
     if _UNIVERSE_CACHE["key"] == ckey and _UNIVERSE_CACHE["snap"] is not None:
+        _UNIVERSE_CACHE["checked_at"] = _time.time()
         return _UNIVERSE_CACHE["snap"]
     row = session.get(AppSnapshot, UNIVERSE_KEY)
     if row is not None and (latest is None or row.as_of >= str(latest)):
         snap = json.loads(row.payload)
         if snap.get("version") == SNAP_VERSION:
-            _UNIVERSE_CACHE.update(key=ckey, snap=snap)
+            _UNIVERSE_CACHE.update(key=ckey, snap=snap, checked_at=_time.time())
             return snap
     if not allow_rebuild:
         return json.loads(row.payload) if row else {"as_of": None, "companies": []}
     snap = build_universe_snapshot(session)
-    _UNIVERSE_CACHE.update(key=(str(latest), SNAP_VERSION), snap=snap)
+    _UNIVERSE_CACHE.update(key=(str(latest), SNAP_VERSION), snap=snap,
+                           checked_at=_time.time())
     return snap

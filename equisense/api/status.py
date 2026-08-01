@@ -40,16 +40,24 @@ def per_company_staleness(session: Session, max_lag_days: int = STALE_PRICE_DAYS
     return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
-def data_status(session: Session) -> dict:
+def data_status(session: Session, verify_ledger: bool = False) -> dict:
     today = date.today()
     warnings: list[str] = []
 
-    n_companies = session.scalar(select(func.count(Company.id)))
-    n_prices = session.scalar(select(func.count(PriceObservation.id)))
-    latest_price = session.scalar(select(func.max(PriceObservation.obs_date)))
-    earliest_price = session.scalar(select(func.min(PriceObservation.obs_date)))
-    null_vol = session.scalar(select(func.count(PriceObservation.id))
-                              .where(PriceObservation.volume.is_(None)))
+    # ONE round trip for five aggregates. Each of these was a separate query,
+    # and this endpoint issued 19 in total — none individually slow, but a
+    # network database charges a few hundred milliseconds per ROUND TRIP, so the
+    # query count was the latency. Scalar subqueries collapse them into a single
+    # statement without changing a single number.
+    n_companies, n_prices, latest_price, earliest_price, null_vol = session.execute(
+        select(
+            select(func.count(Company.id)).scalar_subquery(),
+            select(func.count(PriceObservation.id)).scalar_subquery(),
+            select(func.max(PriceObservation.obs_date)).scalar_subquery(),
+            select(func.min(PriceObservation.obs_date)).scalar_subquery(),
+            select(func.count(PriceObservation.id))
+            .where(PriceObservation.volume.is_(None)).scalar_subquery(),
+        )).one()
     price_stale = (today - latest_price).days if latest_price else None
     if price_stale is None:
         warnings.append("no price data ingested")
@@ -101,9 +109,21 @@ def data_status(session: Session) -> dict:
 
     from ..ingestion.vault import vault_stats
     vault = vault_stats()
-    chain = ledger.verify_chain()
-    if not chain.get("intact", False) and chain.get("records", 0) != 0:
-        warnings.append("LEDGER CHAIN BROKEN — investigate immediately")
+    # Chain verification is O(n) BY DESIGN — it re-hashes every record from
+    # genesis, and that is the feature, not an inefficiency to cache away
+    # (caching it on ledger metadata silently defeated tamper detection when
+    # tried). But it does not belong on every page load: it cost 5.8s of pure
+    # Python here. Skipped by default and offered explicitly instead, which is
+    # the fix the ledger module's own docstring prescribes.
+    if verify_ledger:
+        chain = ledger.verify_chain()
+        if not chain.get("intact", False) and chain.get("records", 0) != 0:
+            warnings.append("LEDGER CHAIN BROKEN — investigate immediately")
+    else:
+        chain = {"verified": False,
+                 "records": ledger.record_count(),
+                 "note": "hash chain not walked on this request — it is an O(n) "
+                         "re-hash from genesis. Verify explicitly to check it."}
 
     # Quality score: decomposed, never a mystery number (Phase III rule)
     comp = {

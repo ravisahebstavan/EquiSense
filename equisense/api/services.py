@@ -445,7 +445,8 @@ def signals_from_snapshot(item: dict) -> pers.CompanySignals:
         implied_growth_gap_pct=s.get("implied_growth_gap_pct"))
 
 
-def dashboard(session: Session, profile: pers.InvestorProfile) -> dict:
+def dashboard(session: Session, profile: pers.InvestorProfile,
+              top: int = 40) -> dict:
     """Snapshot-backed: one row fetch + three small queries — serverless-fast
     (the naive per-company version cost 40s over network Postgres)."""
     from .snapshot import get_universe
@@ -476,6 +477,13 @@ def dashboard(session: Session, profile: pers.InvestorProfile) -> dict:
                         "implied_growth_gap_pct": s.get("implied_growth_gap_pct")},
         })
     ranked.sort(key=lambda r: -r["priority"]["score"])
+    # The view renders a handful of rows but the payload shipped all 395 WITH
+    # their 40-point sparklines: 471 KB to draw 8 rows, a quarter of it
+    # sparkline arrays that were discarded. The full ranking is still returned —
+    # it is cheap and callers count on it — but the price history rides along
+    # only for the rows that can actually display one.
+    for r in ranked[max(0, top):]:
+        r["spark"] = []
 
     today = date.today()
     reviews_due = []

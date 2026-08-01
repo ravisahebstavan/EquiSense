@@ -63,6 +63,22 @@ def read_all() -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+def record_count() -> int:
+    """How many records exist, WITHOUT reading or re-hashing them.
+
+    The status page wants the size of the ledger, not proof of its integrity;
+    conflating the two made every page load pay for a full O(n) verification.
+    """
+    if STORAGE == "db":
+        from sqlalchemy import func, select
+        with get_session() as s:
+            return int(s.scalar(select(func.count(LedgerRecord.seq))) or 0)
+    if not LEDGER_PATH.exists():
+        return 0
+    with LEDGER_PATH.open() as f:
+        return sum(1 for line in f if line.strip())
+
+
 def verify_chain(records: list[dict] | None = None) -> dict:
     """Recompute the hash chain; any edit to any historical line breaks it.
 
