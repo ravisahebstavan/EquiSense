@@ -212,12 +212,31 @@ def qualified_candidates(session: Session, top_n: int = 8,
         "max_effect": get_base_rate(session, "low_max_effect_top_quintile", 63, rk),
     }
     weights, weights_status = cluster_weights()
+    # Scored-claim count, read ONCE. synthesize() otherwise reads the entire
+    # ledger per name: 396 full reads on a 395-name scan, 361 of this
+    # endpoint's 668 seconds.
+    from ..research.learning import _scored_pairs
+    from .. import ledger as _ledger
+    try:
+        scored_n = len(_scored_pairs(_ledger.read_all()))
+    except Exception:                                  # noqa: BLE001
+        scored_n = 0
+
+    # Release the read transaction before the scan. Everything above is a read,
+    # and the loop below is minutes of pure Python over the whole universe, so
+    # the transaction those reads opened would sit idle the entire time —
+    # Postgres terminates it, and _apply_diversification_gate's price query at
+    # the end then dies with IdleInTransactionSessionTimeout. Measured: this
+    # endpoint failed after 440s against Neon while passing every SQLite test,
+    # because SQLite has no connection to lose.
+    session.rollback()
 
     scanned, candidates, verdicts = 0, [], {"long": 0, "avoid": 0, "abstain": 0}
     for item in universe["companies"]:
         scanned += 1
         E = evidence_from_snapshot(item, sigs, rk, br_cache, fc)
-        synth = synthesize(E, weights=weights, cluster_corr=corr)
+        synth = synthesize(E, weights=weights, cluster_corr=corr,
+                           scored_n=scored_n)
         v = synth.verdict
         if v == "long_candidate":
             verdicts["long"] += 1

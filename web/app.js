@@ -449,7 +449,9 @@ function renderDossier(d) {
       <span class="tier ${e.tier}">${e.tier}</span>
       ${e.direction === "shadow" ? '<span class="tier" style="color:var(--serious);border-color:var(--serious)">SHADOW</span>' : ""}
       <strong>${esc(e.engine)}</strong> · ${esc(e.statement)}
-      <span class="sub">(${esc(human(e.cluster))} · strength ${signed(e.strength, 2)})</span>
+      <span class="sub">(${esc(human(e.cluster))} · strength ${signed(e.strength, 2)}${
+        e.admission_weight != null && e.admission_weight < 1
+          ? ` · counts at ×${fmtN(e.admission_weight, 2)}` : ""})</span>
       ${e.base_rate ? `<div class="base-rate">📊 [${esc(e.base_rate.registry_ref)}, regime=${esc(e.base_rate.regime)}]
         N<sub>eff</sub>=${e.base_rate.n_eff ?? "?"} (N=${e.base_rate.n}) · hit ${(e.base_rate.hit_rate * 100).toFixed(0)}%
         · median ${signed(e.base_rate.median_excess_pct)}% (net ${signed(e.base_rate.net_median_excess_pct)}%)

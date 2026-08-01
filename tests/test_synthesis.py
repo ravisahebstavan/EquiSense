@@ -77,3 +77,44 @@ def test_confidence_is_decomposed_and_provisional():
 def test_uniform_weights_flagged():
     s = synthesize([E("trend", 0.5), E("value", 0.5), E("quality", 0.5)])
     assert any("provisional" in n.lower() for n in s.notes)
+
+
+def test_synthesis_does_not_reread_the_ledger_for_every_name():
+    """Measured on the live candidate screen: `SELECT ... FROM ledger_records`
+    ran 396 times — once per company scanned — costing 361 of the endpoint's
+    668 seconds, the single largest cost in the whole screen. synthesize() is
+    called per name and read the entire ledger each time to scale one
+    confidence component.
+
+    Safe to memoise here in a way it was NOT for verify_chain: this is a COUNT
+    feeding a confidence number, not a tamper check, so a stale read costs
+    slightly stale confidence rather than concealing corruption.
+    """
+    import equisense.ledger as L
+    from equisense.engine import synthesis as S
+
+    calls = {"n": 0}
+    real = L.read_all
+
+    def counting_read_all():
+        calls["n"] += 1
+        return real()
+
+    L.read_all = counting_read_all
+    try:
+        # the scan path: count computed once, passed to every synthesise call
+        n = 0
+        for _ in range(50):
+            S._calibration_component(scored_n=n)
+    finally:
+        L.read_all = real
+    assert calls["n"] == 0, (
+        f"read the ledger {calls['n']} times when the count was supplied")
+
+
+def test_an_explicit_count_avoids_the_ledger_entirely():
+    from equisense.engine import synthesis as S
+    from equisense.research.learning import CAL_MIN
+    assert S._calibration_component(scored_n=0) == 0.0
+    assert S._calibration_component(scored_n=CAL_MIN) == 1.0
+    assert S._calibration_component(scored_n=CAL_MIN * 5) == 1.0

@@ -295,14 +295,30 @@ def build_universe_snapshot(session: Session) -> dict:
     return snap
 
 
+# The snapshot payload is a few hundred KB of JSON and several callers want it
+# within one request — qualified_candidates, universe_signals,
+# cluster_correlation and the company detail page all reach for it. Measured on
+# the candidate screen: 5 fetches costing 37 of its 63 seconds. Keyed on the
+# latest price date AND the schema version, so an ingest or a version bump
+# invalidates it immediately; a plain time-based cache could serve a snapshot
+# that no longer matches the prices underneath it.
+_UNIVERSE_CACHE: dict = {"key": None, "snap": None}
+
+
 def get_universe(session: Session, allow_rebuild: bool = True) -> dict:
     """Single-row read; rebuilds only when prices are newer than the snapshot."""
     latest = session.scalar(select(func.max(PriceObservation.obs_date)))
+    ckey = (str(latest), SNAP_VERSION)
+    if _UNIVERSE_CACHE["key"] == ckey and _UNIVERSE_CACHE["snap"] is not None:
+        return _UNIVERSE_CACHE["snap"]
     row = session.get(AppSnapshot, UNIVERSE_KEY)
     if row is not None and (latest is None or row.as_of >= str(latest)):
         snap = json.loads(row.payload)
         if snap.get("version") == SNAP_VERSION:
+            _UNIVERSE_CACHE.update(key=ckey, snap=snap)
             return snap
     if not allow_rebuild:
         return json.loads(row.payload) if row else {"as_of": None, "companies": []}
-    return build_universe_snapshot(session)
+    snap = build_universe_snapshot(session)
+    _UNIVERSE_CACHE.update(key=(str(latest), SNAP_VERSION), snap=snap)
+    return snap

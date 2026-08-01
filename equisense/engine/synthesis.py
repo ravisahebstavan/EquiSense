@@ -243,7 +243,8 @@ def _band_rank(band: str) -> int:
 def synthesize(evidence: list[Evidence],
                weights: dict[str, float] | None = None,
                empirical_null_sd: Optional[float] = None,
-               cluster_corr: Optional[dict] = None) -> Synthesis:
+               cluster_corr: Optional[dict] = None,
+               scored_n: int | None = None) -> Synthesis:
     """`weights` (cluster → multiplier) come ONLY from the learning module's
     gated posteriors (research/learning.py); None = uniform provisional.
 
@@ -284,7 +285,8 @@ def synthesize(evidence: list[Evidence],
             verdict="abstain_insufficient", net_score=0.0, conviction_band="none",
             cluster_scores=cluster_scores, cluster_counts=cluster_counts,
             coverage=coverage,
-            confidence=_confidence(cluster_scores, items, 0.0, thin=True),
+            confidence=_confidence(cluster_scores, items, 0.0, thin=True,
+                                   scored_n=scored_n),
             reliability=reliability, conviction_ceiling=ceiling,
             notes=[PROVISIONAL_NOTE,
                    f"Only {len(present)} evidence clusters available — "
@@ -309,7 +311,8 @@ def synthesize(evidence: list[Evidence],
                 dissent.append(f"{c} cluster dissents ({s:+.2f}) from the "
                                f"{'long' if net > 0 else 'short'} consensus")
 
-    confidence = _confidence(cluster_scores, items, dispersion, thin=False)
+    confidence = _confidence(cluster_scores, items, dispersion, thin=False,
+                             scored_n=scored_n)
 
     if dispersion > MAX_DISPERSION:
         verdict, band = "abstain_disagreement", "none"
@@ -341,7 +344,8 @@ def synthesize(evidence: list[Evidence],
 
 
 def _confidence(cluster_scores: dict, items: list[Evidence],
-                dispersion: float, thin: bool) -> dict:
+                dispersion: float, thin: bool,
+                scored_n: int | None = None) -> dict:
     """Decomposable, no vibes. Components each in [0,1], shown."""
     agreement = max(0.0, 1.0 - dispersion / 0.6)
     coverage = min(1.0, len(cluster_scores) / len(CLUSTERS))
@@ -350,7 +354,7 @@ def _confidence(cluster_scores: dict, items: list[Evidence],
     t2 = [e for e in items if e.tier == "T2" and e.base_rate]
     n_min = min((e.base_rate.get("n_eff") or 0 for e in t2), default=0)
     sample_depth = min(1.0, n_min / 150) if t2 else 0.0
-    calibration_history = _calibration_component()
+    calibration_history = _calibration_component(scored_n)
     components = {"agreement": round(agreement, 2), "coverage": round(coverage, 2),
                   "base_rate_depth": round(sample_depth, 2),
                   "calibration_history": round(calibration_history, 2)}
@@ -361,18 +365,32 @@ def _confidence(cluster_scores: dict, items: list[Evidence],
             "label": _confidence_label(calibration_history)}
 
 
-def _calibration_component() -> float:
+# The scored-claim count changes only when a claim is scored, but reading it
+# meant a FULL ledger read — and synthesize() runs once per company. On a
+# 395-name scan that was 396 reads of the entire ledger: 361 of the endpoint's
+# 668 seconds, and the single largest cost in the whole candidate screen.
+#
+# Fixed by passing the count DOWN from a caller that computes it once, rather
+# than by caching. The first attempt cached on ledger length and still read the
+# ledger to obtain that length, so it saved nothing — and caching a ledger-
+# derived value is the trap that broke verify_chain's tamper detection earlier
+# in this same file's history. An explicit argument has no staleness risk at all.
+def _calibration_component(scored_n: int | None = None) -> float:
     """Read real calibration progress from the ledger instead of hardcoding 0.
 
     Previously pinned at 0.0 with the comment "earned, not asserted" — correct
     in spirit, but it also meant the component could never become non-zero even
     once the ledger HAD scored claims, silently capping confidence at 0.90
     forever. It is now earned *and* actually credited.
+
+    `scored_n` is the number of scored claims. Pass it when synthesising many
+    names; omit it and the ledger is read, which is correct but costs a full
+    read per call.
     """
     try:
         from ..research.learning import CAL_MIN, _scored_pairs
-        n = len(_scored_pairs())
-    except Exception:
+        n = len(_scored_pairs()) if scored_n is None else scored_n
+    except Exception:                                  # noqa: BLE001
         return 0.0
     if n <= 0:
         return 0.0

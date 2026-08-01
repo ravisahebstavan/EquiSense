@@ -242,3 +242,16 @@ def test_fully_oversold_name_is_absent_from_holdings_but_present_in_the_warning(
     visible = [cid for cid, p in pos.items() if p.quantity > 1e-9]
     assert visible == []
     assert ledger_integrity(pos)["unmatched_sells"] == {7: pytest.approx(490.0)}
+
+
+def test_ui_shows_admission_weight_next_to_strength():
+    """Wave S deliberately split the MEASUREMENT (strength, full range) from the
+    TRUST in it (admission_weight). Rendering strength alone undoes that: an
+    exploratory family sitting at 0.95 strength and 0.25 admission weight looks
+    four times as influential as it is."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    assert "admission_weight" in js, "the trust weight is never shown"
+    assert "counts at" in js
+    block = js[js.index("strength ${signed(e.strength"):][:400]
+    assert "admission_weight" in block, "must sit beside the strength it qualifies"

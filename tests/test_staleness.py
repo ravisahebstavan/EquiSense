@@ -211,3 +211,34 @@ def test_stale_badge_is_rendered_wherever_a_price_is_shown():
     assert js.count("staleBadge(") >= 4, (
         "expected the helper plus dashboard, company list and company header")
     assert ".stale-badge" in css, "badge is unstyled and will render as plain text"
+
+
+def test_universe_snapshot_is_not_refetched_within_a_request(db):
+    """Several callers want the snapshot in one request — the candidate screen,
+    universe_signals, cluster_correlation and the company detail page. Measured:
+    5 fetches of a few hundred KB costing 37 of that endpoint's 63 seconds."""
+    from equisense.api import snapshot as S
+    _seed(db, {f"N{i}": 0 for i in range(12)})
+    S._UNIVERSE_CACHE.update(key=None, snap=None)
+    first = S.get_universe(db)
+    again = S.get_universe(db)
+    assert again is first, "the payload was parsed again"
+
+
+def test_new_prices_invalidate_the_snapshot_cache(db):
+    """Keyed on the latest price date, so an ingest invalidates it immediately.
+    A plain time-based cache could serve a snapshot that no longer matches the
+    prices underneath it."""
+    import datetime as dt
+
+    import equisense.models as M
+    from equisense.api import snapshot as S
+    _seed(db, {f"N{i}": 0 for i in range(12)})
+    S._UNIVERSE_CACHE.update(key=None, snap=None)
+    first = S.get_universe(db)
+    cid = db.query(M.Company).filter_by(ticker="N0").one().id
+    newest = max(p.obs_date for p in db.query(M.PriceObservation).all())
+    db.add(M.PriceObservation(company_id=cid, obs_date=newest + dt.timedelta(days=1),
+                              close=999.0, close_raw=999.0, volume=1))
+    db.commit()
+    assert S.get_universe(db) is not first, "stale snapshot served after an ingest"
