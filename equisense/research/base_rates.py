@@ -340,16 +340,26 @@ def run_all_studies(session: Session) -> dict:
     all_studies["HYP-011"] = {
         "feature": feat_max_effect, "select": ("quantile", 0.2), "horizons": [21, 63]}
 
-    session.execute(delete(BaseRateRecord))  # full recompute; records are cache, ledger is truth
+    # Compute BEFORE touching the database. This used to DELETE first, then run
+    # the studies — minutes of pure computation — and only then insert, holding
+    # a transaction open and idle the whole time. Neon's free tier closes idle
+    # connections, so the run died on commit with "SSL connection has been
+    # closed unexpectedly" and /api/live/studies/run was broken in production
+    # while passing every local SQLite test.
     records: list[dict] = []
     for hyp_id, cfg in all_studies.items():
         records.extend(run_study(closes, volumes, regimes, hyp_id, cfg=cfg))
 
     apply_multiplicity_control(records)
 
+    # One short transaction: delete and reinsert together, so a failure rolls
+    # back to the previous records rather than leaving the table empty.
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    for rec in records:
-        session.add(BaseRateRecord(**rec, computed_at=now))
+    session.execute(delete(BaseRateRecord))  # full recompute; records are cache, ledger is truth
+    payload = [{**rec, "computed_at": now} for rec in records]
+    CHUNK = 500                              # keep any single statement modest
+    for i in range(0, len(payload), CHUNK):
+        session.bulk_insert_mappings(BaseRateRecord, payload[i:i + CHUNK])
     session.commit()
     admissible = [r for r in records if r["admissible"]]
     survivors = [r for r in admissible if r.get("survives_multiplicity")]

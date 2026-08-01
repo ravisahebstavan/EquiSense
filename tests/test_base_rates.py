@@ -64,3 +64,24 @@ def test_no_lookahead_in_momentum_feature():
     closes2.iloc[601:] *= 3.0  # violent future shock
     after = STUDIES["HYP-001"]["feature"](closes2, volumes).loc[t]
     pd.testing.assert_series_equal(before, after)
+
+
+def test_studies_are_computed_before_the_database_is_touched():
+    """The DELETE used to run first, then minutes of computation, then the
+    INSERT — holding a transaction open and idle throughout. Neon closes idle
+    connections, so the real run died on commit with "SSL connection has been
+    closed unexpectedly" while every local SQLite test passed.
+
+    Asserted on source order because the failure is about WHEN the transaction
+    opens, which no in-memory test can reproduce.
+    """
+    import inspect
+
+    from equisense.research import base_rates
+    src = inspect.getsource(base_rates.run_all_studies)
+    compute_at = src.index("records.extend(run_study(")
+    delete_at = src.index("session.execute(delete(BaseRateRecord))")
+    assert compute_at < delete_at, (
+        "the DELETE opens a transaction that then sits idle through the whole "
+        "computation - compute first, write last")
+    assert "bulk_insert_mappings" in src, "per-row session.add() is N round trips"
