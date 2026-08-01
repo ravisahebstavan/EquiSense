@@ -63,19 +63,38 @@ def read_all() -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def verify_chain() -> dict:
-    """Recompute the hash chain; any edit to any historical line breaks it."""
+def verify_chain(records: list[dict] | None = None) -> dict:
+    """Recompute the hash chain; any edit to any historical line breaks it.
+
+    `records` lets a caller that has already loaded the ledger pass it in rather
+    than paying for a second full read — /api/live/ledger renders the tail AND
+    verifies, and used to fetch the whole ledger twice to do it.
+
+    Deliberately NOT memoised. Caching on (record count, last hash) looked like
+    an easy win and silently destroyed the tamper detection: editing a field in
+    record 0 changes neither the count nor the last record's stored hash, so a
+    cached "intact" was returned for a corrupted ledger. A tamper-evidence check
+    cannot be keyed on metadata the tamperer controls — the O(n) pass IS the
+    feature. If this ever becomes a bottleneck the fix is to stop calling it on
+    every page load, not to make it lie faster.
+    """
+    recs = read_all() if records is None else records
     prev = GENESIS
-    for i, rec in enumerate(read_all()):
-        stored_hash = rec.pop("hash")
-        if rec.get("prev_hash") != prev:
-            return {"intact": False, "broken_at": i, "reason": "prev_hash mismatch"}
+    for i, rec in enumerate(recs):
+        # copy rather than pop: popping mutated the caller's records, stripping
+        # "hash" from the very dicts /api/live/ledger then renders
+        body = {k: v for k, v in rec.items() if k != "hash"}
+        stored_hash = rec.get("hash")
+        if body.get("prev_hash") != prev:
+            return {"intact": False, "broken_at": i,
+                    "reason": "prev_hash mismatch", "records": len(recs)}
         recomputed = hashlib.sha256(
-            json.dumps(rec, sort_keys=True, default=str).encode()).hexdigest()
+            json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
         if recomputed != stored_hash:
-            return {"intact": False, "broken_at": i, "reason": "content altered"}
+            return {"intact": False, "broken_at": i,
+                    "reason": "content altered", "records": len(recs)}
         prev = stored_hash
-    return {"intact": True, "records": len(read_all())}
+    return {"intact": True, "records": len(recs)}
 
 
 def register_dossier(dossier: dict) -> dict:

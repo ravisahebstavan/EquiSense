@@ -630,7 +630,9 @@ def live_refresh(s: Session = Depends(db)):
 @app.get("/api/live/ledger")
 def live_ledger():
     from .. import ledger
-    return {"records": ledger.read_all()[-50:], "chain": ledger.verify_chain()}
+    # one read serves both the listing and the verification
+    records = ledger.read_all()
+    return {"records": records[-50:], "chain": ledger.verify_chain(records)}
 
 
 @app.post("/api/live/score")

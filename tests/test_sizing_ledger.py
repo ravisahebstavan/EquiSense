@@ -206,3 +206,41 @@ def test_ample_adv_does_not_bind():
         conviction_band="moderate", net_score=0.5, adv_cr=50.0,
         max_position_pct=10.0))
     assert r["binding_constraint"] == "risk_budget"
+
+
+def test_verify_chain_does_not_mutate_the_records_it_is_given(tmp_path, monkeypatch):
+    """It used to `rec.pop("hash")`, stripping the hash from the caller's own
+    dicts — the same dicts /api/live/ledger renders."""
+    from equisense import ledger as L
+    monkeypatch.setattr(L, "LEDGER_PATH", tmp_path / "d.jsonl")
+    L.register_dossier({"synthesis": {"verdict": "long_candidate", "net_score": 0.3,
+                                      "conviction_band": "low"},
+                        "company": {"ticker": "T", "price": 10.0}})
+    records = L.read_all()
+    assert L.verify_chain(records)["intact"]
+    assert all("hash" in r for r in records), "verify_chain stripped the hashes"
+
+
+def test_tamper_is_detected_even_on_a_repeat_call(tmp_path, monkeypatch):
+    """Regression guard. Memoising verification on (count, last hash) looked
+    like a free optimisation and silently disabled tamper detection: editing
+    record 0 changes neither key, so a corrupted ledger returned a cached
+    'intact'. The O(n) pass IS the feature."""
+    from equisense import ledger as L
+    monkeypatch.setattr(L, "LEDGER_PATH", tmp_path / "d.jsonl")
+    base = {"synthesis": {"verdict": "long_candidate", "net_score": 0.4,
+                          "conviction_band": "moderate"},
+            "company": {"ticker": "AAA", "price": 100.0}}
+    L.register_dossier(base)
+    L.register_dossier({**base, "company": {"ticker": "BBB", "price": 50.0}})
+
+    assert L.verify_chain()["intact"]          # warm any would-be cache
+    assert L.verify_chain()["intact"]
+
+    lines = L.LEDGER_PATH.read_text().splitlines()
+    lines[0] = lines[0].replace("AAA", "ZZZ")  # count and last hash unchanged
+    L.LEDGER_PATH.write_text("\n".join(lines) + "\n")
+
+    out = L.verify_chain()
+    assert out["intact"] is False
+    assert out["broken_at"] == 0
