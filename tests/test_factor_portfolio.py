@@ -231,3 +231,63 @@ def test_broad_indices_are_configured_as_benchmarks():
     for sym in ("^CRSLDX", "^CNX100", "^NSEMDCP50", "NIFTYSMLCAP250.NS"):
         assert sym in MACRO_SERIES, f"{sym} missing from MACRO_SERIES"
     assert MACRO_SERIES["^CRSLDX"][0] == "NIFTY 500"
+
+
+def test_factor_caveats_flag_a_tail_driven_family_at_the_point_of_decision():
+    """The research plane measures which families actually pay; the decision
+    plane weights every cluster equally until the calibration ledger unlocks,
+    which needs a trading record that does not exist yet. So a family the system
+    has itself measured as tail-driven was contributing to verdicts at full
+    strength with nothing saying so."""
+    import json
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import equisense.models as M
+    from equisense.api.candidates import factor_caveats
+    from equisense.db import Base
+
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    db = sessionmaker(bind=eng)()
+
+    assert factor_caveats(db) == {}, "no study stored -> no caveats, not a crash"
+
+    payload = {"computable": True, "signals": {"HYP-008": {
+        "computable": True, "by_horizon": {"63": {
+            "long_short": {"computable": True, "tail_driven": True,
+                           "spread_mean_pct": -4.98, "spread_median_pct": 0.19,
+                           "monotonicity": -1.0},
+            "long_only": {"computable": True, "net_annual_pct": -2.0,
+                          "t_stat": -1.0}}}}}}
+    db.add(M.AppSnapshot(key="factor_studies", as_of="2026-08-01",
+                         payload=json.dumps(payload)))
+    db.commit()
+
+    out = factor_caveats(db)
+    assert "vol" in out, "HYP-008 maps to the 'vol' signal"
+    assert "MEDIAN spread" in out["vol"]
+    # and it must be explicit that nothing was silently reweighted
+    assert "never from a backtest" in out["vol"]
+
+
+def test_factor_caveats_survive_a_corrupt_or_incomplete_payload():
+    """A bad cached blob must not take down the candidate screen."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import equisense.models as M
+    from equisense.api.candidates import factor_caveats
+    from equisense.db import Base
+
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    db = sessionmaker(bind=eng)()
+    db.add(M.AppSnapshot(key="factor_studies", as_of="x", payload="{not json"))
+    db.commit()
+    assert factor_caveats(db) == {}

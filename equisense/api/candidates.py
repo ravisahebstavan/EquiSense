@@ -50,23 +50,93 @@ SIGNAL_EVIDENCE = [
     ("vol", "risk", "risk.volatility", "risk", True, "realized vol {v:.1f}%"),
 ]
 
+# signal key -> the hypothesis whose FACTOR study measured it. Only signals with
+# a real study appear; the rest simply carry no factor caveat.
+_FACTOR_HYP = {"momentum": "HYP-001", "mqi": "HYP-004", "heat": "HYP-007",
+               "sector_rel_mom": "HYP-010", "vol": "HYP-008",
+               "max_effect": "HYP-011"}
+
+
+def factor_caveats(session) -> dict[str, str]:
+    """{signal key: what its own quantile study found wrong with it}.
+
+    Closes a gap between the two planes. The research plane now measures which
+    families actually PAY — net of turnover, and whether the effect is monotone
+    or lives in one bucket's tail — while the decision plane weights every
+    cluster equally until the calibration ledger unlocks, which needs a trading
+    record that does not exist yet. So a family the system has itself measured
+    as tail-driven was contributing to a verdict at full strength with nothing
+    saying so.
+
+    This does NOT change any weight. Letting backtest results set live weights
+    is how a system overfits, and the uniform default is a deliberate choice.
+    It attaches the measurement to the evidence so the finding is visible at
+    the point of decision instead of buried in a Lab tab.
+    """
+    import json
+
+    from ..models import AppSnapshot
+    row = session.get(AppSnapshot, "factor_studies")
+    if row is None:
+        return {}
+    try:
+        studies = json.loads(row.payload)
+    except Exception:                                  # noqa: BLE001
+        return {}
+    if not studies.get("computable"):
+        return {}
+    out: dict[str, str] = {}
+    for key, hyp in _FACTOR_HYP.items():
+        sg = (studies.get("signals") or {}).get(hyp)
+        if not sg or not sg.get("computable"):
+            continue
+        notes = []
+        for h, v in (sg.get("by_horizon") or {}).items():
+            ls, lo = v.get("long_short") or {}, v.get("long_only") or {}
+            if not ls.get("computable"):
+                continue
+            if ls.get("tail_driven"):
+                notes.append(
+                    f"at {h}d its mean spread ({ls.get('spread_mean_pct')}%) and "
+                    f"MEDIAN spread ({ls.get('spread_median_pct')}%) disagree — the "
+                    "effect sits in a few extreme names, not the typical one")
+            elif (ls.get("monotonicity") or 0) < 0.5:
+                notes.append(
+                    f"at {h}d the quantile profile is not monotone "
+                    f"(rank corr {ls.get('monotonicity')}) — the ordering does not "
+                    "hold across the universe")
+            elif lo.get("computable") and (lo.get("net_annual_pct") or 0) <= 0:
+                notes.append(
+                    f"at {h}d turnover consumes it: {lo.get('net_annual_pct')}%/yr "
+                    "net long-only")
+        if notes:
+            out[key] = ("own factor study: " + "; ".join(notes[:2])
+                        + ". Counted at full strength regardless — weights unlock "
+                          "only from realised calibration, never from a backtest.")
+    return out
+
+
 # keys whose base rate comes from a registered study (looked up via br_cache)
 _BASE_RATE_KEYS = {"momentum": "momentum", "mqi": "mqi",
                    "sector_rel_mom": "sector_rel_mom", "max_effect": "max_effect"}
 
 
 def evidence_from_snapshot(item: dict, sigs: dict, regime_key: str,
-                           br_cache: dict) -> list[Evidence]:
+                           br_cache: dict,
+                           fc: dict | None = None) -> list[Evidence]:
     t = item["ticker"]
     out = []
+    fc = fc or {}
     for key, engine, family, cluster, invert, tmpl in SIGNAL_EVIDENCE:
         raw = item["signals"].get(key)
         strength = xsec_strength(sigs[key], t, invert=invert)
         if strength is None or raw is None:
             continue
         base_rate = br_cache.get(_BASE_RATE_KEYS.get(key, ""))
+        caveats = [fc[key]] if key in fc else None
         out.append(ev(engine, family, cluster, strength,
-                      tmpl.format(v=raw), [], base_rate=base_rate))
+                      tmpl.format(v=raw), [], base_rate=base_rate,
+                      caveats=caveats))
     return [e for e in out if e is not None]
 
 
@@ -130,6 +200,8 @@ def qualified_candidates(session: Session, top_n: int = 8,
     sigs = universe_signals(session)
     # measured once per snapshot, not per name
     corr = cluster_correlation(session)
+    # what each signal's OWN quantile study found wrong with it, if anything
+    fc = factor_caveats(session)
     regime = current_regime(session)
     rk = regime["conditioning_key"]
     br_cache = {
@@ -144,7 +216,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
     scanned, candidates, verdicts = 0, [], {"long": 0, "avoid": 0, "abstain": 0}
     for item in universe["companies"]:
         scanned += 1
-        E = evidence_from_snapshot(item, sigs, rk, br_cache)
+        E = evidence_from_snapshot(item, sigs, rk, br_cache, fc)
         synth = synthesize(E, weights=weights, cluster_corr=corr)
         v = synth.verdict
         if v == "long_candidate":
