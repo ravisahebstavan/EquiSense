@@ -220,3 +220,58 @@ def test_lab_run_buttons_warn_about_the_serverless_timeout():
     assert js.count("python -m equisense.research all") == 2, (
         "both the IC and factor run buttons need the CLI fallback note")
     assert "time out" in js
+
+
+def test_every_api_route_is_reachable_from_the_ui_or_explicitly_exempt():
+    """The rule this repo states in status.py: 'no backend capability may hide
+    in JSON.' An endpoint nothing calls is either dead weight or a feature the
+    user cannot reach — both are defects. Exemptions are listed explicitly so
+    adding one is a deliberate act, not an oversight."""
+    import re
+    from pathlib import Path
+
+    from equisense.api.app import app
+
+    # machine-to-machine or streaming endpoints with no UI surface
+    EXEMPT = {
+        "/api/cron/refresh",            # scheduler entry point
+        "/api/live/refresh/stream",     # SSE, driven by the refresh button
+        "/api/live/vault",              # same payload as /live/status datasets.vault
+        "/api/markets/position-risk",   # POST calculator, invoked from markets view
+    }
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    calls = set(re.findall(r'api\(\s*[`"\']([^`"\'?]+)', js))
+    calls |= {re.sub(r"\$\{[^}]+\}", "*", t.split("?")[0])
+              for t in re.findall(r'api\(\s*`([^`]+)`', js)}
+    called = {c if c.startswith("/api") else "/api" + c for c in calls}
+
+    missing = []
+    for r in app.routes:
+        p = getattr(r, "path", "")
+        if not p.startswith("/api") or p in EXEMPT:
+            continue
+        norm = re.sub(r"\{[^}]+\}", "*", p)
+        if not any(norm.rstrip("/") == c.rstrip("/") for c in called):
+            missing.append(p)
+    assert not missing, f"backend capabilities with no UI: {sorted(missing)}"
+
+
+def test_data_health_surfaces_storage_and_source_reachability():
+    """Neon's free tier is a hard 512 MB ceiling, and every archive fetch fails
+    CLOSED — so an unreachable source looks exactly like a quiet market day.
+    Both were reachable only as raw JSON."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    assert "async function renderDataExtras(host)" in js
+    assert '"/storage"' in js and '"/markets/sources"' in js
+    assert "renderDataExtras(" in js.split("async function renderDataExtras")[0], \
+        "defined but never called"
+
+
+def test_company_page_shows_delivery_percentage():
+    """Built, tested, and completely unreachable from the UI until now."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    assert "async function renderDeliveryPanel(host, ticker)" in js
+    assert "/markets/delivery/" in js
+    assert "renderDeliveryPanel(slot" in js, "defined but never called"

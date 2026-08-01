@@ -437,3 +437,20 @@ code {
   border-radius: 3px;
   white-space: nowrap;
 }
+
+/* A price that has stopped updating. Deliberately loud: the universe keeps
+   stale names visible because the user may hold one, and an unmarked frozen
+   quote is indistinguishable from a live one. */
+.stale-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  border-radius: 3px;
+  color: var(--critical);
+  border: 1px solid var(--critical);
+  white-space: nowrap;
+  vertical-align: middle;
+}

@@ -130,3 +130,16 @@ def test_benchmark_prefers_nifty500_when_present(sess):
     b = _nifty_counterfactual(s, trades, 1_000_000.0, symbol="^CRSLDX")
     assert b["fell_back"] is False
     assert b["index"] == "NIFTY 500"
+
+
+def test_ui_renders_both_benchmarks_and_names_the_index():
+    """The two indices differ by roughly the size premium, so showing a single
+    unlabelled 'Alpha vs NIFTY' number lets the easier comparison pass for
+    skill. The label has to say WHICH index, and the NIFTY 50 gap has to be
+    visible next to it."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    assert "alpha_vs_nifty50_pct" in js, "the NIFTY 50 comparison is not rendered"
+    assert "benchmark || {}).index" in js, "the index must be named, not assumed"
+    assert "fell_back" in js, "a silent fallback to the narrower index is invisible"
+    assert "size premium, not skill" in js

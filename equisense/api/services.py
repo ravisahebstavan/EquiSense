@@ -124,6 +124,22 @@ def _series(stmts: list[StatementData], fn) -> list[dict]:
     return out
 
 
+def _stale_sessions(session, ticker: str) -> int:
+    """How many trading sessions this name's last price is behind the universe.
+
+    Read from the universe snapshot rather than recomputed, so the detail page
+    and the listings can never disagree about whether a name is stale.
+    """
+    try:
+        from .snapshot import get_universe
+        for item in get_universe(session)["companies"]:
+            if item["ticker"] == ticker:
+                return int(item.get("stale_sessions") or 0)
+    except Exception:                                  # noqa: BLE001
+        pass
+    return 0
+
+
 def company_analysis(session: Session, company: Company,
                      profile: pers.InvestorProfile,
                      dcf_assumptions: Optional[valuation.ReverseDcfAssumptions] = None) -> dict:
@@ -242,7 +258,12 @@ def company_analysis(session: Session, company: Company,
         "company": {"id": company.id, "ticker": company.ticker, "name": company.name,
                     "sector": company.sector, "industry": company.industry,
                     "cap_band": company.cap_band, "description": company.description,
-                    "is_demo_data": company.is_demo_data, "price": price},
+                    "is_demo_data": company.is_demo_data, "price": price,
+                    # Carried so the page can mark a price that stopped updating.
+                    # Without it the detail view renders a frozen quote exactly
+                    # like a live one — the single most likely place for someone
+                    # to read a price immediately before acting on it.
+                    "stale_sessions": _stale_sessions(session, company.ticker)},
         "period": curr.period,
         "card_order": pers.card_order(profile),
         "cards": cards,

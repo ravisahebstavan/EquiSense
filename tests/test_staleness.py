@@ -187,3 +187,27 @@ def test_a_name_with_no_history_does_not_drag_the_whole_batch(db):
 def test_refresh_period_on_an_empty_batch_is_harmless(db):
     from equisense.ingestion.yahoo import _refresh_period
     assert _refresh_period(db, {}) == "5d"
+
+
+def test_company_detail_carries_stale_sessions_for_the_ui():
+    """The detail page is the most likely place for someone to read a price
+    immediately before acting on it, so a frozen quote must not render there
+    identically to a live one. Read from the snapshot rather than recomputed, so
+    the detail view and the listings cannot disagree."""
+    import inspect
+
+    from equisense.api import services
+    src = inspect.getsource(services.company_analysis)
+    assert '"stale_sessions"' in src, "company detail omits the staleness marker"
+    helper = inspect.getsource(services._stale_sessions)
+    assert "get_universe" in helper, "must read the snapshot, not recompute"
+
+
+def test_stale_badge_is_rendered_wherever_a_price_is_shown():
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    css = (Path(__file__).resolve().parent.parent / "web" / "style.css").read_text()
+    assert "function staleBadge(item)" in js
+    assert js.count("staleBadge(") >= 4, (
+        "expected the helper plus dashboard, company list and company header")
+    assert ".stale-badge" in css, "badge is unstyled and will render as plain text"

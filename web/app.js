@@ -579,7 +579,7 @@ async function viewDashboard() {
       <td><strong>${esc(r.ticker)}</strong></td><td>${esc(r.sector)}</td>
       <td>${microspark(r.spark)}</td>
       <td>${r.held ? '<span class="chip held">held</span>' : ""}${r.watched ? '<span class="chip">watch</span>' : ""}</td>
-      <td class="num">${fmtMoney(r.price)}
+      <td class="num">${fmtMoney(r.price)}${staleBadge(r)}
         <div class="sub" style="color:${(r.chg_1d_pct ?? 0) >= 0 ? "var(--good-text)" : "var(--critical)"}">${signed(r.chg_1d_pct, 2)}%</div></td>
       <td class="num">${r.signals.f_score ?? "—"}</td>
       <td class="num">${fmtN(r.signals.pe, 1)}</td>
@@ -679,7 +679,7 @@ async function viewCompanies() {
       <td>${esc(c.sector)}</td>
       <td>${microspark(c.spark)}</td>
       <td>${c.held ? '<span class="chip held">held</span>' : ""}${c.watched ? '<span class="chip">watch</span>' : ""}</td>
-      <td class="num">${fmtMoney(c.price)}
+      <td class="num">${fmtMoney(c.price)}${staleBadge(c)}
         <div class="sub" style="color:${(c.chg_1d_pct ?? 0) >= 0 ? "var(--good-text)" : "var(--critical)"}">${signed(c.chg_1d_pct, 2)}%</div></td>
       <td class="num">${c.signals.f_score ?? "—"}/9</td>
       <td>${c.signals.z_zone ? `<span class="chip ${c.signals.z_zone}">${c.signals.z_zone}</span>` : "—"}</td>
@@ -745,7 +745,7 @@ async function viewCompanyDetail(id, tab = "overview") {
   const tabs = [["overview", "Overview"], ["dossier", "Dossier"], ["memory", "Memory"], ["ai", "AI Desk"]];
 
   app.innerHTML = `
-    <h1>${esc(c.name)} <span class="sub">${esc(c.ticker)} · ${esc(c.sector)} · ${fmtMoney(c.price)}
+    <h1>${esc(c.name)} <span class="sub">${esc(c.ticker)} · ${esc(c.sector)} · ${fmtMoney(c.price)}${staleBadge(c)}
       · ${esc(d.period)}</span></h1>
     <div class="sub">${esc(c.description)}</div>
     <div class="tabs">${tabs.map(([k, l]) =>
@@ -755,10 +755,58 @@ async function viewCompanyDetail(id, tab = "overview") {
     b.addEventListener("click", () => location.hash = `#/companies/${id}/${b.dataset.tab}`));
 
   const body = document.getElementById("tab-body");
-  if (tab === "overview") renderCompanyOverview(body, d, id);
+  if (tab === "overview") {
+    renderCompanyOverview(body, d, id);
+    // Delivery % is India-specific and was fully built but unreachable from the
+    // UI. It separates real ownership transfer from intraday churn, which no
+    // price or volume series can distinguish.
+    const slot = document.createElement("div");
+    slot.id = "delivery-slot";
+    body.appendChild(slot);
+    renderDeliveryPanel(slot, c.ticker);
+  }
   else if (tab === "dossier") renderCompanyDossier(body, id);
   else if (tab === "memory") renderCompanyMemory(body, id);
   else if (tab === "ai") renderCompanyAi(body, id);
+}
+
+async function renderDeliveryPanel(host, ticker) {
+  if (!host || !ticker) return;
+  const d = await api(`/markets/delivery/${encodeURIComponent(ticker)}`).catch(() => null);
+  if (!d || !d.available) {
+    host.innerHTML = `<div class="panel"><h2>Delivery %</h2>
+      <div class="sub">${esc((d && d.reason) || "No delivery data for this name yet. " +
+        "The NSE archive yields one file per trading day, so this series accumulates " +
+        "forward and cannot be backfilled.")}</div></div>`;
+    return;
+  }
+  const hi = d.delivery_pct >= d.mean_delivery_pct;
+  const spark = (d.history || []).map(h => h.delivery_pct);
+  const max = Math.max(...spark, 1), min = Math.min(...spark, 0);
+  const bars = spark.map(v => {
+    const pct = max > min ? (v - min) / (max - min) * 100 : 50;
+    return `<div style="flex:1;display:flex;align-items:flex-end;height:38px">
+      <div style="width:100%;height:${Math.max(4, pct)}%;background:var(--series-1);opacity:.75"></div></div>`;
+  }).join("");
+  host.innerHTML = `
+    <div class="panel"><h2>Delivery % — accumulation vs churn</h2>
+      <div class="tiles" style="grid-template-columns:repeat(3,1fr)">
+        <div class="tile"><div class="label">Latest (${esc(d.as_of)})</div>
+          <div class="value ${hi ? "pos" : "neg"}">${fmtN(d.delivery_pct, 1)}%</div></div>
+        <div class="tile"><div class="label">Own mean</div>
+          <div class="value">${fmtN(d.mean_delivery_pct, 1)}%</div></div>
+        <div class="tile"><div class="label">Percentile vs own history</div>
+          <div class="value">${fmtN(d.percentile_vs_own_history, 0)}</div></div>
+      </div>
+      <div style="display:flex;gap:2px;margin-top:8px">${bars}</div>
+      <div class="sub" style="margin-top:6px">
+        Share of traded volume actually taken to demat rather than squared off
+        intraday — the one free measure that separates real ownership transfer
+        from churn. Ranked against this stock's OWN history, because the normal
+        level differs enormously between a large-cap and a retail-heavy small-cap.
+        ${d.observations} observation${d.observations === 1 ? "" : "s"} so far;
+        the series accumulates forward and cannot be backfilled.</div>
+    </div>`;
 }
 
 function renderCompanyOverview(body, d, id) {
@@ -1201,9 +1249,17 @@ async function viewTrading() {
       <div class="tile"><div class="label">Positions</div><div class="value">${fmtMoney(a.positions_value)}</div></div>
       <div class="tile"><div class="label">Total return</div>
         <div class="value ${(a.total_return_pct ?? 0) >= 0 ? "pos" : "neg"}">${signed(a.total_return_pct)}%</div></div>
-      <div class="tile"><div class="label">Alpha vs NIFTY</div>
+      <div class="tile"><div class="label">Alpha vs ${esc((a.benchmark || {}).index || "NIFTY 500")}</div>
         <div class="value ${(alpha ?? 0) >= 0 ? "pos" : "neg"}">${alpha == null ? "—" : signed(alpha) + "%"}</div>
-        <div class="sub">${a.benchmark ? "same cashflows in NIFTY: " + signed(a.benchmark.total_return_pct) + "%" : "trade to activate"}</div></div>
+        <div class="sub">${a.benchmark
+          ? "same cashflows in " + esc(a.benchmark.index || "the index") + ": "
+            + signed(a.benchmark.total_return_pct) + "%"
+            + (a.benchmark.fell_back ? " (NIFTY 500 unavailable — fell back)" : "")
+          : "trade to activate"}</div>
+        ${a.alpha_vs_nifty50_pct != null ? `<div class="sub">vs NIFTY 50:
+          <strong class="${a.alpha_vs_nifty50_pct >= 0 ? "pos" : "neg"}">${
+          signed(a.alpha_vs_nifty50_pct)}%</strong> — the narrower index is easier
+          to beat, so the gap between these two is size premium, not skill</div>` : ""}</div>
     </div>
     ${a.curve ? `<div class="panel">${equityChart(a.curve, a.benchmark)}
       ${a.alpha_note ? `<div class="sub" style="margin-top:8px">${esc(a.alpha_note)}</div>` : ""}</div>` : ""}
@@ -1851,10 +1907,84 @@ async function viewLab(section = "hypotheses") {
           <h2 style="margin-top:10px">Missing datasets (visible, not ignored)</h2>
           <div class="sub">${st.missing_datasets.join(" · ")}</div>
         </div>
-      </div>`;
+      </div>
+      <div id="data-extra">${skeleton(2)}</div>`;
+    renderDataExtras(document.getElementById("data-extra"));
   }
 }
 
+
+/* A price that stopped updating must never be displayed as if it were today's.
+   The universe keeps stale names visible on purpose (the user may hold one) and
+   excludes them from the cross-sectional reference distribution — but without a
+   marker here, a frozen quote reads exactly like a live one. Five Nifty-50
+   names were sitting 13 trading sessions behind when this was added. */
+function staleBadge(item) {
+  const n = item && item.stale_sessions;
+  if (!n) return "";
+  return `<span class="stale-badge" title="Last price is ${n} trading session${
+    n === 1 ? "" : "s"} behind the rest of the universe — excluded from ranking">
+    ${n}d stale</span>`;
+}
+
+async function renderDataExtras(host) {
+  if (!host) return;
+  // Storage and source reachability were reachable only as raw JSON. The rule
+  // this module serves is that no backend capability hides in JSON, and these
+  // two were the exceptions: Neon's free tier is a hard 512 MB ceiling, and
+  // every archive fetch fails CLOSED, so an unreachable source is otherwise
+  // indistinguishable from a quiet market day.
+  const [store, src] = await Promise.all([
+    api("/storage").catch(() => null),
+    api("/markets/sources").catch(() => null),
+  ]);
+  const FREE_MB = 512;
+  let storePanel = "";
+  if (store) {
+    const mb = parseFloat(String(store.database_size).replace(/[^0-9.]/g, "")) || 0;
+    const unit = /GB/i.test(String(store.database_size)) ? 1024 : 1;
+    const usedMb = mb * unit;
+    const pct = Math.min(100, usedMb / FREE_MB * 100);
+    const tone = pct > 85 ? "neg" : (pct > 65 ? "" : "pos");
+    storePanel = `
+      <div class="panel"><h2>Storage — Neon free tier</h2>
+        <div class="tiles" style="grid-template-columns:1fr 1fr">
+          <div class="tile"><div class="label">Used</div>
+            <div class="value ${tone}">${esc(String(store.database_size))}</div></div>
+          <div class="tile"><div class="label">Of ${FREE_MB} MB ceiling</div>
+            <div class="value ${tone}">${pct.toFixed(0)}%</div></div>
+        </div>
+        <div class="tablewrap"><table><thead><tr><th>Table</th>
+          <th class="num">Rows</th><th class="num">Size</th></tr></thead><tbody>
+          ${(store.largest_tables || []).map(t => `<tr><td>${esc(t.table)}</td>
+            <td class="num">${fmtN(t.rows, 0)}</td>
+            <td class="num">${esc(String(t.size))}</td></tr>`).join("")}
+        </tbody></table></div>
+        <div class="sub" style="margin-top:6px">Retention:
+          ${Object.entries(store.retention || {}).map(([k, v]) =>
+            `${esc(k.replace(/_/g, " "))} ${v}d`).join(" · ")}.
+          The largest table is also the most re-fetchable, which is why pruning
+          starts there and never with accumulated series that cannot be rebuilt.</div>
+      </div>`;
+  }
+  let srcPanel = "";
+  if (src) {
+    const checks = Object.entries(src.checks || {});
+    srcPanel = `
+      <div class="panel"><h2>Data sources — reachability</h2>
+        <div class="metric-row" style="cursor:default"><span class="m-label">${esc(src.source || "")}</span>
+          <span class="m-value ${src.healthy ? "pos" : "neg"}">${src.healthy ? "healthy" : "DEGRADED"}</span></div>
+        ${checks.map(([name, c]) => `<div class="metric-row" style="cursor:default">
+          <span class="m-label">${esc(name.replace(/_/g, " "))}</span>
+          <span class="m-value ${c.ok ? "pos" : "neg"}">${c.ok ? "ok" : "FAIL"}</span>
+          <span class="m-unit">${c.rows != null ? fmtN(c.rows, 0) + " rows" : ""}</span></div>`).join("")}
+        <div class="sub" style="margin-top:6px">${esc(src.note || "")}</div>
+      </div>`;
+  }
+  host.innerHTML = (storePanel || srcPanel)
+    ? `<div class="grid2">${storePanel}${srcPanel}</div>`
+    : `<div class="sub">Storage and source probes unavailable.</div>`;
+}
 
 /* ========================================================= markets view */
 /* Surfaces the multi-asset engines: derivatives (live, unstored), the
