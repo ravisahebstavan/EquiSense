@@ -302,3 +302,35 @@ def test_the_flat_drawdown_claim_is_retracted_in_the_source():
     head = head[:head.index("def strategy_backtest")]
     assert "artefact" in head and "21-day steps" in head
     assert "-34.26" in head or "34.26" in head
+
+
+def test_breadth_hysteresis_holds_through_the_middle_band():
+    """A continuous scale on raw daily breadth rebalances the cash balance on
+    every wiggle around the threshold, spiking costs and realising a stream of
+    tiny taxable gains. Inside the band, exposure must not move."""
+    from equisense.research.backtest import breadth_exposure
+    e = breadth_exposure([0.70, 0.50, 0.50, 0.30, 0.50, 0.50, 0.70])
+    assert e == [1.0, 1.0, 1.0, 0.2, 0.2, 0.2, 1.0]
+
+
+def test_breadth_exposure_survives_missing_values():
+    """A NaN early in the series (before the 200-day window fills) must carry
+    the previous exposure, not crash or reset to full risk."""
+    from equisense.research.backtest import breadth_exposure
+    e = breadth_exposure([float("nan"), 0.30, float("nan"), 0.70])
+    assert e == [1.0, 0.2, 0.2, 1.0]
+
+
+def test_breadth_scaling_is_on_by_default_and_documented_with_its_cost():
+    """It buys a 65% drawdown cut for 3.7pp of after-tax CAGR, which is the
+    trade a real book makes — but the thresholds are extra parameters and the
+    worst CPCV path degrades, so both must be recorded."""
+    import inspect
+
+    from equisense.research import backtest
+    sig = inspect.signature(backtest.strategy_backtest)
+    assert sig.parameters["breadth_scaled"].default is True
+    head = inspect.getsource(backtest)
+    head = head[:head.index("def universe_breadth")]
+    assert "NOT swept" in head, "must state the thresholds were not fitted"
+    assert "3.04" in head, "must record that the worst CPCV path degrades"

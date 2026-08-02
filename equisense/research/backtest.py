@@ -60,6 +60,78 @@ SWEPT_CASH_YIELD = 0.055
 STCG_RATE = 0.20
 
 
+# ---- breadth-scaled exposure ------------------------------------------------
+# The -34.26% daily drawdown is systemic, not idiosyncratic: widening the basket
+# barely touches it because the whole market falls together. The only lever that
+# attacks it is being less invested when the market is broadly broken.
+#
+# Breadth = fraction of the universe trading above its own 200-day SMA. Measured
+# on this panel it bottomed at 0.040 on 2020-03-23 (the actual COVID low) and
+# 0.133 on 2018-10-09 (the midcap bear) — precisely the episodes that produce
+# the drawdown.
+#
+# Computed on the FULL universe rather than the index-distance proxy. The proxy
+# is cheaper but correlates 0.9173 (Spearman 0.9441), so it misses 16% of the
+# variance in a quantity that decides between 100% and 20% exposure. And the
+# cost it saves is not real: true breadth over 500 names x 2,485 sessions
+# computes in 53 milliseconds.
+#
+# HYSTERESIS BANDS, not a continuous scale. Scaling on raw daily breadth churns
+# the cash balance every session when the market oscillates around the
+# threshold, spiking costs and realising a stream of tiny taxable gains. Inside
+# the middle band the previous exposure is HELD.
+# Measured effect at N=15 (daily mark-to-market):
+#
+#   always invested   29.75% ann / 23.80% after tax / -34.26% DD / ret-DD 0.69
+#   breadth-scaled    25.08% ann / 20.06% after tax / -11.85% DD / ret-DD 1.69
+#   passive S&P-INR            17.08%              / -30.20% DD / ret-DD 0.57
+#
+# 3.7pp of after-tax CAGR buys a 65% cut in drawdown. Against the passive
+# alternative the scaled book is now better on BOTH axes — higher return and a
+# third of the drawdown — which the always-invested version was not.
+#
+# Honest caveat: these three thresholds are additional parameters. They were set
+# to conventional values and NOT swept, so they are not fitted to this panel,
+# but they do widen the search and the Deflated Sharpe trial count should be
+# read accordingly. The worst CPCV path also falls (15.26% -> 3.04%): de-risking
+# costs the most in the paths that were already weakest.
+BREADTH_RISK_ON = 0.60      # above: full exposure
+BREADTH_RISK_OFF = 0.40     # below: minimum exposure
+BREADTH_MIN_EXPOSURE = 0.20
+
+
+def universe_breadth(closes, window: int = 200):
+    """Fraction of the universe above its own `window`-day SMA, per session."""
+    sma = closes.rolling(window, min_periods=window).mean()
+    n = closes.notna().sum(axis=1)
+    return (closes > sma).sum(axis=1) / n.replace(0, float("nan"))
+
+
+def breadth_exposure(breadth, risk_on: float = BREADTH_RISK_ON,
+                     risk_off: float = BREADTH_RISK_OFF,
+                     min_exposure: float = BREADTH_MIN_EXPOSURE):
+    """Target equity exposure from breadth, with hysteresis.
+
+    Above `risk_on` deploy fully; below `risk_off` cut to `min_exposure`; in
+    between HOLD whatever exposure was already set. Holding through the middle
+    band is the whole point — a continuous scale would rebalance on every wiggle
+    around the threshold.
+    """
+    out = []
+    cur = 1.0
+    for f in breadth:
+        if f is None or f != f:
+            out.append(cur)
+            continue
+        if f > risk_on:
+            cur = 1.0
+        elif f < risk_off:
+            cur = min_exposure
+        # middle band: unchanged
+        out.append(cur)
+    return out
+
+
 # Default basket width. Measured across N=3..30, the after-tax CAGR is almost
 # flat (25.84% at N=3, 23.80% at N=15) while per-position weight falls from
 # 33.3% to 6.7%. A three-stock book cannot survive one promoter-default or
@@ -83,7 +155,8 @@ DEFAULT_TOP_N = 15
 def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
                       hold_days: int = 63, panel=None,
                       min_composite: float | None = None,
-                      cash_yield: float = SWEPT_CASH_YIELD) -> dict:
+                      cash_yield: float = SWEPT_CASH_YIELD,
+                      breadth_scaled: bool = True) -> dict:
     """Monthly: rank by the equal-weight percentile composite of the price
     clusters (12-1 momentum, MQI, trend vs 200DMA, inverted vol, inverted
     crowding); hold the top N equal-weighted for `hold_days`; costs charged
@@ -135,6 +208,12 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
     cost = DEFAULT_ROUND_TRIP_COST_PCT / 100
 
     tranches: list[list] = [[] for _ in range(K)]
+    exposure_at: dict = {}
+    if breadth_scaled:
+        _b = universe_breadth(closes)
+        _e = breadth_exposure(_b.tolist())
+        exposure_at = dict(zip(closes.index, _e))
+
     period_rets, nifty_rets = [], []
     book_states: list = []
     turnover_log = []
@@ -172,6 +251,7 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
         # that was actually sitting idle.
         cash_period = (1.0 + cash_yield) ** (21.0 / 252.0) - 1.0
         cash_period_daily = (1.0 + cash_yield) ** (1.0 / 252.0) - 1.0
+        expo = exposure_at.get(t, 1.0) if breadth_scaled else 1.0
         leg_rets, invested_legs = [], 0
         for picks in tranches:
             held = [p for p in picks if p in fwd21.columns] if picks else []
@@ -186,7 +266,10 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
         if not leg_rets:
             continue
         invested_frac = invested_legs / max(len(tranches), 1)
-        r = sum(leg_rets) / len(leg_rets) - period_cost
+        # Breadth-scaled exposure: the unallocated remainder earns the swept
+        # yield rather than the active return, so de-risking is costed honestly.
+        active = sum(leg_rets) / len(leg_rets)
+        r = expo * active + (1 - expo) * cash_period - period_cost * expo
         # snapshot the whole book so a DAILY mark-to-market curve can be built.
         # Drawdown measured on 21-day steps is blind to everything inside a
         # step: a book down 45% mid-March 2020 and back to -15% by the step
@@ -256,7 +339,9 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
                 legs.append(float(v.mean()) if not v.empty else cash_period_daily)
             if not legs:
                 continue
-            deq *= (1.0 + sum(legs) / len(legs))
+            ex_d = exposure_at.get(day, 1.0) if breadth_scaled else 1.0
+            act_d = sum(legs) / len(legs)
+            deq *= (1.0 + ex_d * act_d + (1 - ex_d) * cash_period_daily)
             dpeak = max(dpeak, deq)
             dmdd = min(dmdd, deq / dpeak - 1.0)
             daily_curve_pts += 1
@@ -337,6 +422,9 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
         "mean_invested_frac": round(
             sum(p.get("invested_frac", 1.0) for p in period_rets) / len(period_rets), 3),
         "swept_cash_yield_pct": round(cash_yield * 100, 2),
+        "breadth_scaled": breadth_scaled,
+        "mean_exposure": (round(sum(exposure_at.values()) / len(exposure_at), 3)
+                          if exposure_at else 1.0),
         # At ~370% annualised turnover essentially every gain is short-term and
         # realised within the year, so STCG is paid annually and compounds on
         # the after-tax base. A passive holder defers to 12.5% LTCG at exit, so
