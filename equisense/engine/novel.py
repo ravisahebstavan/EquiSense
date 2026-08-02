@@ -290,10 +290,27 @@ def trend_value_tension(pe_pctile: Optional[float], trend_above_ma_pct: Optional
 
 # ---------------------------------------------------------------- crowding
 
+# Below this multiple of its own recent median volume, a session is too thin for
+# its delivery percentage to mean anything. When a stock locks at a circuit the
+# order book freezes, intraday square-offs cannot clear, and the delivery RATIO
+# mathematically rises toward 100% on a tiny absolute number of shares. Reading
+# that as institutional accumulation would point the signal at exactly the names
+# that are locked and un-exitable.
+#
+# Not yet observed in our own data — the delivery archive currently covers 50
+# Nifty-50 names over 9 sessions, delivery spans 20.91%-83.07%, and nothing sits
+# above 90%. Those names are in F&O and have no circuit limits at all, only a
+# 10% dynamic band, so the sample CANNOT contain the pattern. The guard is
+# therefore precautionary rather than evidence-driven, and is cheap: it only
+# suppresses a modifier on sessions where the underlying number is meaningless.
+MIN_VOLUME_RATIO_FOR_DELIVERY = 0.30
+
+
 def crowding_proxy(closes: Sequence[float], volumes: Sequence[Optional[float]],
                    period: str = "",
                    delivery_pct: Optional[float] = None,
-                   delivery_mean_pct: Optional[float] = None) -> Metric:
+                   delivery_mean_pct: Optional[float] = None,
+                   volume_ratio: Optional[float] = None) -> Metric:
     """Participation Heat — EquiSense original crowding proxy.
 
     Volume surge × recent price extension. High values = late-crowd conditions;
@@ -321,6 +338,11 @@ def crowding_proxy(closes: Sequence[float], volumes: Sequence[Optional[float]],
     if len(closes) >= 64 and closes[-64] > 0:
         r63 = (closes[-1] / closes[-64] - 1) * 100
     delivery_mult = 1.0
+    # a circuit-locked session reports a delivery RATIO near 100% on almost no
+    # shares; suppress the modifier rather than read it as accumulation
+    if (volume_ratio is not None
+            and volume_ratio < MIN_VOLUME_RATIO_FOR_DELIVERY):
+        delivery_pct = None
     if delivery_pct is not None and delivery_mean_pct:
         # ratio < 1 => delivery below this stock's own norm => churn
         ratio = delivery_pct / delivery_mean_pct

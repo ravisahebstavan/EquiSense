@@ -116,11 +116,33 @@ BREADTH_RISK_OFF = 0.40     # below: minimum exposure
 BREADTH_MIN_EXPOSURE = 0.20
 
 
-def universe_breadth(closes, window: int = 200):
-    """Fraction of the universe above its own `window`-day SMA, per session."""
+# Minimum share of the universe that must be priced for a breadth reading to be
+# trusted. Free keyless scrapers fail partially — 470 names land and 31 do not —
+# and both ways of handling that corrupt F. Carrying stale prices forward freezes
+# collapsing names at pre-crash levels and inflates breadth exactly when it
+# matters; dropping them changes the denominator, which biases F if the failures
+# cluster by sector or cap size. Neither is acceptable, so a thin session
+# produces no reading at all and the previous exposure is held.
+MIN_UNIVERSE_COMPLETENESS = 0.95
+
+
+def universe_breadth(closes, window: int = 200,
+                     min_completeness: float = MIN_UNIVERSE_COMPLETENESS):
+    """Fraction of the universe above its own `window`-day SMA, per session.
+
+    Returns NaN on any session where too little of the universe is priced.
+    `breadth_exposure` holds the previous exposure through a NaN, which is the
+    correct failure mode: an ingestion outage must not be able to move real
+    money by pretending the market improved.
+    """
     sma = closes.rolling(window, min_periods=window).mean()
-    n = closes.notna().sum(axis=1)
-    return (closes > sma).sum(axis=1) / n.replace(0, float("nan"))
+    priced = closes.notna().sum(axis=1)
+    # measured against the universe's own recent peak coverage, not a constant,
+    # so the guard adapts as names are added or delisted
+    expected = priced.rolling(63, min_periods=5).max()
+    complete = priced / expected.replace(0, float("nan"))
+    raw = (closes > sma).sum(axis=1) / priced.replace(0, float("nan"))
+    return raw.where(complete >= min_completeness)
 
 
 def breadth_exposure(breadth, risk_on: float = BREADTH_RISK_ON,

@@ -366,3 +366,34 @@ def test_the_default_thresholds_are_recorded_as_grid_best_not_neutral():
     head = head[:head.index("def universe_breadth")]
     assert "signature of selection" in head
     assert "19.2" in head, "the honest median estimate must be recorded"
+
+
+def test_breadth_refuses_a_reading_on_an_incomplete_session():
+    """Free keyless scrapers fail partially. Carrying stale prices forward
+    freezes collapsing names at pre-crash levels and INFLATES breadth exactly
+    when it matters; dropping them changes the denominator and biases F if the
+    failures cluster by sector. Neither is acceptable, so a thin session must
+    produce no reading at all."""
+    import numpy as np
+    import pandas as pd
+
+    from equisense.research.backtest import universe_breadth
+    idx = pd.bdate_range("2020-01-01", periods=300)
+    df = pd.DataFrame({f"S{i}": np.linspace(100, 200, 300) for i in range(20)},
+                      index=idx)
+    full = universe_breadth(df)
+    assert full.iloc[-1] == 1.0, "a fully priced session should read normally"
+
+    # simulate an outage: only 3 of 20 names ingest on the final session
+    broken = df.copy()
+    broken.iloc[-1, 3:] = np.nan
+    out = universe_breadth(broken)
+    assert pd.isna(out.iloc[-1]), "breadth was computed from a 15% sample"
+
+
+def test_a_missing_breadth_reading_holds_exposure_rather_than_resetting():
+    """The correct failure mode: an ingestion outage must not be able to move
+    real money by implying the market improved."""
+    from equisense.research.backtest import breadth_exposure
+    e = breadth_exposure([0.30, float("nan"), float("nan"), 0.30])
+    assert e == [0.2, 0.2, 0.2, 0.2], "an outage reset exposure to full risk"
