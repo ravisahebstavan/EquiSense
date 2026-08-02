@@ -40,6 +40,11 @@ MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
        "NOV", "DEC"]
 TIMEOUT = 30
 
+# How long a symbol must be absent before it counts as gone. Three sampling
+# intervals: one missed monthly sample is routine (no trade that day, or a
+# different series), a full quarter of silence is not.
+DELISTED_ABSENT_DAYS = 100
+
 
 def bhavcopy_urls(d: dt.date) -> list[str]:
     """Both formats. NSE switched layout in 2024 and kept the old archive, so a
@@ -126,14 +131,20 @@ def ingest_listing_history(session: Session, start: Optional[dt.date] = None,
                 "dates_attempted": len(dates)}
 
     newest = max(last.values())
+    # A name counts as gone only if it has been absent for several consecutive
+    # samples, not merely missing from the newest one. With a monthly grid a
+    # live company that simply did not trade on the single sampled day — or
+    # traded under a different series that day — would otherwise be recorded as
+    # delisted. Measured: the naive rule flagged 1,058 symbols, and 31 of the
+    # 40 longest-lived among them still return ~2,470 daily bars from the
+    # price provider, i.e. they never stopped trading at all.
+    gone_before = newest - dt.timedelta(days=DELISTED_ABSENT_DAYS)
     panel = {c.ticker.upper() for c in session.scalars(select(Company)).all()}
     existing = {r.symbol: r for r in session.scalars(select(ListingWindow)).all()}
 
     written = 0
     for sym, f in first.items():
-        # "Delisted" means it stopped appearing BEFORE the newest session we
-        # sampled. A symbol last seen at the newest session is simply current.
-        delisted = last[sym] < newest
+        delisted = last[sym] < gone_before
         row = existing.get(sym)
         if row is None:
             row = ListingWindow(symbol=sym, first_seen=f, last_seen=last[sym])
@@ -146,8 +157,8 @@ def ingest_listing_history(session: Session, start: Optional[dt.date] = None,
         written += 1
     session.commit()
 
-    delisted = sum(1 for s in first if last[s] < newest)
-    missing = sum(1 for s in first if last[s] < newest and s not in panel)
+    delisted = sum(1 for s in first if last[s] < gone_before)
+    missing = sum(1 for s in first if last[s] < gone_before and s not in panel)
     return {
         "ok": True,
         "dates_sampled": ok_dates,

@@ -86,3 +86,19 @@ def test_report_refuses_to_call_the_raw_gap_survivorship(db):
 def test_report_is_honest_when_nothing_is_ingested(db):
     r = survivorship_report(db)
     assert r["available"] is False and "not ingested" in r["reason"]
+
+
+def test_one_missed_sample_does_not_mark_a_live_company_delisted(db):
+    """The bug this replaced. With a monthly grid, a live company that simply
+    did not trade on the single sampled day was recorded as delisted. The naive
+    rule flagged 1,058 symbols and 31 of the 40 longest-lived among them still
+    return ~2,470 daily bars from the price provider — they never stopped
+    trading at all."""
+    import datetime as dt
+
+    from equisense.ingestion.listings import DELISTED_ABSENT_DAYS
+    newest = dt.date(2026, 7, 10)
+    # missed only the final monthly sample
+    assert (newest - dt.date(2026, 6, 10)).days < DELISTED_ABSENT_DAYS
+    # silent for a full quarter
+    assert (newest - dt.date(2026, 1, 10)).days > DELISTED_ABSENT_DAYS
