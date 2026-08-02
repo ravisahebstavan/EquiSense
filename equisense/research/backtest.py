@@ -49,8 +49,21 @@ def moving_block_bootstrap_ci(values: list[float], block_len: int,
     return (lo, hi)
 
 
+# Idle cash in an Indian trading account earns nothing; swept into a liquid fund
+# it earns roughly this. Applied to any unallocated weight so that abstaining is
+# costed honestly rather than being free.
+SWEPT_CASH_YIELD = 0.055
+
+# Short-term capital gains on listed Indian equity. At ~370% annualised turnover
+# essentially every gain here is short-term and realised within the year, so the
+# strategy pays this annually while a passive holder defers to 12.5% LTCG.
+STCG_RATE = 0.20
+
+
 def strategy_backtest(session: Session, top_n: int = 3,
-                      hold_days: int = 63, panel=None) -> dict:
+                      hold_days: int = 63, panel=None,
+                      min_composite: float | None = None,
+                      cash_yield: float = SWEPT_CASH_YIELD) -> dict:
     """Monthly: rank by the equal-weight percentile composite of the price
     clusters (12-1 momentum, MQI, trend vs 200DMA, inverted vol, inverted
     crowding); hold the top N equal-weighted for `hold_days`; costs charged
@@ -115,7 +128,16 @@ def strategy_backtest(session: Session, top_n: int = 3,
 
         slot = i % K
         old = set(tranches[slot])
-        new_picks = list(row.nlargest(top_n).index)
+        # An absolute quality bar, not just a relative ranking. Without one the
+        # backtest is ALWAYS fully invested in the top 3 by construction, while
+        # the live screen abstains — on the current universe it returns 0 long
+        # candidates out of 395. Measuring an always-invested rule and running
+        # an abstaining one means the reported return describes a strategy
+        # nobody trades. Unfilled slots sit in cash and earn the swept yield.
+        ranked = row.nlargest(top_n)
+        if min_composite is not None:
+            ranked = ranked[ranked >= min_composite]
+        new_picks = list(ranked.index)
         # cost is paid only on names actually changing hands in the rotating
         # tranche, and that tranche is 1/K of the book
         changed = len(old.symmetric_difference(set(new_picks))) / max(1, 2 * top_n)
@@ -123,21 +145,31 @@ def strategy_backtest(session: Session, top_n: int = 3,
         tranches[slot] = new_picks
         turnover_log.append(round(changed / K * 100, 2))
 
-        live = [p for p in tranches if p]
-        if not live:
-            continue
-        leg_rets = []
-        for picks in live:
-            o = fwd21.loc[t, [p for p in picks if p in fwd21.columns]].dropna()
-            if not o.empty:
-                leg_rets.append(float(o.mean()))
+        # Every tranche is a slot of the book whether or not it holds anything.
+        # Counting only the FILLED ones would silently rescale an abstaining
+        # book back to fully invested and hand it the active return on capital
+        # that was actually sitting idle.
+        cash_period = (1.0 + cash_yield) ** (21.0 / 252.0) - 1.0
+        leg_rets, invested_legs = [], 0
+        for picks in tranches:
+            held = [p for p in picks if p in fwd21.columns] if picks else []
+            o = fwd21.loc[t, held].dropna() if held else None
+            if o is not None and not o.empty:
+                filled = len(o) / max(top_n, 1)
+                # partially filled slot: the rest of it earns the swept yield
+                leg_rets.append(float(o.mean()) * filled + cash_period * (1 - filled))
+                invested_legs += 1
+            else:
+                leg_rets.append(cash_period)
         if not leg_rets:
             continue
+        invested_frac = invested_legs / max(len(tranches), 1)
         r = sum(leg_rets) / len(leg_rets) - period_cost
         period_rets.append({"date": str(t.date() if hasattr(t, "date") else t),
                             "ret_net_pct": round(r * 100, 2),
                             "picks": tranches[slot],
-                            "live_tranches": len(live)})
+                            "invested_frac": round(invested_frac, 3),
+                            "live_tranches": invested_legs})
         idx = nifty_series.index
         try:
             i0 = idx.get_indexer([t], method="ffill")[0]
@@ -219,6 +251,24 @@ def strategy_backtest(session: Session, top_n: int = 3,
         # the diagnostic: an edge whose paths run +25% to +40% is a different
         # object from one running -5% to +80% with the same mean, and a single
         # number cannot distinguish them.
+        # Mean fraction of the book actually invested. A number below 1.0 means
+        # the strategy sat in cash, and the return above already reflects that
+        # at the swept yield rather than pretending idle capital was working.
+        "mean_invested_frac": round(
+            sum(p.get("invested_frac", 1.0) for p in period_rets) / len(period_rets), 3),
+        "swept_cash_yield_pct": round(cash_yield * 100, 2),
+        # At ~370% annualised turnover essentially every gain is short-term and
+        # realised within the year, so STCG is paid annually and compounds on
+        # the after-tax base. A passive holder defers to 12.5% LTCG at exit, so
+        # comparing gross active against gross passive overstates the edge.
+        "after_stcg_annualized_pct": round(
+            ((1 + mean_r) ** ann_factor - 1) * 100 * (1 - STCG_RATE), 2),
+        "stcg_rate_pct": round(STCG_RATE * 100, 1),
+        "tax_note": (
+            "Active return is shown after 20% STCG applied annually, because "
+            "this turnover realises gains every year. The passive comparison "
+            "defers to 12.5% LTCG at redemption, so the honest spread is "
+            "after-tax active minus after-tax passive, not gross minus gross."),
         "cpcv": cpcv_evaluate(rs, n_blocks=6, k_test=2,
                               label_span=max(1, hold_days // 21), embargo=1,
                               periods_per_year=252.0 / 21),
