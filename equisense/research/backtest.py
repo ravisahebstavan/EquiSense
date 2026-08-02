@@ -90,11 +90,27 @@ STCG_RATE = 0.20
 # alternative the scaled book is now better on BOTH axes — higher return and a
 # third of the drawdown — which the always-invested version was not.
 #
-# Honest caveat: these three thresholds are additional parameters. They were set
-# to conventional values and NOT swept, so they are not fitted to this panel,
-# but they do widen the search and the Deflated Sharpe trial count should be
-# read accordingly. The worst CPCV path also falls (15.26% -> 3.04%): de-risking
-# costs the most in the paths that were already weakest.
+# THRESHOLD SENSITIVITY — measured across 8 configurations, and the result
+# demands care. After-tax CAGR ranges 15.67% to 20.98% (spread 5.31pp) and daily
+# drawdown -9.97% to -18.06% (spread 8.09pp). The defaults below scored BEST in
+# that grid, which is the signature of selection even though they were set to
+# conventional values rather than optimised. Treat the honest central estimate
+# as the grid MEDIAN — roughly 19.2% after tax at about -14.5% drawdown — not
+# the 20.06%/-11.85% these particular thresholds produce.
+#
+# What survives regardless of threshold: every configuration cuts drawdown far
+# below the always-invested -34.26%, and every one beats passive on
+# return-per-unit-drawdown (0.96-1.69 against 0.57). The MECHANISM is robust;
+# the precise number is not.
+#
+# The worst CPCV path also falls (15.26% -> 3.04%): de-risking costs the most in
+# the paths that were already weakest.
+#
+# NOTE for anyone changing these: `breadth_exposure` binds them as DEFAULT
+# ARGUMENTS, which Python evaluates once at import. Reassigning the module
+# constants afterwards does nothing — an earlier sensitivity run returned eight
+# identical rows for exactly that reason and looked like perfect robustness.
+# Pass the values explicitly.
 BREADTH_RISK_ON = 0.60      # above: full exposure
 BREADTH_RISK_OFF = 0.40     # below: minimum exposure
 BREADTH_MIN_EXPOSURE = 0.20

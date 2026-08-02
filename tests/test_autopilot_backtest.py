@@ -332,5 +332,37 @@ def test_breadth_scaling_is_on_by_default_and_documented_with_its_cost():
     assert sig.parameters["breadth_scaled"].default is True
     head = inspect.getsource(backtest)
     head = head[:head.index("def universe_breadth")]
-    assert "NOT swept" in head, "must state the thresholds were not fitted"
+    assert "signature of selection" in head, (
+        "must state the defaults scored best in the grid, which is a selection "
+        "signature even when they were not deliberately optimised")
     assert "3.04" in head, "must record that the worst CPCV path degrades"
+
+
+def test_breadth_thresholds_must_be_passed_explicitly_to_take_effect():
+    """`breadth_exposure` binds the thresholds as DEFAULT ARGUMENTS, which
+    Python evaluates once at import. Reassigning the module constants afterwards
+    changes nothing — a sensitivity run did exactly that and returned eight
+    identical rows, which looked like perfect robustness and was a bug in the
+    test. Anyone varying these must pass them explicitly."""
+    import equisense.research.backtest as B
+    original = B.BREADTH_RISK_OFF
+    try:
+        B.BREADTH_RISK_OFF = 0.99          # would de-risk almost always...
+        via_module = B.breadth_exposure([0.50])
+        via_explicit = B.breadth_exposure([0.50], risk_off=0.99)
+        assert via_module == [1.0], "module reassignment silently had no effect"
+        assert via_explicit == [B.BREADTH_MIN_EXPOSURE], "explicit pass ignored"
+    finally:
+        B.BREADTH_RISK_OFF = original
+
+
+def test_the_default_thresholds_are_recorded_as_grid_best_not_neutral():
+    """They scored best of 8 configurations. Presenting their result as the
+    expected outcome would overstate it; the grid median is the honest figure."""
+    import inspect
+
+    from equisense.research import backtest
+    head = inspect.getsource(backtest)
+    head = head[:head.index("def universe_breadth")]
+    assert "signature of selection" in head
+    assert "19.2" in head, "the honest median estimate must be recorded"
