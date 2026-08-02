@@ -50,13 +50,19 @@ def moving_block_bootstrap_ci(values: list[float], block_len: int,
 
 
 def strategy_backtest(session: Session, top_n: int = 3,
-                      hold_days: int = 63) -> dict:
+                      hold_days: int = 63, panel=None) -> dict:
     """Monthly: rank by the equal-weight percentile composite of the price
     clusters (12-1 momentum, MQI, trend vs 200DMA, inverted vol, inverted
     crowding); hold the top N equal-weighted for `hold_days`; costs charged
     per round trip. Features at t use data ≤ t only (the leakage harness
     covers the underlying builders)."""
-    closes, volumes = load_price_panel(session)
+    # `panel` lets a caller substitute the price universe — specifically to add
+    # back the names that stopped trading. Reusing THIS function rather than
+    # reimplementing it matters: a hand-rolled replication compounded 63-day
+    # holding returns at 21-day steps and produced +113%/yr against this
+    # function's 33%, because the overlapping-tranche accounting below is
+    # exactly the part that is easy to get wrong.
+    closes, volumes = load_price_panel(session) if panel is None else panel
     nifty = load_nifty(session)
 
     rets = closes.pct_change()
