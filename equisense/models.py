@@ -366,6 +366,33 @@ class DerivativeQuote(Base):
     lot_size: Mapped[int | None] = mapped_column(Integer)
 
 
+class ListingWindow(Base):
+    """When each NSE symbol was actually tradeable — the point-in-time universe.
+
+    Every backtest here runs on TODAY'S index membership backfilled, which means
+    a name that was listed in 2018 and later delisted is absent entirely. That
+    is survivorship bias, and it inflates every absolute return the panel
+    produces (the reconstructed equal-weight basket returns 24.67%/yr against
+    the published NIFTY 500's 12.33%).
+
+    Storing one row per SYMBOL rather than per symbol-day is what makes this
+    affordable on a 512 MB tier: ~3,400 rows instead of ~5 million. First and
+    last sighting plus the sample count is enough to answer the only question
+    the studies need — "was this name tradeable on date D?" — to within the
+    sampling interval.
+    """
+    __tablename__ = "listing_windows"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    first_seen: Mapped[date] = mapped_column(Date, index=True)
+    last_seen: Mapped[date] = mapped_column(Date, index=True)
+    sessions_sampled: Mapped[int] = mapped_column(Integer, default=0)
+    # True once last_seen falls short of the newest sampled session: the symbol
+    # stopped trading. This is the population the panel is missing.
+    is_delisted: Mapped[bool] = mapped_column(Boolean, default=False)
+    in_panel: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class DeliveryStat(Base):
     """Security-wise delivery position from the NSE MTO file.
 

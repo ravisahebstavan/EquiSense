@@ -200,8 +200,13 @@ def within_cluster_effective_n(session: Session) -> Optional[dict]:
     draws. Measured on the live universe the trend cluster's 6 signals are
     n_eff 1.46 — mqi is a transform of momentum (rho +0.99), rel_strength and
     sector_rel_mom share the same 63d return (+0.94), dist_52w and trend the
-    same price level (+0.82). Understating the null there overstates net_z by
-    ~2x, which is the difference between abstaining and issuing a trade.
+    same price level (+0.82). Understating the null inside the TREND cluster
+    overstates that cluster's contribution by sqrt(6/1.56) ~ 2.0x. The effect on
+    net_z is smaller, because net_z blends five clusters and the others correct
+    less: measured across 390 names, max |net_z| falls 2.90 -> 2.10, i.e. the
+    aggregate inflation was 1.39x, not 2x. Still decisive — it is the difference
+    between abstaining and issuing a trade — but the per-cluster and aggregate
+    figures are not the same number and were previously conflated.
 
     These correlations are STRUCTURAL, not signal-driven: mqi is built out of
     momentum, so the two move together for an uninformative name as much as an
