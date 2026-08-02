@@ -248,6 +248,22 @@ def build_universe_snapshot(session: Session) -> dict:
         if lag > STALE_SESSIONS:
             stale[c.ticker] = lag
 
+        # Corporate-action guard. A free feed adjusts splits retroactively but
+        # handles DEMERGERS inconsistently, and there is a window where the
+        # action reads as a collapse — VEDL printed -64.9% on its demerger,
+        # ABFRL -66.6%. Trailing returns spanning such a bar are not
+        # interpretable, so the name is withheld from ranking.
+        suspect = {"suspect": False, "reason": None}
+        if len(closes) >= 2 and len(volumes) >= 21:
+            recent_v = [v for v in volumes[-63:] if v]
+            med_v = sorted(recent_v)[len(recent_v) // 2] if recent_v else None
+            vr = (volumes[-1] / med_v) if (med_v and volumes[-1]) else None
+            for k in range(1, min(22, len(closes))):
+                f = technical.flag_data_suspect(closes[-k - 1], closes[-k], vr)
+                if f["suspect"]:
+                    suspect = f
+                    break
+
         window = closes[-252:]  # 1y of closes, downsampled to ≤40 points
         step = max(1, len(window) // 40)
         adv = technical.adv_crore(closes, volumes)
@@ -260,6 +276,8 @@ def build_universe_snapshot(session: Session) -> dict:
             "adv_cr": None if adv is None else round(adv, 2),
             "spark": [round(v, 1) for v in window[::step]][-40:],
             "stale_sessions": stale.get(c.ticker, 0),
+            "data_suspect": suspect["suspect"],
+            "data_suspect_reason": suspect.get("reason"),
             "signals": sig,
         })
 

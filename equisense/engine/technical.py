@@ -396,3 +396,48 @@ def best_available_vol(closes, opens=None, highs=None, lows=None,
                 "realized volatility — roughly 6x less efficient than Yang-Zhang "
                 "for the same window. Re-ingest prices to populate OHLC.")
     return m
+
+
+# ---------------------------------------------------- corporate-action guard
+
+# A single-session move this large in a Nifty-500 name is not an ordinary market
+# event. Measured across 994,965 real bars only 9 exist, and inspecting them
+# they are corporate actions rather than trading: VEDL -64.9% (demerger),
+# ABFRL -66.6% (demerger), plus three bars dated on an NSE holiday.
+SUSPECT_ABS_RETURN = 0.45
+
+
+def flag_data_suspect(prev_close: float | None, close: float | None,
+                      volume_ratio: float | None = None) -> dict:
+    """Is this bar safe to compute a momentum signal from?
+
+    Free price feeds adjust splits and bonuses retroactively but handle
+    DEMERGERS inconsistently, and there is a window — often 24-48h for Indian
+    names — where a corporate action reads as a catastrophic price collapse. A
+    momentum engine sees VEDL at -64.9% and concludes the company imploded, when
+    shareholders in fact received stock in the spun-off entity.
+
+    The discriminator is not "data error vs real event", because that cannot be
+    settled from a free feed. It does not need to be: a -45% single session in a
+    Nifty-500 name makes the momentum signal meaningless EITHER WAY. If it is a
+    corporate action the number is an artefact; if it is genuine the name is in
+    a situation no trailing-return model describes. Abstaining is correct in
+    both branches, which is what makes the rule robust to the ambiguity.
+    """
+    if prev_close is None or close is None or prev_close <= 0:
+        return {"suspect": False, "reason": None}
+    ret = close / prev_close - 1.0
+    if abs(ret) < SUSPECT_ABS_RETURN:
+        return {"suspect": False, "reason": None}
+    kind = ("possible unadjusted corporate action (split, bonus or demerger)"
+            if volume_ratio is not None and volume_ratio >= 0.7
+            else "extreme move on thin volume")
+    return {
+        "suspect": True,
+        "return_pct": round(ret * 100, 2),
+        "volume_ratio": None if volume_ratio is None else round(volume_ratio, 2),
+        "reason": (f"single-session move {ret * 100:+.1f}% — {kind}. Trailing "
+                   "returns spanning this bar are not interpretable, so the "
+                   "name is withheld from ranking rather than scored on a "
+                   "number that may not describe a price change at all."),
+    }

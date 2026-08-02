@@ -101,6 +101,11 @@ def universe_signals(session: Session) -> dict[str, dict[str, Optional[float]]]:
         # index constituents caused, from a different direction.
         if item.get("stale_sessions"):
             continue
+        # A bar carrying an unadjusted corporate action makes every trailing
+        # return spanning it meaningless, so the name must not set anyone else's
+        # percentile either.
+        if item.get("data_suspect"):
+            continue
         t = item["ticker"]
         for k in SIGNAL_KEYS:
             out[k][t] = item["signals"].get(k)

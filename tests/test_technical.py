@@ -86,3 +86,40 @@ def test_tvt_quadrants():
     m2 = novel.trend_value_tension(85.0, -4.0)  # expensive + downtrend
     assert "unwinding" in m2.inputs["quadrant"]
     assert novel.trend_value_tension(None, 5.0).value is None
+
+
+# ------------------------------------------------- corporate-action guard
+
+def test_ordinary_moves_are_not_flagged():
+    from equisense.engine.technical import flag_data_suspect
+    assert flag_data_suspect(100.0, 92.0, 1.2)["suspect"] is False   # -8%
+    assert flag_data_suspect(100.0, 115.0, 3.0)["suspect"] is False  # +15%
+
+
+def test_a_demerger_sized_drop_is_flagged():
+    """VEDL printed -64.9% on 4.88x volume when Vedanta demerged, and ABFRL
+    -66.6% on 18x. A momentum engine reads those as the company imploding, when
+    holders in fact received stock in the spun-off entity."""
+    from equisense.engine.technical import flag_data_suspect
+    out = flag_data_suspect(775.0, 271.55, 4.88)
+    assert out["suspect"] is True
+    assert out["return_pct"] < -60
+    assert "corporate action" in out["reason"]
+
+
+def test_the_rule_does_not_need_to_distinguish_error_from_reality():
+    """The discriminator cannot be settled from a free feed, and does not need
+    to be: a -45% single session makes trailing returns meaningless whether it
+    is an artefact or a genuine collapse. Both branches flag."""
+    from equisense.engine.technical import flag_data_suspect
+    high_vol = flag_data_suspect(100.0, 50.0, 5.0)
+    thin_vol = flag_data_suspect(100.0, 50.0, 0.1)
+    assert high_vol["suspect"] and thin_vol["suspect"]
+    assert "corporate action" in high_vol["reason"]
+    assert "thin volume" in thin_vol["reason"]
+
+
+def test_missing_or_degenerate_input_is_not_flagged():
+    from equisense.engine.technical import flag_data_suspect
+    assert flag_data_suspect(None, 50.0, 1.0)["suspect"] is False
+    assert flag_data_suspect(0.0, 50.0, 1.0)["suspect"] is False

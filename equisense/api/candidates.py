@@ -255,6 +255,10 @@ def qualified_candidates(session: Session, top_n: int = 8,
         # position than a typical name would have been given — missing data
         # resolving in the optimistic direction, on the one input that sets the
         # stop. live.py already skips sizing when vol is unknown; this now matches.
+        if item.get("data_suspect"):
+            # withheld rather than scored on a number that may not describe a
+            # price change at all
+            continue
         vol_ann = item["signals"].get("vol")
         if not vol_ann:
             continue
