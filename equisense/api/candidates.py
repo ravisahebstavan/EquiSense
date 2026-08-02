@@ -306,6 +306,23 @@ def qualified_candidates(session: Session, top_n: int = 8,
         })
 
     candidates.sort(key=lambda c: (-c["tradable"], -c["net_score"]))
+
+    # Runtime governance veto. The catastrophe this book cannot survive is not a
+    # bad momentum reading — it is an insolvency filing or forensic audit on a
+    # name it already holds, which gaps down through consecutive lower circuits
+    # with no exit. Fetched at scan time and discarded, so storage is untouched.
+    gov = {"available": False, "vetoed": {}}
+    try:
+        from ..ingestion.nse_alerts import governance_vetoes
+        gov = governance_vetoes([c["ticker"] for c in candidates])
+    except Exception as exc:                       # noqa: BLE001 - never block a scan
+        gov = {"available": False, "reason": f"{type(exc).__name__}", "vetoed": {}}
+    for c in candidates:
+        reason = (gov.get("vetoed") or {}).get(c["ticker"])
+        if reason:
+            c["tradable"] = False
+            c["gates"] = list(c.get("gates") or []) + [f"failed: {reason}"]
+
     _apply_diversification_gate(session, candidates)
     candidates.sort(key=lambda c: (-c["tradable"], -c["net_score"]))  # re-sort post-gate
 
@@ -315,6 +332,11 @@ def qualified_candidates(session: Session, top_n: int = 8,
         "scanned": scanned,
         "verdict_counts": verdicts,
         "weights_status": weights_status,
+        "governance_filter": {
+            "available": gov.get("available", False),
+            "vetoed": list((gov.get("vetoed") or {})),
+            "note": gov.get("note"),
+        },
         "candidates": candidates[:top_n],
         "discipline_note": (
             f"{scanned} companies scanned; {verdicts['abstain']} abstained — "
