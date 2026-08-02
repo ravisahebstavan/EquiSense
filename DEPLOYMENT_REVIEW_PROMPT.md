@@ -98,14 +98,19 @@ Measured across N=3..30:
 | 3 | 32.30 | 25.84 | −21.31 | 1.45 | 20.99 | 33.3% | 16.7% |
 | 5 | 33.93 | 27.14 | −20.04 | 1.56 | 21.48 | 20.0% | 10.0% |
 | 10 | 29.40 | 23.52 | −19.99 | 1.40 | 16.05 | 10.0% | 5.0% |
-| **15 (default)** | **29.75** | **23.80** | −20.59 | 1.40 | 15.26 | **6.7%** | **3.3%** |
+| **15 (default)** | **29.75** | **23.80** | −20.59 (21d) / **−34.26 daily** | 1.40 | 15.26 | **6.7%** | **3.3%** |
 | 20 | 28.37 | 22.69 | −21.19 | 1.37 | 13.97 | 5.0% | 2.5% |
 
 The CAGR is nearly flat while catastrophe exposure falls fivefold, so the
 default is now N=15. Turnover also FALLS with N (30% → 25%), reducing cost and
-tax churn. **What widening does not buy: max drawdown is flat near −20% at
-every N**, because those drawdowns are market-wide rather than idiosyncratic.
-Diversification here protects against the single-name disaster, not the market.
+tax churn.
+
+**Drawdown correction — read this before sizing.** The −20.59% figure is
+peak-to-trough on 21-day rebalance steps and is blind to anything inside a step.
+Measured on a true DAILY mark-to-market series over 2,233 sessions the same book
+drew down **−34.26%** (N=3: −39.25%, N=20: −34.19%). Widening N does reduce
+drawdown once measured correctly, which the step-based number had hidden. Size
+against the daily figure.
 
 ### 4b. The finding that undercuts it
 
@@ -215,9 +220,10 @@ Answer these directly and plainly.
    the in-sample framing.
 3. **Given §4f, is active management justified at all here?** A passive
    S&P-500-in-INR allocation returned 17.08% with a *smaller* drawdown (−30.2%).
-   The N=15 active book returns 23.80% after STCG with −20.6% drawdown and 6.7%
-   per-position weight. That is a ~6.7pp after-tax premium at comparable
-   drawdown — but with key-person dependency on a custom stack, a free-tier
+   The N=15 active book returns 23.80% after STCG with a **−34.3% daily
+   mark-to-market drawdown** (not the −20.6% the step-based figure suggested)
+   and 6.7% per-position weight. That is a ~6.7pp after-tax premium at WORSE
+   drawdown than passive — but with key-person dependency on a custom stack, a free-tier
    database, monthly execution load, and zero forward track record. Is that
    premium worth it? Say so plainly if not.
 4. **What is the single highest-value missing capability?** Historical *index

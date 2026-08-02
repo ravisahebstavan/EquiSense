@@ -255,13 +255,50 @@ def test_default_basket_is_wide_enough_to_survive_a_single_name_shock():
     assert 100 / DEFAULT_TOP_N <= 10.0, "per-position weight above 10%"
 
 
-def test_widening_is_documented_as_not_reducing_drawdown():
-    """Max drawdown is flat near -20% at every N, because these drawdowns are
-    market-wide. Claiming diversification fixes drawdown would be wrong and
-    would invite oversizing."""
+def test_widening_reduces_daily_drawdown_and_the_source_says_so():
+    """REPLACES an earlier test that asserted the opposite. That test locked in
+    the claim "drawdown is flat near -20% across every N", which was true only
+    of the step-based measurement. On a daily mark-to-market series widening
+    clearly helps: -39.25% at N=3 against -34.26% at N=15. A test that pins a
+    false claim is worse than no test, because it defends the error."""
     import inspect
 
     from equisense.research import backtest
-    src = inspect.getsource(backtest)
-    head = src[:src.index("def strategy_backtest")]
-    assert "market-wide" in head and "not" in head
+    head = inspect.getsource(backtest)
+    head = head[:head.index("def strategy_backtest")]
+    assert "artefact" in head, "the retraction is not recorded"
+    assert "WORSE than" in head, "must state the drawdown is worse than passive"
+
+
+
+def test_drawdown_is_measured_on_a_daily_series_not_rebalance_steps():
+    """Peak-to-trough on 21-day steps cannot see inside a step. A book down 45%
+    mid-March 2020 and back to -15% by the step boundary records -15%, while the
+    holder watched half the capital vanish.
+
+    Measured on the real panel the gap is 13-18pp: N=15 reads -20.59% on steps
+    and -34.26% on a daily mark-to-market series. Sizing against the step figure
+    would size for a drawdown that never happened.
+    """
+    import inspect
+
+    from equisense.research import backtest
+    src = inspect.getsource(backtest.strategy_backtest)
+    assert "max_drawdown_daily_mtm_pct" in src
+    assert "daily_mtm_sessions" in src
+    # and the step figure must carry its own warning rather than sit unlabelled
+    assert "UNDERSTATES" in src
+
+
+def test_the_flat_drawdown_claim_is_retracted_in_the_source():
+    """An earlier commit asserted drawdown was flat near -20% across every N.
+    That was an artefact of step-based measurement; on daily MTM it falls from
+    -39.25% (N=3) to -34.26% (N=15). Leaving the wrong claim in place would
+    invite oversizing."""
+    import inspect
+
+    from equisense.research import backtest
+    head = inspect.getsource(backtest)
+    head = head[:head.index("def strategy_backtest")]
+    assert "artefact" in head and "21-day steps" in head
+    assert "-34.26" in head or "34.26" in head

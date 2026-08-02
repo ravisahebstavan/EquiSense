@@ -68,10 +68,15 @@ STCG_RATE = 0.20
 # consecutive lower circuits with no exit available. Paying ~2pp of CAGR to cut
 # that exposure fivefold is the trade any real book should make.
 #
-# Note what widening does NOT buy: max drawdown is flat at roughly -20% across
-# every N, because these drawdowns are market-wide rather than idiosyncratic.
-# Diversification here protects against the single-name catastrophe, not
-# against the market.
+# Widening DOES also reduce drawdown, but that only became visible once drawdown
+# was measured on a daily mark-to-market series: -39.25% at N=3 against -34.26%
+# at N=15. The earlier claim that drawdown was "flat near -20% across every N"
+# was an artefact of measuring peak-to-trough on 21-day steps, which cannot see
+# inside a step and understated the real figure by 13-18pp.
+#
+# The daily number is the one to size against: at N=15 this book drew down
+# -34.26%, which is WORSE than the -30.2% of a passive S&P-500-in-INR holding.
+# The active premium is real but it is not bought with less drawdown.
 DEFAULT_TOP_N = 15
 
 
@@ -131,6 +136,7 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
 
     tranches: list[list] = [[] for _ in range(K)]
     period_rets, nifty_rets = [], []
+    book_states: list = []
     turnover_log = []
     nifty_series = nifty
 
@@ -165,6 +171,7 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
         # book back to fully invested and hand it the active return on capital
         # that was actually sitting idle.
         cash_period = (1.0 + cash_yield) ** (21.0 / 252.0) - 1.0
+        cash_period_daily = (1.0 + cash_yield) ** (1.0 / 252.0) - 1.0
         leg_rets, invested_legs = [], 0
         for picks in tranches:
             held = [p for p in picks if p in fwd21.columns] if picks else []
@@ -180,6 +187,13 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
             continue
         invested_frac = invested_legs / max(len(tranches), 1)
         r = sum(leg_rets) / len(leg_rets) - period_cost
+        # snapshot the whole book so a DAILY mark-to-market curve can be built.
+        # Drawdown measured on 21-day steps is blind to everything inside a
+        # step: a book down 45% mid-March 2020 and back to -15% by the step
+        # boundary records -15%, while the person holding it watched half the
+        # capital disappear. That gap is the difference between a paper result
+        # and a live behavioural failure.
+        book_states.append((t, [list(x) for x in tranches]))
         period_rets.append({"date": str(t.date() if hasattr(t, "date") else t),
                             "ret_net_pct": round(r * 100, 2),
                             "picks": tranches[slot],
@@ -209,6 +223,46 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
                         deflated_sharpe_ratio)
     ci_lo, ci_hi = cluster_block_bootstrap_ci(
         [[x * 100] for x in rs], statistic="median")
+
+    # ---- TRUE daily mark-to-market drawdown --------------------------------
+    # The 21-day curve below is the right basis for return statistics (the steps
+    # are non-overlapping and independent), but it is the WRONG basis for
+    # drawdown. Peak-to-trough has to be measured on the series the holder
+    # actually experiences, which is daily. Rebuilt here by marking the book
+    # every session between rebalances.
+    daily_mdd = None
+    daily_curve_pts = 0
+    try:
+        daily_ret = closes.pct_change()
+        all_days = list(closes.index)
+        state_idx = {t: st for t, st in book_states}
+        state_dates = [t for t, _ in book_states]
+        cur = None
+        deq, dpeak, dmdd = 1.0, 1.0, 0.0
+        nxt = 0
+        for day in all_days:
+            while nxt < len(state_dates) and state_dates[nxt] <= day:
+                cur = state_idx[state_dates[nxt]]
+                nxt += 1
+            if cur is None:
+                continue
+            legs = []
+            for picks in cur:
+                held = [x for x in picks if x in daily_ret.columns]
+                if not held:
+                    legs.append(cash_period_daily)
+                    continue
+                v = daily_ret.loc[day, held].dropna()
+                legs.append(float(v.mean()) if not v.empty else cash_period_daily)
+            if not legs:
+                continue
+            deq *= (1.0 + sum(legs) / len(legs))
+            dpeak = max(dpeak, deq)
+            dmdd = min(dmdd, deq / dpeak - 1.0)
+            daily_curve_pts += 1
+        daily_mdd = round(dmdd * 100, 2)
+    except Exception:                                  # noqa: BLE001
+        daily_mdd = None
 
     # A real compounded equity curve: consecutive 21-day portfolio returns.
     eq, neq, curve, peak, mdd = 1.0, 1.0, [], 1.0, 0.0
@@ -260,7 +314,18 @@ def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
         "periods": len(rs), "n_eff": n_eff, "tranches": K,
         "mean_monthly_turnover_pct": round(sum(turnover_log) / len(turnover_log), 2)
         if turnover_log else None,
+        # 21-day-step drawdown, kept for continuity, but it UNDERSTATES what a
+        # holder lived through because it cannot see inside a step.
         "max_drawdown_pct": round(mdd * 100, 2),
+        # The number that matters: peak-to-trough on the daily series.
+        "max_drawdown_daily_mtm_pct": daily_mdd,
+        "daily_mtm_sessions": daily_curve_pts,
+        "drawdown_note": (
+            "Report the daily mark-to-market figure. The 21-day-step number is "
+            "blind to anything inside a step: a book down 45% mid-March 2020 and "
+            "back to -15% by the step boundary records -15%, while the holder "
+            "watched half the capital vanish. Position sizing must use the daily "
+            "figure or it will be sized for a drawdown that never happened."),
         "deflated_sharpe": dsr,
         # 15 out-of-sample paths instead of walk-forward's one. The spread is
         # the diagnostic: an edge whose paths run +25% to +40% is a different
