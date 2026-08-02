@@ -5,9 +5,12 @@ import pytest
 from equisense.research import learning as L
 
 
-def _dossier(h, clusters, net=0.2, verdict="long_candidate"):
-    return {"kind": "dossier", "hash": h, "verdict": verdict, "net_score": net,
-            "cluster_scores": clusters, "claim": {"direction": 1}}
+def _dossier(h, clusters, net=0.2, verdict="long_candidate", created_at=None):
+    d = {"kind": "dossier", "hash": h, "verdict": verdict, "net_score": net,
+         "cluster_scores": clusters, "claim": {"direction": 1}}
+    if created_at:
+        d["created_at"] = created_at
+    return d
 
 
 def _score(h, realized, hit, p=0.55):
@@ -16,14 +19,24 @@ def _score(h, realized, hit, p=0.55):
             "stated_probability": p, "brier": (p - (1 if hit else 0)) ** 2}
 
 
-def _history(n, trend_right_rate=0.8):
+def _history(n, trend_right_rate=0.8, spread_days=0):
     """n scored claims where the trend cluster is right `trend_right_rate` of
-    the time and the value cluster is right 50/50."""
+    the time and the value cluster is right 50/50.
+
+    `spread_days` staggers the claim dates. With 0 every claim shares one date,
+    which is ONE regime observation however many claims it contains — the gate
+    must refuse to unlock on that.
+    """
+    import datetime as _dt
+    base = _dt.date(2024, 1, 1)
     recs = []
     for i in range(n):
         trend_right = (i % 10) < trend_right_rate * 10
         realized = 5.0 if trend_right else -5.0
-        recs.append(_dossier(f"h{i}", {"trend": 0.3, "value": 0.3 if i % 2 else -0.3}))
+        when = (base + _dt.timedelta(days=(i * spread_days) // max(n, 1))
+                ).isoformat() if spread_days else base.isoformat()
+        recs.append(_dossier(f"h{i}", {"trend": 0.3, "value": 0.3 if i % 2 else -0.3},
+                             created_at=when))
         recs.append(_score(f"h{i}", realized, hit=realized > 0))
     return recs
 
@@ -43,8 +56,20 @@ def test_weights_stay_uniform_below_gate():
     assert "provisional" in status
 
 
+def test_a_single_regime_batch_does_not_unlock_weights():
+    """The failure this guards. The book holds ~15 names at once across
+    overlapping tranches, so one matured horizon retires a batch of claims that
+    all lived through the SAME market. If it rose, most succeeded. Counting
+    those as independent confirmations would unlock live weights on what is
+    really one regime observation."""
+    w, status = L.cluster_weights(_history(200, spread_days=0))
+    assert w is None, "200 same-date claims unlocked the weights"
+    assert "independent" in status and "cycle" in status
+
+
 def test_weights_unlock_past_gate_and_are_bounded():
-    w, status = L.cluster_weights(_history(200))
+    # spread across ~3 years so the ledger spans several non-overlapping cycles
+    w, status = L.cluster_weights(_history(200, spread_days=1000))
     assert w is not None and "learned" in status
     assert w["trend"] > 1.0            # the right cluster earns weight
     assert 0.5 <= min(w.values()) and max(w.values()) <= 1.5

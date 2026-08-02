@@ -23,6 +23,22 @@ from __future__ import annotations
 from .. import ledger
 
 UNLOCK_N = 150          # scored alignments per cluster before weights unlock
+
+# Raw claim COUNT is not evidence count. The book holds ~15 names simultaneously
+# across overlapping tranches, so when a 63-day horizon matures it retires a
+# batch of claims that all lived through the SAME market regime. If the market
+# rose, most succeeded; if it fell, most failed. Treating those as independent
+# observations inflates the degrees of freedom and would unlock live weights on
+# what is really one or two regime observations — precisely the failure the
+# cluster-robust machinery in research/stats.py exists to prevent everywhere
+# else in this system.
+#
+# So the gate requires BOTH: enough scored alignments AND enough temporally
+# distinct forecast cohorts. Three non-overlapping 63-day cycles is roughly nine
+# months of live history, which guarantees the system has survived at least two
+# regime transitions before it is allowed to reweight itself.
+MIN_INDEPENDENT_CYCLES = 3
+CYCLE_DAYS = 63
 CAL_MIN = 30            # scored claims before probability calibration engages
 ALIGN_THRESHOLD = 0.1   # |cluster score| above which a cluster "voted"
 MAG_MIN = 30            # same-direction scored claims before magnitude calibration engages
@@ -72,11 +88,52 @@ def cluster_posteriors(records: list[dict] | None = None) -> dict:
     return out
 
 
+def independent_cycles(records: list[dict] | None = None) -> int:
+    """How many temporally NON-OVERLAPPING forecast cohorts have been scored.
+
+    Claims registered days apart and held over the same 63 days are one
+    observation of one regime, not many. Counted by walking scored claims in
+    date order and starting a new cycle only once CYCLE_DAYS have elapsed since
+    the last one opened.
+    """
+    from datetime import date as _date
+    dates = []
+    for d, _s in _scored_pairs(records):
+        raw = str(d.get("created_at") or "")[:10]
+        try:
+            y, m, dd = (int(x) for x in raw.split("-"))
+            dates.append(_date(y, m, dd))
+        except Exception:                              # noqa: BLE001
+            continue
+    if not dates:
+        return 0
+    dates.sort()
+    cycles, anchor = 1, dates[0]
+    for d in dates[1:]:
+        if (d - anchor).days >= CYCLE_DAYS:
+            cycles += 1
+            anchor = d
+    return cycles
+
+
 def cluster_weights(records: list[dict] | None = None) -> tuple[dict | None, str]:
     """(weights, status). None → synthesis stays uniform (the honest default).
-    Unlocks per cluster only at ≥ UNLOCK_N scored alignments; weight =
-    posterior mean rescaled around 1.0, capped to [0.5, 1.5]."""
+
+    Unlocks only when a cluster has ≥ UNLOCK_N scored alignments AND the ledger
+    spans ≥ MIN_INDEPENDENT_CYCLES non-overlapping horizons. The second
+    condition is what stops a single good quarter — 15 correlated names all
+    succeeding in one rising regime — from being mistaken for 15 independent
+    confirmations and unlocking live weights.
+    """
     post = cluster_posteriors(records)
+    cycles = independent_cycles(records)
+    if cycles < MIN_INDEPENDENT_CYCLES:
+        n_max = max((p["n"] for p in post.values()), default=0)
+        return None, (
+            f"uniform (provisional) — {cycles}/{MIN_INDEPENDENT_CYCLES} independent "
+            f"{CYCLE_DAYS}d cycles scored ({n_max} raw alignments). Claims held "
+            "over the same window are one regime observation, not many, so the "
+            "gate counts cycles as well as claims.")
     unlocked = {c: p for c, p in post.items() if p["unlocked"]}
     if not unlocked:
         n_max = max((p["n"] for p in post.values()), default=0)
@@ -88,7 +145,8 @@ def cluster_weights(records: list[dict] | None = None) -> tuple[dict | None, str
             weights[c] = round(max(0.5, min(1.5, 1.0 + (p["posterior_mean"] - 0.5) * 2)), 3)
         else:
             weights[c] = 1.0  # locked clusters stay uniform
-    return weights, f"learned — {len(unlocked)} cluster(s) past the {UNLOCK_N}-sample gate"
+    return weights, (f"learned — {len(unlocked)} cluster(s) past the "
+                     f"{UNLOCK_N}-sample gate across {cycles} independent cycles")
 
 
 def calibrated_probability(net_score: float,
