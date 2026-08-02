@@ -238,3 +238,30 @@ def test_dsr_sensitivity_actually_flips_on_real_returns():
     assert high["expected_max_sharpe_under_null"] > low["expected_max_sharpe_under_null"], \
         "more trials must raise the bar the Sharpe has to clear"
     assert high["deflated_sharpe_probability"] <= low["deflated_sharpe_probability"]
+
+
+def test_default_basket_is_wide_enough_to_survive_a_single_name_shock():
+    """A three-stock book puts 33.3% in each name. One promoter default or
+    forensic audit in an Indian mid-cap gaps down in consecutive lower circuits
+    with no exit available, and a -50% move on a third of the book is a 16.7%
+    unstoppable loss.
+
+    Measured across N=3..30 the after-tax CAGR is nearly flat — 25.84% at N=3,
+    23.80% at N=15 — while per-position weight falls 33.3% -> 6.7%. Paying ~2pp
+    to cut catastrophe exposure fivefold is the trade a real book makes.
+    """
+    from equisense.research.backtest import DEFAULT_TOP_N
+    assert DEFAULT_TOP_N >= 10, "basket too concentrated for real capital"
+    assert 100 / DEFAULT_TOP_N <= 10.0, "per-position weight above 10%"
+
+
+def test_widening_is_documented_as_not_reducing_drawdown():
+    """Max drawdown is flat near -20% at every N, because these drawdowns are
+    market-wide. Claiming diversification fixes drawdown would be wrong and
+    would invite oversizing."""
+    import inspect
+
+    from equisense.research import backtest
+    src = inspect.getsource(backtest)
+    head = src[:src.index("def strategy_backtest")]
+    assert "market-wide" in head and "not" in head

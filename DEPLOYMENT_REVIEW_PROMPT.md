@@ -87,6 +87,26 @@ overlapping monthly tranches; 0.35% round-trip cost on actual turnover.
 | CPCV, 15 OOS paths | min +14.5%, median +26.8%, max +53.1%, **0 paths lose money** |
 | Deflated Sharpe | passes to ~50 trials, fails by 75 |
 
+### 4a-bis. Basket width — the concentration fix, measured
+
+A three-stock book puts 33.3% in each name; one promoter default or forensic
+audit in an Indian mid-cap gaps down in consecutive lower circuits with no exit.
+Measured across N=3..30:
+
+| N | Ann % | After 20% STCG | Max DD | Sharpe | CPCV min | Per-position | −50% shock costs |
+|---|---|---|---|---|---|---|---|
+| 3 | 32.30 | 25.84 | −21.31 | 1.45 | 20.99 | 33.3% | 16.7% |
+| 5 | 33.93 | 27.14 | −20.04 | 1.56 | 21.48 | 20.0% | 10.0% |
+| 10 | 29.40 | 23.52 | −19.99 | 1.40 | 16.05 | 10.0% | 5.0% |
+| **15 (default)** | **29.75** | **23.80** | −20.59 | 1.40 | 15.26 | **6.7%** | **3.3%** |
+| 20 | 28.37 | 22.69 | −21.19 | 1.37 | 13.97 | 5.0% | 2.5% |
+
+The CAGR is nearly flat while catastrophe exposure falls fivefold, so the
+default is now N=15. Turnover also FALLS with N (30% → 25%), reducing cost and
+tax churn. **What widening does not buy: max drawdown is flat near −20% at
+every N**, because those drawdowns are market-wide rather than idiosyncratic.
+Diversification here protects against the single-name disaster, not the market.
+
 ### 4b. The finding that undercuts it
 
 The backtest holds `nlargest(3)` **unconditionally** — always invested, never
@@ -194,10 +214,12 @@ Answer these directly and plainly.
    (§4c), the two-not-four reduction (§4d), the Deflated Sharpe trial count, and
    the in-sample framing.
 3. **Given §4f, is active management justified at all here?** A passive
-   S&P-500-in-INR allocation returned 17.08% with a *smaller* drawdown. The
-   long-only momentum excess is ~+9.7%/yr over an equal-weighted universe. After
-   20% STCG on ~370% turnover, execution slippage, and the operational risk of a
-   custom stack — is the residual premium worth it? Say so plainly if not.
+   S&P-500-in-INR allocation returned 17.08% with a *smaller* drawdown (−30.2%).
+   The N=15 active book returns 23.80% after STCG with −20.6% drawdown and 6.7%
+   per-position weight. That is a ~6.7pp after-tax premium at comparable
+   drawdown — but with key-person dependency on a custom stack, a free-tier
+   database, monthly execution load, and zero forward track record. Is that
+   premium worth it? Say so plainly if not.
 4. **What is the single highest-value missing capability?** Historical *index
    membership* is the known candidate (bhavcopy gives listed universe, not index
    membership). Is there something better?

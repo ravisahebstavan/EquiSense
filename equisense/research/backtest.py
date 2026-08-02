@@ -60,7 +60,22 @@ SWEPT_CASH_YIELD = 0.055
 STCG_RATE = 0.20
 
 
-def strategy_backtest(session: Session, top_n: int = 3,
+# Default basket width. Measured across N=3..30, the after-tax CAGR is almost
+# flat (25.84% at N=3, 23.80% at N=15) while per-position weight falls from
+# 33.3% to 6.7%. A three-stock book cannot survive one promoter-default or
+# forensic-audit shock in an Indian mid-cap — a -50% single name costs 16.7% of
+# the book at N=3 against 3.3% at N=15, and such a name gaps down in
+# consecutive lower circuits with no exit available. Paying ~2pp of CAGR to cut
+# that exposure fivefold is the trade any real book should make.
+#
+# Note what widening does NOT buy: max drawdown is flat at roughly -20% across
+# every N, because these drawdowns are market-wide rather than idiosyncratic.
+# Diversification here protects against the single-name catastrophe, not
+# against the market.
+DEFAULT_TOP_N = 15
+
+
+def strategy_backtest(session: Session, top_n: int = DEFAULT_TOP_N,
                       hold_days: int = 63, panel=None,
                       min_composite: float | None = None,
                       cash_yield: float = SWEPT_CASH_YIELD) -> dict:
