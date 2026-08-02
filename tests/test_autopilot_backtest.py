@@ -203,3 +203,38 @@ def test_vol_overlay_reports_both_variants_honestly():
     r = vol_managed_overlay(rets, hold_days=21)
     assert "baseline" in r and "vol_managed" in r
     assert r["verdict"]  # always states a verdict, win or not — never silent
+
+
+def test_backtest_reports_where_the_deflated_sharpe_verdict_breaks():
+    """A single n_trials is a guess and the verdict is extremely sensitive to
+    it: the same 105 returns read "genuine skill" at 8 trials (DSR 0.990) and
+    "not distinguishable" at 75 (0.939). Worse, a hardcoded constant cannot grow
+    as more variants get tried, and this strategy WAS modified after seeing
+    results — HYP-008/011 demoted, the within-cluster null corrected — each of
+    which is a trial the constant never learned about.
+
+    So the result must expose the breaking point rather than assert one number.
+    """
+    import inspect
+
+    from equisense.research import backtest
+    src = inspect.getsource(backtest.strategy_backtest)
+    assert "deflated_sharpe_sensitivity" in src
+    assert "dsr_breaks_at_n_trials" in src
+    # the sweep has to span both sides of the threshold to be informative
+    assert "75" in src and "150" in src
+
+
+def test_dsr_sensitivity_actually_flips_on_real_returns():
+    """Guards the claim above with arithmetic rather than a docstring."""
+    from equisense.research.stats import deflated_sharpe_ratio
+    # a Sharpe strong enough to pass at low trial counts and fail at high ones
+    import random
+    rng = random.Random(7)
+    rs = [rng.gauss(0.014, 0.033) for _ in range(105)]
+    low = deflated_sharpe_ratio(rs, n_trials=8)
+    high = deflated_sharpe_ratio(rs, n_trials=150)
+    assert low["computable"] and high["computable"]
+    assert high["expected_max_sharpe_under_null"] > low["expected_max_sharpe_under_null"], \
+        "more trials must raise the bar the Sharpe has to clear"
+    assert high["deflated_sharpe_probability"] <= low["deflated_sharpe_probability"]

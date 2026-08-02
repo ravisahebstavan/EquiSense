@@ -172,7 +172,26 @@ def strategy_backtest(session: Session, top_n: int = 3,
     sharpe = (mean_r / (var ** 0.5) * (ann_factor ** 0.5)) if var > 0 else None
     # A best-of-N backtest Sharpe is upward biased; the composite is one of
     # several rules that were looked at, so it is deflated accordingly.
-    dsr = deflated_sharpe_ratio(rs, n_trials=8)
+    dsr = deflated_sharpe_ratio(rs, n_trials=DSR_TRIALS)
+    # A single n_trials is a guess, and the verdict is extremely sensitive to it:
+    # this backtest reads "genuine skill" at 8 trials and "not distinguishable"
+    # at 75, from the SAME returns. Worse, a hardcoded count cannot grow as more
+    # variants get tried, and this strategy was modified after seeing results
+    # (HYP-008/011 demoted, the within-cluster null corrected) — each such change
+    # is a trial the constant never learned about. So report where the verdict
+    # BREAKS rather than asserting one number, and let the reader judge whether
+    # the search was smaller or larger than that.
+    dsr_sensitivity = []
+    breaks_at = None
+    for n in (8, 15, 20, 30, 50, 75, 100, 150):
+        d = deflated_sharpe_ratio(rs, n_trials=n)
+        if not d.get("computable"):
+            continue
+        p_ = d["deflated_sharpe_probability"]
+        dsr_sensitivity.append({"n_trials": n, "dsr_probability": round(p_, 4),
+                                "passes": p_ >= 0.95})
+        if breaks_at is None and p_ < 0.95:
+            breaks_at = n
 
     result = {
         "computed_at": datetime.utcnow().isoformat(),
@@ -189,6 +208,15 @@ def strategy_backtest(session: Session, top_n: int = 3,
         if turnover_log else None,
         "max_drawdown_pct": round(mdd * 100, 2),
         "deflated_sharpe": dsr,
+        "deflated_sharpe_sensitivity": dsr_sensitivity,
+        "dsr_breaks_at_n_trials": breaks_at,
+        "dsr_reading": (
+            f"Reads as skill while the honest number of strategy variants tried "
+            f"stays below {breaks_at}; above that it is not distinguishable from "
+            f"the best of that many lucky rules. Judge the search size yourself — "
+            f"the constant cannot."
+            if breaks_at else
+            "Survives every trial count tested up to 150."),
         "mean_period_return_net_pct": round(mean_r * 100, 2),
         "median_ci95_pct": [round(ci_lo, 2), round(ci_hi, 2)],
         "hit_rate": round(sum(1 for x in rs if x > 0) / len(rs), 3),
@@ -214,7 +242,12 @@ def strategy_backtest(session: Session, top_n: int = 3,
     return result
 
 
-BACKTEST_CACHE_VERSION = 3  # bump whenever the result schema changes → forces recompute
+BACKTEST_CACHE_VERSION = 4  # bump whenever the result schema changes → forces recompute
+
+# Nominal trial count for the Deflated Sharpe. Deliberately not treated as
+# authoritative — see `deflated_sharpe_sensitivity` in the result, which reports
+# the verdict across a range because it is highly sensitive to this number.
+DSR_TRIALS = 8
 TARGET_ANNUAL_VOL = 0.15   # typical equity vol target (Barroso-Santa-Clara use ~12%)
 VOL_LOOKBACK_PERIODS = 6   # trailing periods of the STRATEGY's own returns
 SCALE_BOUNDS = (0.3, 1.5)  # de-lever in stress, cap leverage in calm — never full off/on
