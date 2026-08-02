@@ -62,18 +62,25 @@ def _held_verdicts(session: Session, tickers: list[str]) -> dict[str, str]:
     from ..engine.synthesis import synthesize
     from ..research.learning import cluster_weights
     from .candidates import evidence_from_snapshot
-    from .live import current_regime, universe_signals
+    from .live import (cluster_correlation, current_regime, universe_signals,
+                       within_cluster_effective_n)
     from .snapshot import get_universe
     universe = {c["ticker"]: c for c in get_universe(session)["companies"]}
     sigs = universe_signals(session)
     rk = current_regime(session)["conditioning_key"]
     weights, _ = cluster_weights()
+    # Same null a name was ADMITTED under, or an exit is judged by a different
+    # standard than the entry — the held name would be re-scored against a
+    # smaller null than the candidate scan used.
+    corr = cluster_correlation(session)
+    eff_n = within_cluster_effective_n(session)
     out = {}
     for t in tickers:
         item = universe.get(t)
         if item:
             out[t] = synthesize(evidence_from_snapshot(item, sigs, rk, {}),
-                                weights=weights).verdict
+                                weights=weights, cluster_corr=corr,
+                                within_cluster_eff=eff_n).verdict
     return out
 
 

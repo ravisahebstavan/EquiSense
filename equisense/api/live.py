@@ -76,6 +76,7 @@ def current_regime(session: Session) -> dict:
 
 _SIG_CACHE: dict = {"key": None, "signals": None}
 _CORR_CACHE: dict = {"key": None, "corr": None}
+_EFFN_CACHE: dict = {"key": None, "eff": None}
 
 SIGNAL_KEYS = ["momentum", "dist_52w", "trend", "rel_strength", "mqi", "vol",
                "heat", "f_score", "z_score", "ccs", "fragility", "exp_gap",
@@ -190,6 +191,89 @@ def cluster_correlation(session: Session) -> Optional[dict]:
     return out
 
 
+def within_cluster_effective_n(session: Session) -> Optional[dict]:
+    """Effective INDEPENDENT evidence count inside each cluster.
+
+    `cluster_correlation` fixed the independence assumption between clusters.
+    The same assumption survived inside them: null_sd gave a cluster holding m
+    evidence variance (1/3)/m, which is only right if those m are independent
+    draws. Measured on the live universe the trend cluster's 6 signals are
+    n_eff 1.46 — mqi is a transform of momentum (rho +0.99), rel_strength and
+    sector_rel_mom share the same 63d return (+0.94), dist_52w and trend the
+    same price level (+0.82). Understating the null there overstates net_z by
+    ~2x, which is the difference between abstaining and issuing a trade.
+
+    These correlations are STRUCTURAL, not signal-driven: mqi is built out of
+    momentum, so the two move together for an uninformative name as much as an
+    informative one. That is precisely the condition the null describes, so the
+    correction belongs in the null rather than in the scoring.
+
+    n_eff = m / (1 + (m-1)·rho_bar) — the mean of m equicorrelated draws has
+    variance (1/3)/n_eff exactly. Same two conservatisms as cluster_correlation:
+    the matrix is shrunk toward independence at the observed n, and rho_bar is
+    floored at 0 so n_eff never exceeds m — redundancy is penalised, a
+    diversification credit is never granted.
+    """
+    from ..engine.evidence import xsec_strength
+    from ..engine.synthesis import shrink_correlation
+    from .snapshot import get_universe
+
+    universe = get_universe(session)
+    key = universe.get("as_of")
+    if _EFFN_CACHE["key"] == key:
+        return _EFFN_CACHE["eff"]
+
+    from .candidates import SIGNAL_EVIDENCE      # late: avoids an import cycle
+    sigs = universe_signals(session)
+    live_names = [c["ticker"] for c in universe["companies"]
+                  if not c.get("stale_sessions")]
+    from ..research.registry import admission_cap
+    per_cluster: dict[str, dict[str, dict[str, float]]] = {}
+    for sig_key, _engine, family, cluster, invert, _tmpl in SIGNAL_EVIDENCE:
+        # shadow evidence is never aggregated, so it must not shape the null
+        if sig_key not in sigs or admission_cap(family)[0] <= 0:
+            continue
+        for t in live_names:
+            st = xsec_strength(sigs[sig_key], t, invert=invert)
+            if st is not None:
+                per_cluster.setdefault(cluster, {}).setdefault(sig_key, {})[t] = st
+
+    out: dict[str, float] = {}
+    for cluster, by_sig in per_cluster.items():
+        keys = sorted(by_sig)
+        m = len(keys)
+        if m < 2:
+            out[cluster] = float(m)
+            continue
+        common = sorted(set.intersection(*[set(by_sig[k]) for k in keys]))
+        if len(common) < 20:           # too thin to estimate — assume redundant
+            out[cluster] = 1.0
+            continue
+        cols = {k: [by_sig[k][t] for t in common] for k in keys}
+        means = {k: fmean(cols[k]) for k in keys}
+        dev = {k: [x - means[k] for x in cols[k]] for k in keys}
+        ss = {k: math.sqrt(sum(d * d for d in dev[k])) for k in keys}
+        matrix = []
+        for a in keys:
+            row = []
+            for b in keys:
+                if a == b:
+                    row.append(1.0)
+                elif ss[a] <= 0 or ss[b] <= 0:
+                    row.append(0.0)
+                else:
+                    row.append(sum(x * y for x, y in zip(dev[a], dev[b]))
+                               / (ss[a] * ss[b]))
+            matrix.append(row)
+        matrix = shrink_correlation(matrix, n_obs=len(common))
+        off = [matrix[i][j] for i in range(m) for j in range(m) if i != j]
+        rho_bar = max(0.0, fmean(off)) if off else 0.0
+        out[cluster] = max(1.0, min(float(m), m / (1.0 + (m - 1) * rho_bar)))
+
+    _EFFN_CACHE.update(key=key, eff=out)
+    return out
+
+
 # ------------------------------------------------------------ portfolio fit
 
 def portfolio_state(session: Session) -> dict:
@@ -260,16 +344,16 @@ def build_evidence(session: Session, company: Company, regime_key: str,
                 if mom.value is not None else "", [mom],
                 base_rate=get_base_rate(session, "momentum_12_1_top_quintile", 126, regime_key)))
     hi = technical.pct_from_52w_high(closes, period)
-    E.append(ev("technical", "technical.trend", "trend", S("dist_52w"),
+    E.append(ev("technical", "technical.anchor_52w", "trend", S("dist_52w"),
                 f"{hi.value:+.1f}% from 52w high" if hi.value is not None else "", [hi],
                 base_rate=get_base_rate(session, "near_52w_high", 126, regime_key)
                 if (hi.value or -99) > -5 else None))
     tr = technical.trend_200dma(closes, period)
-    E.append(ev("technical", "technical.trend", "trend", S("trend"),
+    E.append(ev("technical", "technical.trend_200dma", "trend", S("trend"),
                 f"price {tr.value:+.1f}% vs 200DMA" if tr.value is not None else "", [tr],
                 base_rate=get_base_rate(session, "above_200dma", 126, regime_key)))
     rs = technical.relative_strength(closes, _macro(session, "^NSEI", 300), period=period)
-    E.append(ev("technical", "technical.trend", "trend", S("rel_strength"),
+    E.append(ev("technical", "technical.rel_strength", "trend", S("rel_strength"),
                 f"relative strength vs NIFTY {rs.value:+.1f}% (63d)"
                 if rs.value is not None else "", [rs]))
     mqi = novel.momentum_quality(closes, period)
@@ -470,7 +554,8 @@ def build_dossier(session: Session, company: Company, book_value: float = 1_000_
     regime = current_regime(session)
     book = portfolio_state(session)
     evidence, ctx = build_evidence(session, company, regime["conditioning_key"], book)
-    synth = synthesize(evidence, cluster_corr=cluster_correlation(session))
+    synth = synthesize(evidence, cluster_corr=cluster_correlation(session),
+                       within_cluster_eff=within_cluster_effective_n(session))
 
     sizing, costs = None, None
     if synth.verdict == "long_candidate" and ctx["price"] and ctx["daily_vol_pct"]:

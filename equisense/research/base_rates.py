@@ -125,6 +125,43 @@ def feat_above_200dma(closes: pd.DataFrame, volumes) -> pd.DataFrame:
     return closes > closes.rolling(200, min_periods=200).mean()
 
 
+# The CONTINUOUS forms the live system actually emits. HYP-002/003 register the
+# boolean cohort versions above, which the IC study reports "not computable"
+# (a boolean carries no cross-sectional ordering) — so the signals that vote on
+# every live verdict had never been measured at all. These mirror
+# engine/technical.py exactly, in the same units, so a signal cannot be tested
+# under one definition and traded under another.
+
+def feat_dist_52w_high(closes: pd.DataFrame, volumes) -> pd.DataFrame:
+    """% below the 52-week high (0 = at the high). Mirrors
+    technical.pct_from_52w_high. Higher = nearer the high = the
+    anchoring-continuation direction of HYP-002."""
+    high = closes.rolling(252, min_periods=200).max()
+    return (closes / high - 1) * 100
+
+
+def feat_trend_200dma(closes: pd.DataFrame, volumes) -> pd.DataFrame:
+    """% above the 200-day average. Mirrors technical.trend_200dma's returned
+    value (`above_pct`); the 21d slope it also reports is not the ranked
+    quantity, so it is not part of the feature."""
+    ma = closes.rolling(200, min_periods=200).mean()
+    return (closes / ma - 1) * 100
+
+
+def feat_rel_strength(closes: pd.DataFrame, volumes) -> pd.DataFrame:
+    """63d stock return minus the 63d index return, per
+    technical.relative_strength.
+
+    NOTE, and it is the whole point of measuring this one: the index term is a
+    single scalar per date, identical for every name, so subtracting it CANNOT
+    change the cross-sectional ordering. Rank IC here is therefore identical by
+    construction to the rank IC of the raw 63d return — this signal adds no
+    cross-sectional information beyond 63d momentum, it only relabels it. The
+    index series is not even needed to measure it.
+    """
+    return (closes / closes.shift(63) - 1) * 100
+
+
 def feat_momentum_quality(closes: pd.DataFrame, volumes) -> pd.DataFrame:
     """MQI, vectorised. Must mirror engine.novel.momentum_quality EXACTLY —
     including the Wave S directional fix, where persistence is agreement with the

@@ -41,11 +41,18 @@ FAMILY_HYPOTHESIS: dict[str, str] = {
     # Treating a bank's ROA as unusable while an industrial's F-Score counts at
     # 0.25 would be an inconsistency, not extra rigour.
     "technical.trend": "HYP-001",
+    # Split out 2026-08-02. These three emitted family "technical.trend" and so
+    # inherited HYP-001's status, whose spec covers 12-1 momentum ONLY — three
+    # untested signals wearing a tested one's credential. Each now carries its
+    # own governance, so a status change reaches the signal it is about.
+    "technical.anchor_52w": "HYP-021",
+    "technical.trend_200dma": "HYP-022",
+    "technical.rel_strength": "HYP-023",
     "novel.mqi": "HYP-004",
     "novel.ccs": "HYP-005",
     "novel.fragility": "HYP-006",
     "novel.crowding": "HYP-007",
-    "technical.vol": "HYP-008",
+    "risk.volatility": "HYP-008",
     "technical.sector_momentum": "HYP-010",
     "behavioral.max_effect": "HYP-011",
 }
@@ -228,6 +235,78 @@ REGISTRY: dict[str, dict] = {
         "result": "IC -0.006 to -0.008, monotonicity ~0.0, all t < 1.2. No "
                   "standalone directional content.",
     },
+    # ---------------------------------------------------------------------
+    # HYP-021..023 are POST-HOC, and the record must say so. Every other entry
+    # here was registered before its result existed; these three were measured
+    # 2026-08-02 on signals that had ALREADY been voting on live verdicts for
+    # months, discovered when the family split showed they were inheriting
+    # HYP-001's credential without a spec of their own. Registering them
+    # afterwards is the honest repair, but it is NOT pre-registration and their
+    # results carry the selection risk that implies: the signals were built and
+    # deployed by the same person now measuring them.
+    #
+    # Measured on the ~500-name, 2485-day panel with the platform's own
+    # estimators; the 12-1 momentum control reproduced the stored study exactly
+    # (IC 0.0492/0.0667/0.0694, OOS 63d +0.062), which is what validates the
+    # harness. Walk-forward has only 2 folds, so a sign-agreement of 1.00 is
+    # weak evidence — it is 2 coin flips. None of these are promoted above the
+    # default cap on this evidence.
+    "HYP-021": {
+        "name": "distance_from_52w_high_continuous",
+        "family": "technical.anchor_52w",
+        "motivation": "The CONTINUOUS form of HYP-002. HYP-002 registers a "
+                      "boolean 'within 5% of the high' cohort, which the IC "
+                      "study cannot rank and therefore never measured — while "
+                      "the live system emits and votes on the continuous "
+                      "percentage. The traded signal was the untested one.",
+        "spec": "Rank by (close / 252d rolling max − 1); higher = nearer the "
+                "high. Mirrors engine.technical.pct_from_52w_high.",
+        "status": "computed",
+        "result": "IC +0.0396/+0.0592/+0.0756 at 21/63/126d, t=2.28/2.57/2.57; "
+                  "hit rate 70.9% at 126d. Walk-forward OOS IC +0.048 at 126d, "
+                  "sign stable across 2 folds. Passes t>=2 but NOT the "
+                  "Harvey-Liu-Zhu |t|>=3 hurdle at any horizon.",
+    },
+    "HYP-022": {
+        "name": "trend_vs_200dma_continuous",
+        "family": "technical.trend_200dma",
+        "motivation": "The CONTINUOUS form of HYP-003, unmeasured for the same "
+                      "reason as HYP-021: the registered spec is a boolean "
+                      "above/below cohort, the live signal is the percentage.",
+        "spec": "Rank by (close / 200d rolling mean − 1). Mirrors the value "
+                "returned by engine.technical.trend_200dma (`above_pct`); the "
+                "21d MA slope it also reports is not the ranked quantity.",
+        "status": "computed",
+        "result": "The STRONGEST single signal measured on this universe: IC "
+                  "+0.0340/+0.0654/+0.0945 at 21/63/126d, t=2.24/3.16/3.65, hit "
+                  "rate 74.8% at 126d. Clears Harvey-Liu-Zhu |t|>=3 at 126d. "
+                  "Walk-forward OOS IC +0.071 at 126d — HIGHER than 12-1 "
+                  "momentum's +0.062, on 2 folds. Deliberately NOT promoted "
+                  "above cap 0.25: raising influence on a post-hoc in-sample "
+                  "result is the overfitting failure this registry exists to "
+                  "prevent, and 2 folds is not a track record. Promotion should "
+                  "come from realised forecasts, not from this entry.",
+    },
+    "HYP-023": {
+        "name": "relative_strength_vs_index",
+        "family": "technical.rel_strength",
+        "motivation": "Registered to record a REDUNDANCY, not an edge. The live "
+                      "system counts this as a separate piece of trend evidence.",
+        "spec": "63d stock return minus 63d index return "
+                "(engine.technical.relative_strength).",
+        "status": "computed",
+        "result": "REDUNDANT BY CONSTRUCTION. The index term is one scalar per "
+                  "date, identical for every name, so subtracting it cannot "
+                  "change the cross-sectional ordering: this series is "
+                  "numerically identical to the raw 63d return (verified, max "
+                  "abs difference 0.0000000000). Its IC (+0.0648 at 126d, "
+                  "t=3.67, OOS +0.039) is therefore a measurement of 63d "
+                  "momentum wearing another name, not independent evidence. "
+                  "Measured rho +0.94 against sector_rel_mom, which shares the "
+                  "same 63d return. The within-cluster n_eff correction "
+                  "(api.live.within_cluster_effective_n) is what stops this "
+                  "from counting as an independent confirming vote.",
+    },
     "HYP-020": {
         "name": "momentum_within_high_information_universe",
         "family": "information.conditioning",
@@ -316,12 +395,19 @@ REGISTRY: dict[str, dict] = {
     },
     "HYP-008": {
         "name": "low_vol_quintile",
-        "family": "technical.vol",
+        "family": "risk.volatility",
         "motivation": "Low-volatility anomaly check on this universe — also serves "
                       "as the price-only leg of the Fragility hypothesis.",
         "spec": "Monthly: bottom quintile of 126d realized vol; forward 126d excess "
                 "vs universe median.",
-        "status": "registered",
+        # Computed 2026-08-01 on the ~500-name panel: rank IC indistinguishable from
+        # zero (t=-0.23 at 63d) while the quantile profile is perfectly INVERTED
+        # (monotonicity -1.0 at 21/63/126d, net -20.2%/yr long-short, -8.1% long-only).
+        # Both horizons flag tail_driven, so the magnitude is untrustworthy but the
+        # sign and the ordering are consistent. No demonstrated edge; evidence leans
+        # negative. Demoted rather than rejected so it stays visible and recoverable
+        # if the inversion proves to be a tail artefact.
+        "status": "weak",
     },
     "HYP-010": {
         "name": "sector_relative_momentum_top_quintile",
@@ -351,6 +437,11 @@ REGISTRY: dict[str, dict] = {
         "spec": "Monthly: rank universe by the negative of (mean of the 5 highest "
                 "daily returns in the trailing 21 days) — i.e. select LOW-MAX "
                 "names; top quintile; forward 21d & 63d excess vs universe median.",
-        "status": "registered",
+        # Computed 2026-08-01 alongside HYP-008 and showing the same failure shape:
+        # rank IC ~zero (t=-0.73 at 63d) with a perfectly inverted quantile profile
+        # (monotonicity -1.0 at 21/63/126d, net -14.8%/yr long-short, -6.1% long-only),
+        # tail_driven throughout. The Bali-Cakici-Whitelaw lottery effect does not
+        # reproduce on this universe as constructed. Demoted, not rejected.
+        "status": "weak",
     },
 }

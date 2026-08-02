@@ -350,8 +350,9 @@ def run_ic_studies(session, horizons: Sequence[int] = (21, 63, 126),
     """
     import pandas as pd
 
-    from .base_rates import (STUDIES, feat_max_effect,
-                             feat_sector_relative_momentum, load_price_panel,
+    from .base_rates import (STUDIES, feat_dist_52w_high, feat_max_effect,
+                             feat_rel_strength, feat_sector_relative_momentum,
+                             feat_trend_200dma, load_price_panel,
                              load_sector_map)
 
     # `panel` lets a caller running several studies load the price panel ONCE
@@ -373,6 +374,12 @@ def run_ic_studies(session, horizons: Sequence[int] = (21, 63, 126),
     builders = {hyp: cfg["feature"] for hyp, cfg in STUDIES.items()}
     builders["HYP-010"] = lambda c, v: feat_sector_relative_momentum(c, v, sector_map)
     builders["HYP-011"] = feat_max_effect
+    # The continuous forms the live system actually votes on. Their boolean
+    # counterparts (HYP-002/003) report "not computable" here, which is why
+    # these signals traded unmeasured until 2026-08-02.
+    builders["HYP-021"] = feat_dist_52w_high
+    builders["HYP-022"] = feat_trend_200dma
+    builders["HYP-023"] = feat_rel_strength
 
     month_ends = closes.index[::sampling_days]
     results: dict[str, dict] = {}

@@ -91,8 +91,13 @@ def null_sd(cluster_counts: dict[str, int],
     """Null standard deviation of `net_score`, correlation-aware.
 
     Under the percentile normalization an uninformative name's evidence
-    strengths are U(-1, 1), so a cluster holding m_c evidence has null variance
-    v_c = (1/3)/m_c. The net score is a weighted mean of cluster scores, so:
+    strengths are U(-1, 1), so a cluster holding m_c INDEPENDENT evidence has
+    null variance v_c = (1/3)/m_c. Pass effective counts (see
+    `api.live.within_cluster_effective_n`) when the evidence inside a cluster is
+    correlated: m_c is then n_eff, not the raw item count. The mean of m
+    equicorrelated U(-1,1) draws has variance (1/3)(1+(m-1)rho)/m = (1/3)/n_eff,
+    so substituting n_eff is exact under equicorrelation. The net score is a
+    weighted mean of cluster scores, so:
 
         Var(net) = Σ_i Σ_j w_i w_j ρ_ij √(v_i v_j)
 
@@ -113,7 +118,7 @@ def null_sd(cluster_counts: dict[str, int],
     `cluster_corr` is {"clusters": [...], "matrix": [[...]]} measured across the
     universe. Missing pairs fall back to independence for that pair only.
     """
-    counts = {c: max(1, n) for c, n in cluster_counts.items()}
+    counts = {c: max(1.0, float(n)) for c, n in cluster_counts.items()}
     names = list(counts)
     C = len(names)
     if C == 0:
@@ -244,13 +249,24 @@ def synthesize(evidence: list[Evidence],
                weights: dict[str, float] | None = None,
                empirical_null_sd: Optional[float] = None,
                cluster_corr: Optional[dict] = None,
-               scored_n: int | None = None) -> Synthesis:
+               scored_n: int | None = None,
+               within_cluster_eff: Optional[dict[str, float]] = None) -> Synthesis:
     """`weights` (cluster → multiplier) come ONLY from the learning module's
     gated posteriors (research/learning.py); None = uniform provisional.
 
     `empirical_null_sd`, when supplied, replaces the closed-form null with a
     measured cross-sectional dispersion of net_score over the universe — which
     accounts for correlation between clusters instead of assuming independence.
+
+    `within_cluster_eff` (cluster → effective independent count) corrects the
+    same anti-conservative error one level in. `cluster_corr` handles
+    correlation BETWEEN clusters; without this, the evidence WITHIN a cluster is
+    still assumed independent. It is not: mqi is a transform of momentum
+    (measured rho +0.99) and rel_strength and sector_rel_mom share the same 63d
+    return (+0.94), so the trend cluster's 6 items are ~1.5 independent signals.
+    Those correlations are structural — they hold for an uninformative name too,
+    which is exactly when the null must be right. Unsupplied, counts fall back
+    to raw item counts and the null stays too small.
     """
     # Shadow evidence (admission cap 0) is rendered but never aggregated.
     items = [e for e in evidence if e is not None and e.direction != "shadow"]
@@ -300,8 +316,13 @@ def synthesize(evidence: list[Evidence],
            if wsum > 0 else 0.0)
     dispersion = pstdev(cluster_scores.values()) if len(present) > 1 else 0.0
 
+    # Effective counts never exceed the raw count: redundancy is penalised, but
+    # a diversification credit — which shrinks the null and manufactures
+    # conviction — is never granted. Same asymmetry cluster_correlation uses.
+    null_counts = {c: min(float(n), max(1.0, (within_cluster_eff or {}).get(c, n)))
+                   for c, n in cluster_counts.items()}
     sd = empirical_null_sd if (empirical_null_sd and empirical_null_sd > 0) \
-        else null_sd(cluster_counts, weights=eff_w, cluster_corr=cluster_corr)
+        else null_sd(null_counts, weights=eff_w, cluster_corr=cluster_corr)
     net_z = net / sd if sd and sd == sd and sd > 0 else 0.0
 
     dissent = []

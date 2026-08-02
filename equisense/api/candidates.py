@@ -19,7 +19,7 @@ from ..models import PriceObservation
 from ..research.base_rates import get_base_rate
 from ..research.learning import cluster_weights
 from .live import (_corr, cluster_correlation, current_regime,
-                   universe_signals)
+                   universe_signals, within_cluster_effective_n)
 from .snapshot import get_universe
 
 # Naive/risk-parity-style concentration heuristic: two names correlated above
@@ -32,9 +32,9 @@ CORRELATION_LOOKBACK_DAYS = 70
 # signal key → (engine, family, cluster, invert, label template)
 SIGNAL_EVIDENCE = [
     ("momentum", "technical", "technical.trend", "trend", False, "12-1 momentum {v:+.1f}%"),
-    ("dist_52w", "technical", "technical.trend", "trend", False, "{v:+.1f}% from 52-week high"),
-    ("trend", "technical", "technical.trend", "trend", False, "price {v:+.1f}% vs 200-day average"),
-    ("rel_strength", "technical", "technical.trend", "trend", False, "relative strength vs NIFTY {v:+.1f}%"),
+    ("dist_52w", "technical", "technical.anchor_52w", "trend", False, "{v:+.1f}% from 52-week high"),
+    ("trend", "technical", "technical.trend_200dma", "trend", False, "price {v:+.1f}% vs 200-day average"),
+    ("rel_strength", "technical", "technical.rel_strength", "trend", False, "relative strength vs NIFTY {v:+.1f}%"),
     ("mqi", "novel", "novel.mqi", "trend", False, "Momentum Quality {v:+.2f}"),
     ("sector_rel_mom", "technical", "technical.sector_momentum", "trend", False,
      "{v:+.1f}pp vs own sector (63d, Moskowitz-Grinblatt)"),
@@ -200,6 +200,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
     sigs = universe_signals(session)
     # measured once per snapshot, not per name
     corr = cluster_correlation(session)
+    eff_n = within_cluster_effective_n(session)
     # what each signal's OWN quantile study found wrong with it, if anything
     fc = factor_caveats(session)
     regime = current_regime(session)
@@ -236,7 +237,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
         scanned += 1
         E = evidence_from_snapshot(item, sigs, rk, br_cache, fc)
         synth = synthesize(E, weights=weights, cluster_corr=corr,
-                           scored_n=scored_n)
+                           scored_n=scored_n, within_cluster_eff=eff_n)
         v = synth.verdict
         if v == "long_candidate":
             verdicts["long"] += 1
