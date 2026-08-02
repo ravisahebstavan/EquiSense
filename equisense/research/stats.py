@@ -466,3 +466,130 @@ def cluster_block_bootstrap_ci(groups: Sequence[Sequence[float]],
     hi = stats_out[min(len(stats_out) - 1,
                        int((1 - alpha / 2) * len(stats_out)))]
     return (lo, hi)
+
+
+# ------------------------------------------------- combinatorial purged CV
+
+def cpcv_splits(n_samples: int, n_blocks: int = 6, k_test: int = 2,
+                label_span: int = 3, embargo: int = 1
+                ) -> list[tuple[list[int], list[int]]]:
+    """Combinatorial Purged Cross-Validation splits (López de Prado, AFML ch. 7).
+
+    Walk-forward yields ONE out-of-sample path, and with a short history that
+    means two or three folds — far too few to tell a stable edge from a lucky
+    ordering. CPCV splits the timeline into `n_blocks` and tests on every
+    combination of `k_test` of them, giving C(n_blocks, k_test) distinct paths
+    (15 for the default 6-choose-2) out of the same data.
+
+    What that buys is a DISTRIBUTION rather than a point estimate: an edge whose
+    OOS paths run +25% to +40% is a different object from one running -5% to
+    +80% with the same mean, and a single walk-forward number cannot tell them
+    apart.
+
+    `label_span` is the forward horizon expressed in SAMPLES (a 63-day horizon
+    sampled every 21 days is 3). Training samples whose forward label overlaps
+    the test block are purged; `embargo` further drops samples immediately after
+    a test block, because a label ending just before a test period still shares
+    the same post-event drift.
+    """
+    if n_samples <= 0 or n_blocks < 2 or not (1 <= k_test < n_blocks):
+        return []
+    edges = [round(i * n_samples / n_blocks) for i in range(n_blocks + 1)]
+    blocks = [list(range(edges[i], edges[i + 1])) for i in range(n_blocks)]
+    blocks = [b for b in blocks if b]
+    if len(blocks) < 2:
+        return []
+
+    out: list[tuple[list[int], list[int]]] = []
+    for combo in _combinations(range(len(blocks)), min(k_test, len(blocks) - 1)):
+        test_idx = sorted(i for c in combo for i in blocks[c])
+        if not test_idx:
+            continue
+        banned: set[int] = set()
+        for c in combo:
+            lo, hi = blocks[c][0], blocks[c][-1]
+            # purge: a training sample whose label window reaches into the test
+            # block shares outcome data with it
+            banned.update(range(lo - label_span, hi + 1))
+            # embargo: and one whose label ended just before it still shares the
+            # same post-event drift
+            banned.update(range(hi + 1, hi + 1 + embargo))
+        train_idx = [i for i in range(n_samples) if i not in banned]
+        if train_idx and test_idx:
+            out.append((train_idx, test_idx))
+    return out
+
+
+def _combinations(seq, k):
+    seq = list(seq)
+    if k == 0:
+        yield ()
+        return
+    for i in range(len(seq) - k + 1):
+        for rest in _combinations(seq[i + 1:], k - 1):
+            yield (seq[i],) + rest
+
+
+def cpcv_evaluate(returns: Sequence[float], n_blocks: int = 6, k_test: int = 2,
+                  label_span: int = 3, embargo: int = 1,
+                  periods_per_year: float = 12.0) -> dict:
+    """Run CPCV over a period-return series and report the OOS DISTRIBUTION.
+
+    The headline is deliberately the worst path and the fraction of paths that
+    lose money, not the mean. A strategy is only as good as the path you happen
+    to live through, and the mean of many overlapping paths flatters it.
+    """
+    rs = [float(r) for r in returns if r is not None and r == r]
+    n = len(rs)
+    splits = cpcv_splits(n, n_blocks, k_test, label_span, embargo)
+    if n < 24 or not splits:
+        return {"computable": False,
+                "reason": f"need ≥24 periods and ≥1 split, have {n} and {len(splits)}"}
+
+    path_ann, path_mean, path_hit = [], [], []
+    for _train, test in splits:
+        seg = [rs[i] for i in test]
+        if len(seg) < 4:
+            continue
+        eq = 1.0
+        for r in seg:
+            eq *= (1.0 + r)
+        yrs = len(seg) / periods_per_year
+        if yrs <= 0 or eq <= 0:
+            continue
+        path_ann.append((eq ** (1.0 / yrs) - 1.0) * 100.0)
+        path_mean.append(sum(seg) / len(seg) * 100.0)
+        path_hit.append(sum(1 for r in seg if r > 0) / len(seg))
+    if not path_ann:
+        return {"computable": False, "reason": "no usable test paths"}
+
+    srt = sorted(path_ann)
+    m = len(srt)
+    return {
+        "computable": True,
+        "paths": m,
+        "n_blocks": n_blocks,
+        "k_test": k_test,
+        "label_span": label_span,
+        "embargo": embargo,
+        "annualized_pct": {
+            "min": round(srt[0], 2),
+            "p25": round(srt[m // 4], 2),
+            "median": round(srt[m // 2], 2),
+            "p75": round(srt[(3 * m) // 4], 2),
+            "max": round(srt[-1], 2),
+            "mean": round(sum(srt) / m, 2),
+        },
+        "paths_losing_money_pct": round(sum(1 for x in srt if x <= 0) / m * 100, 1),
+        "mean_hit_rate": round(sum(path_hit) / len(path_hit), 3),
+        "reading": (
+            f"{m} out-of-sample paths span {srt[0]:.1f}% to {srt[-1]:.1f}% "
+            f"annualised, median {srt[m // 2]:.1f}%. "
+            + (f"{sum(1 for x in srt if x <= 0)} of {m} lose money."
+               if any(x <= 0 for x in srt)
+               else "No path loses money.")),
+        "caveat": ("Paths share data by construction, so these are not "
+                   "independent samples — the SPREAD is the diagnostic, not a "
+                   "confidence interval. A wide spread means the single "
+                   "walk-forward number was an accident of ordering."),
+    }

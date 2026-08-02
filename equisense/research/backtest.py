@@ -158,7 +158,8 @@ def strategy_backtest(session: Session, top_n: int = 3,
     ann_factor = 252 / 21
     nifty_valid = [x for x in nifty_rets if x is not None]
     nifty_mean = float(sum(nifty_valid) / len(nifty_valid)) if nifty_valid else None
-    from .stats import cluster_block_bootstrap_ci, deflated_sharpe_ratio
+    from .stats import (cluster_block_bootstrap_ci, cpcv_evaluate,
+                        deflated_sharpe_ratio)
     ci_lo, ci_hi = cluster_block_bootstrap_ci(
         [[x * 100] for x in rs], statistic="median")
 
@@ -214,6 +215,13 @@ def strategy_backtest(session: Session, top_n: int = 3,
         if turnover_log else None,
         "max_drawdown_pct": round(mdd * 100, 2),
         "deflated_sharpe": dsr,
+        # 15 out-of-sample paths instead of walk-forward's one. The spread is
+        # the diagnostic: an edge whose paths run +25% to +40% is a different
+        # object from one running -5% to +80% with the same mean, and a single
+        # number cannot distinguish them.
+        "cpcv": cpcv_evaluate(rs, n_blocks=6, k_test=2,
+                              label_span=max(1, hold_days // 21), embargo=1,
+                              periods_per_year=252.0 / 21),
         "deflated_sharpe_sensitivity": dsr_sensitivity,
         "dsr_breaks_at_n_trials": breaks_at,
         "dsr_reading": (
@@ -248,7 +256,7 @@ def strategy_backtest(session: Session, top_n: int = 3,
     return result
 
 
-BACKTEST_CACHE_VERSION = 4  # bump whenever the result schema changes → forces recompute
+BACKTEST_CACHE_VERSION = 5  # bump whenever the result schema changes → forces recompute
 
 # Nominal trial count for the Deflated Sharpe. Deliberately not treated as
 # authoritative — see `deflated_sharpe_sensitivity` in the result, which reports

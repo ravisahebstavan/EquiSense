@@ -343,3 +343,66 @@ def test_unclamped_negative_correlation_would_have_bought_conviction():
     assert null_sd(counts, cluster_corr=corr) < null_sd(counts)
     ratio = null_sd(counts, cluster_corr=corr) / null_sd(counts)
     assert ratio < 0.90, "a -0.25 correlation shrinks the null by >10%"
+
+
+# ------------------------------------------- combinatorial purged CV (CPCV)
+
+def test_cpcv_yields_the_combinatorial_number_of_paths():
+    """Walk-forward gives ONE path — two or three folds on this history, far too
+    few to separate a stable edge from a lucky ordering. C(6,2)=15."""
+    from equisense.research.stats import cpcv_splits
+    splits = cpcv_splits(106, n_blocks=6, k_test=2, label_span=3, embargo=1)
+    assert len(splits) == 15
+
+
+def test_cpcv_train_and_test_never_overlap():
+    from equisense.research.stats import cpcv_splits
+    for train, test in cpcv_splits(120, n_blocks=6, k_test=2):
+        assert not (set(train) & set(test)), "train/test overlap is leakage"
+
+
+def test_cpcv_purges_the_label_span_before_each_test_block():
+    """A training sample whose 63-day forward label reaches into the test block
+    shares outcome data with it. Sampled every 21 days, that is 3 samples."""
+    from equisense.research.stats import cpcv_splits
+    span = 3
+    for train, test in cpcv_splits(120, n_blocks=6, k_test=1, label_span=span,
+                                   embargo=0):
+        lo = test[0]
+        # nothing within `span` samples before the test block may remain
+        assert not any(lo - span <= t < lo for t in train), \
+            "a label window reaches into the test block"
+
+
+def test_cpcv_embargo_drops_samples_immediately_after_a_test_block():
+    """A label ending just before a test period still shares its post-event
+    drift, which is why the embargo is separate from the purge."""
+    from equisense.research.stats import cpcv_splits
+    emb = 2
+    for train, test in cpcv_splits(120, n_blocks=6, k_test=1, label_span=0,
+                                   embargo=emb):
+        hi = test[-1]
+        assert not any(hi < t <= hi + emb for t in train)
+
+
+def test_cpcv_reports_the_spread_not_just_the_mean():
+    """The point of 15 paths is the DISTRIBUTION. A strategy whose paths run
+    -5% to +80% is a different object from one running +25% to +40% with the
+    same mean, and one walk-forward number cannot tell them apart."""
+    import random
+
+    from equisense.research.stats import cpcv_evaluate
+    rng = random.Random(3)
+    rs = [rng.gauss(0.012, 0.05) for _ in range(106)]
+    out = cpcv_evaluate(rs, periods_per_year=12.0)
+    assert out["computable"] and out["paths"] == 15
+    a = out["annualized_pct"]
+    assert a["min"] <= a["median"] <= a["max"]
+    assert "paths_losing_money_pct" in out
+    # and it must warn that shared data means this is not a confidence interval
+    assert "not" in out["caveat"] and "independent" in out["caveat"]
+
+
+def test_cpcv_refuses_a_history_too_short_to_split():
+    from equisense.research.stats import cpcv_evaluate
+    assert cpcv_evaluate([0.01] * 10)["computable"] is False
