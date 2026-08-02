@@ -244,3 +244,34 @@ def test_tamper_is_detected_even_on_a_repeat_call(tmp_path, monkeypatch):
     out = L.verify_chain()
     assert out["intact"] is False
     assert out["broken_at"] == 0
+
+
+def test_small_capital_cannot_fill_a_wide_book():
+    """Indian equity has no fractional shares, so a slot must clear the whole
+    share price. On the live universe (390 names, median 836) a 15-name book at
+    Rs 10,000 gives Rs 667 per slot and reaches only ~45% of names. The ranking
+    keeps picking stocks the account cannot buy and the book silently becomes a
+    cheap-stock portfolio — a tilt with none of this system's evidence behind
+    it. This binds BEFORE alpha, tax or slippage."""
+    from equisense.engine.sizing import capital_feasibility
+    prices = [100, 300, 500, 836, 1200, 1893, 3000, 4367, 8000, 15000]
+    small = capital_feasibility(10_000, prices, top_n=15)
+    assert small["feasible"] is False
+    assert small["universe_affordable_pct"] < 85
+    assert "index ETF" in small["note"], "must name the better alternative"
+
+
+def test_adequate_capital_is_feasible():
+    from equisense.engine.sizing import capital_feasibility
+    prices = [100, 300, 500, 836, 1200, 1893, 3000, 4367, 8000, 15000]
+    ok = capital_feasibility(200_000, prices, top_n=15)
+    assert ok["feasible"] is True
+    assert ok["universe_affordable_pct"] >= 85
+
+
+def test_feasibility_reports_the_capital_actually_required():
+    from equisense.engine.sizing import capital_feasibility
+    prices = [100, 200, 400, 800, 1600]
+    out = capital_feasibility(1_000, prices, top_n=5)
+    assert out["capital_for_85pct_coverage"] > 0
+    assert out["slot_value"] == 200.0

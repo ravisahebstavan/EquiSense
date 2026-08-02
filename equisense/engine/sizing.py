@@ -139,3 +139,46 @@ def cost_tax_breakeven(position_value: float, adv_cr: float | None,
         "assumptions": "zero-brokerage delivery; impact ≈ f(position/ADV); "
                        "LTCG exemption (₹1.25L/yr) ignored conservatively",
     }
+
+
+# ------------------------------------------------- small-capital feasibility
+
+def capital_feasibility(book_value: float, universe_prices: list[float],
+                        top_n: int = 15) -> dict:
+    """Can this book actually BUY the names the ranking picks?
+
+    Indian equity has no fractional shares, so a slot of book_value/top_n must
+    clear the whole share price. Measured on the live universe (390 priced
+    names, median 836, p75 1,893): a 15-name book funded with Rs 10,000 gives
+    Rs 667 per slot and can afford a single share of only 45% of the universe.
+    The ranking would keep selecting names the account cannot buy, and the book
+    would silently become a cheap-stock portfolio — a systematic low-price tilt
+    that is not the strategy and has none of its evidence behind it.
+
+    This is a HARD constraint, not a cost. It binds before alpha, before tax,
+    before slippage.
+    """
+    prices = sorted(p for p in universe_prices if p and p > 0)
+    if not prices or book_value <= 0 or top_n <= 0:
+        return {"feasible": False, "reason": "no priced universe or no capital"}
+    slot = book_value / top_n
+    affordable = sum(1 for p in prices if p <= slot) / len(prices)
+    # what capital would be needed to reach 85% coverage at this N
+    idx = int(0.85 * (len(prices) - 1))
+    needed = prices[idx] * top_n
+    return {
+        "feasible": affordable >= 0.85,
+        "slot_value": round(slot, 2),
+        "universe_affordable_pct": round(affordable * 100, 1),
+        "capital_for_85pct_coverage": round(needed, -2),
+        "top_n": top_n,
+        "note": (
+            f"A {top_n}-name book needs about Rs {needed:,.0f} for 85% of the "
+            f"universe to be reachable. At Rs {book_value:,.0f} only "
+            f"{affordable * 100:.0f}% is, so the ranking will repeatedly select "
+            "names the account cannot buy and the book drifts into a cheap-stock "
+            "tilt that carries none of this system's evidence. Below that "
+            "threshold a broad index ETF gives strictly better diversification "
+            "per rupee, and the right use of this system is paper-trading while "
+            "the forward record accumulates."),
+    }
