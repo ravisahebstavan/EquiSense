@@ -488,3 +488,49 @@ def test_a_driver_failure_is_not_reported_as_a_missing_env_var():
     src = inspect.getsource(status.data_status)
     assert 'not ENGINE_ERROR.get("detail")' in src
     assert "_has_url" in src
+
+
+def test_the_storage_panel_reads_the_keys_the_endpoint_actually_returns():
+    """The first version rendered "undefined" against a perfectly correct
+    payload: it read the shape of storage_report() while the ROUTE wraps it as
+    {"report": {...}}. Guarding that the panel exists was not enough — it has to
+    read keys the endpoint really emits.
+
+    So this calls the real function rather than grepping its source, which is
+    what makes it able to catch a shape change at all.
+    """
+    from pathlib import Path
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import equisense.models  # noqa: F401 - registers tables
+    from equisense.db import Base
+    from equisense.ingestion.nse_archive import storage_report
+
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    report = storage_report(sessionmaker(bind=eng)())
+
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    block = js[js.index("async function renderDataExtras"):]
+    block = block[:block.index("/* =====")]
+
+    assert "store.report" in block, "the panel ignores the endpoint's wrapper"
+
+    # storage_report is DIALECT-DEPENDENT: on-disk size is a Postgres-only
+    # query, so this SQLite fixture yields row counts and retention only. Both
+    # shapes must render — assuming the Postgres one unconditionally is what
+    # produced "undefined" on the live site.
+    assert set(report) >= {"rows", "retention"}, "the SQLite shape changed"
+    for key in ("rows", "retention"):
+        assert f"rep.{key}" in block, f"the panel never reads '{key}'"
+    for key in ("total", "tables"):
+        assert f"rep.{key}" in block, (
+            f"the panel never reads '{key}', which Postgres does return")
+    # and it must not read keys that never existed on either side
+    for ghost in ("database_size", "largest_tables"):
+        assert ghost not in report, f"'{ghost}' unexpectedly exists now"
+        assert ghost not in block, f"panel still reads the invented key '{ghost}'"

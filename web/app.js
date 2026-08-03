@@ -1940,33 +1940,57 @@ async function renderDataExtras(host) {
     api("/storage").catch(() => null),
     api("/markets/sources").catch(() => null),
   ]);
-  const FREE_MB = 512;
+  // The endpoint WRAPS the report: {"report": {...}}. The first version of this
+  // panel read the shape of storage_report() directly and rendered "undefined"
+  // against a payload that was perfectly correct — the bug was reading the
+  // function's return type instead of the route's.
+  const rep = (store && store.report) || store || null;
   let storePanel = "";
-  if (store) {
-    const mb = parseFloat(String(store.database_size).replace(/[^0-9.]/g, "")) || 0;
-    const unit = /GB/i.test(String(store.database_size)) ? 1024 : 1;
-    const usedMb = mb * unit;
-    const pct = Math.min(100, usedMb / FREE_MB * 100);
+  if (rep && !rep.total) {
+    // storage_report is DIALECT-DEPENDENT: on-disk size is a Postgres-only
+    // query, so SQLite returns row counts and retention alone. Render what
+    // exists instead of printing "undefined" where a size should be.
+    storePanel = `
+      <div class="panel"><h2>Storage</h2>
+        <div class="sub">On-disk size is a Postgres-only measurement, so it is
+          unavailable on this database. Row counts and the retention policy
+          still apply.</div>
+        ${Object.keys(rep.rows || {}).length ? `<div class="tablewrap"><table>
+          <thead><tr><th>Table</th><th class="num">Rows</th></tr></thead><tbody>
+          ${Object.entries(rep.rows).map(([k, v]) =>
+            `<tr><td>${esc(k)}</td><td class="num">${fmtN(v, 0)}</td></tr>`).join("")}
+        </tbody></table></div>` : ""}
+        <div class="sub" style="margin-top:6px">Retention:
+          ${Object.entries(rep.retention || {}).map(([k, v]) =>
+            `${esc(k.replace(/_/g, " "))} ${v}d`).join(" · ") || "not configured"}.</div>
+      </div>`;
+  } else if (rep && rep.total) {
+    const pct = rep.used_pct != null ? rep.used_pct
+      : (rep.total_bytes && rep.free_tier_bytes
+         ? rep.total_bytes / rep.free_tier_bytes * 100 : 0);
     const tone = pct > 85 ? "neg" : (pct > 65 ? "" : "pos");
+    const ceiling = rep.free_tier_bytes
+      ? (rep.free_tier_bytes / 1e6).toFixed(0) + " MB" : "the free tier";
     storePanel = `
       <div class="panel"><h2>Storage — Neon free tier</h2>
         <div class="tiles" style="grid-template-columns:1fr 1fr">
           <div class="tile"><div class="label">Used</div>
-            <div class="value ${tone}">${esc(String(store.database_size))}</div></div>
-          <div class="tile"><div class="label">Of ${FREE_MB} MB ceiling</div>
-            <div class="value ${tone}">${pct.toFixed(0)}%</div></div>
+            <div class="value ${tone}">${esc(String(rep.total))}</div></div>
+          <div class="tile"><div class="label">Of ${esc(ceiling)}</div>
+            <div class="value ${tone}">${fmtN(pct, 1)}%</div></div>
         </div>
         <div class="tablewrap"><table><thead><tr><th>Table</th>
-          <th class="num">Rows</th><th class="num">Size</th></tr></thead><tbody>
-          ${(store.largest_tables || []).map(t => `<tr><td>${esc(t.table)}</td>
+          <th class="num">Rows</th><th class="num">Size</th>
+          <th>If lost</th></tr></thead><tbody>
+          ${(rep.tables || []).map(t => `<tr><td>${esc(t.table)}</td>
             <td class="num">${fmtN(t.rows, 0)}</td>
-            <td class="num">${esc(String(t.size))}</td></tr>`).join("")}
+            <td class="num">${esc(String(t.size))}</td>
+            <td class="sub">${esc(t.class || "")}</td></tr>`).join("")}
         </tbody></table></div>
-        <div class="sub" style="margin-top:6px">Retention:
-          ${Object.entries(store.retention || {}).map(([k, v]) =>
-            `${esc(k.replace(/_/g, " "))} ${v}d`).join(" · ")}.
-          The largest table is also the most re-fetchable, which is why pruning
-          starts there and never with accumulated series that cannot be rebuilt.</div>
+        <div class="sub" style="margin-top:6px">Tables are classed by whether
+          they can be rebuilt. Pruning starts with the largest REFETCHABLE table
+          and never with an accumulated series, because a series published once
+          per day cannot be recovered after deletion — the row is gone for good.</div>
       </div>`;
   }
   let srcPanel = "";
