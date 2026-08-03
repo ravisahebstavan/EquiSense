@@ -100,10 +100,33 @@ _SOFT_MIGRATIONS = [
 ]
 
 
+# Bumped whenever _SOFT_MIGRATIONS or the table set changes, so a deployment
+# running older code cannot mistake a newer schema for "already done".
+SCHEMA_VERSION = "2026-08-03.1"
+
+
 def ensure_schema() -> None:
     """create_all for new tables + additive column migrations, dialect-portable
-    (inspector-based — works on SQLite and Postgres alike)."""
+    (inspector-based — works on SQLite and Postgres alike).
+
+    Fast-paths out when the schema is already at SCHEMA_VERSION. This matters
+    enormously on serverless: the full path runs create_all over ~20 tables plus
+    has_table and get_columns per soft migration plus index DDL — dozens of round
+    trips. At a few hundred milliseconds each, against a free Postgres tier that
+    auto-suspends and must be woken, that ran on EVERY cold start and was enough
+    to blow the function's init budget and take the whole site down with
+    FUNCTION_INVOCATION_FAILED. One SELECT replaces all of it.
+    """
     from . import models  # noqa: F401 — registers all tables on Base.metadata
+    try:
+        with engine.connect() as conn:
+            got = conn.execute(text(
+                "SELECT payload FROM app_snapshots WHERE key = 'schema_version'"
+            )).scalar()
+        if got == SCHEMA_VERSION:
+            return
+    except Exception:                              # noqa: BLE001
+        pass                                       # table absent on a fresh database
     Base.metadata.create_all(engine)
     insp = inspect(engine)
     with engine.begin() as conn:
@@ -120,3 +143,16 @@ def ensure_schema() -> None:
                           "ON vol_surface_observations (symbol, obs_date)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_macro_sym_date "
                           "ON macro_observations (symbol, obs_date)"))
+
+    # Stamped LAST, so a migration that fails part-way leaves the fast path
+    # disarmed and the next boot retries instead of skipping incomplete work.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM app_snapshots WHERE key = 'schema_version'"))
+            conn.execute(text(
+                "INSERT INTO app_snapshots (key, as_of, payload) "
+                "VALUES ('schema_version', :d, :v)"), {"d": SCHEMA_VERSION,
+                                                       "v": SCHEMA_VERSION})
+    except Exception:                              # noqa: BLE001
+        pass                                       # an optimisation, never required

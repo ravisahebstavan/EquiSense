@@ -338,8 +338,39 @@ def test_a_hosted_deployment_never_seeds_demo_data():
     from equisense.api import app as A
     src = inspect.getsource(A)
     assert "IS_HOSTED_ENV" in src
+    boot = inspect.getsource(A._startup_boot)
+    assert "not IS_HOSTED_ENV" in boot, "a hosted fallback would still be seeded"
+
+
+def test_startup_failure_cannot_take_down_the_site():
+    """On serverless an exception during init is FUNCTION_INVOCATION_FAILED —
+    the whole site 500s, including the pages that would explain why. A free
+    Postgres tier that auto-suspends makes that routine, not an edge case. A
+    site that loads and says "no database" beats one that will not load."""
+    import inspect
+
+    from equisense.api import app as A
     life = inspect.getsource(A.lifespan)
-    assert "not IS_HOSTED_ENV" in life, "a hosted fallback would still be seeded"
+    assert "IS_HOSTED_ENV" in life, "a hosted boot must skip the database entirely"
+    assert "STARTUP_ERROR" in life
+    dep = inspect.getsource(A.db)
+    assert "ensure_schema" in dep, "schema must be ensured lazily on first request"
+    assert '_SCHEMA_READY["done"] = True' in dep, "must not retry on every request"
+
+
+def test_schema_check_fast_paths_instead_of_migrating_every_cold_start():
+    """The full path runs create_all over ~20 tables plus has_table and
+    get_columns per soft migration plus index DDL — dozens of round trips at a
+    few hundred milliseconds each against a database that must first be woken.
+    Measured locally: 394ms full, 4.8ms fast path, an 82x difference, and on a
+    network database the gap is far larger."""
+    import inspect
+
+    from equisense import db
+    src = inspect.getsource(db.ensure_schema)
+    assert "SCHEMA_VERSION" in src
+    body = src[src.index('"""', src.index('"""') + 3):]   # skip the docstring
+    assert "return" in body.split("create_all")[0], "no early exit before create_all"
 
 
 def test_status_shouts_when_the_database_is_missing():

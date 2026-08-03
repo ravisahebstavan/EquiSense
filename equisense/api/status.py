@@ -73,7 +73,13 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
     # the only symptom is implausibly small row counts that look like an
     # ingestion lag rather than a total loss of the database.
     from ..db import IS_SQLITE
-    from .app import IS_HOSTED_ENV
+    from .app import IS_HOSTED_ENV, STARTUP_ERROR
+    if STARTUP_ERROR.get("detail"):
+        warnings.insert(0,
+            "STARTUP FAILED — the app booted but could not reach its database: "
+            f"{STARTUP_ERROR['detail']}. On a free Postgres tier this is usually "
+            "the instance auto-suspending; the next request often succeeds. "
+            "Figures below may be stale or absent.")
     if IS_HOSTED_ENV and IS_SQLITE:
         warnings.insert(0,
             "CONFIGURATION ERROR — this deployment has no DATABASE_URL and is "

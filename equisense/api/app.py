@@ -38,6 +38,42 @@ async def lifespan(app: FastAPI):
     """Runs per cold start on serverless — must stay fast and idempotent.
     Live data bootstrap is NOT done here (serverless kills background
     threads): the refresh stream is bootstrap-aware instead (status.py)."""
+    # NOTHING here may raise. On a serverless host an exception during init is
+    # FUNCTION_INVOCATION_FAILED — the entire site 500s, including the pages that
+    # would have explained why. A free-tier Postgres that auto-suspends after a
+    # few minutes idle makes this a routine event, not an edge case: the cold
+    # start lands on a sleeping database, create_all blocks waking it, and the
+    # whole deployment goes dark.
+    #
+    # So startup is best-effort and the failure is carried to the endpoints,
+    # which already know how to report a broken database. A site that loads and
+    # says "no database" is strictly better than one that will not load at all.
+    # Measured against the real deployment: a suspended Neon free-tier instance
+    # takes ~28 SECONDS to accept its first connection, and the schema work on
+    # top is only ~3s of that. No amount of optimising the migration helps,
+    # because the cost is waking the database, not the DDL.
+    #
+    # So a hosted app does NO database work during init. The first real request
+    # pays the wake cost inside its own generous budget (maxDuration 300)
+    # instead of inside the function's much shorter init window, where blocking
+    # produced FUNCTION_INVOCATION_FAILED and took the entire site down.
+    #
+    # Local development still boots eagerly: SQLite has no wake cost, and having
+    # the schema and default profile ready on first run is worth the
+    # milliseconds.
+    if not IS_HOSTED_ENV:
+        try:
+            _startup_boot()
+        except Exception as exc:                   # noqa: BLE001
+            STARTUP_ERROR["detail"] = f"{type(exc).__name__}: {exc}"
+    yield
+
+
+STARTUP_ERROR: dict = {"detail": None}
+
+
+def _startup_boot() -> None:
+    """Schema + default profile. Split out so lifespan can guard it."""
     from ..db import IS_SQLITE, ensure_schema
     ensure_schema()
     with get_session() as s:
@@ -50,7 +86,6 @@ async def lifespan(app: FastAPI):
         if not s.scalars(select(InvestorProfileRow)).first():
             s.add(InvestorProfileRow(name="default", is_active=True))
             s.commit()
-    yield
 
 
 app = FastAPI(title="EquiSense", version="0.1.0", lifespan=lifespan)
@@ -90,7 +125,20 @@ async def auth_gate(request: Request, call_next):
     return response
 
 
+_SCHEMA_READY = {"done": False}
+
+
 def db():
+    # Deferred schema check: the first request per process pays for it, inside
+    # its own 300s budget rather than the init window. Guarded so it runs once
+    # and never blocks a warm invocation.
+    if not _SCHEMA_READY["done"]:
+        _SCHEMA_READY["done"] = True               # set first: a failure must not
+        try:                                       # retry on every request
+            from ..db import ensure_schema
+            ensure_schema()
+        except Exception as exc:                   # noqa: BLE001
+            STARTUP_ERROR["detail"] = f"{type(exc).__name__}: {exc}"
     s = get_session()
     try:
         yield s
