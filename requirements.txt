@@ -9,4 +9,10 @@ pandas>=2.0
 # explicit: engine/montecarlo.py and research/stats.py import numpy directly.
 # It arrives transitively via pandas today, which is not a guarantee.
 numpy>=1.26
-psycopg[binary]>=3.1
+# Split deliberately. `psycopg[binary]` uses extras-bracket syntax, and Vercel's
+# Python builder resolved every other package while silently skipping this one —
+# the deployment died at import with ModuleNotFoundError: No module named
+# 'psycopg' while the requirement sat right here in the file. Naming the binary
+# wheel as its own top-level requirement removes the extras resolution entirely.
+psycopg>=3.1
+psycopg-binary>=3.1

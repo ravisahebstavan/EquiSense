@@ -383,3 +383,72 @@ def test_status_shouts_when_the_database_is_missing():
     assert "CONFIGURATION ERROR" in src
     assert "DATABASE_URL" in src
     assert "warnings.insert(0" in src, "must be the FIRST warning, not buried"
+
+
+def test_writes_are_refused_on_ephemeral_hosted_storage():
+    """The most expensive failure in this codebase, and it ran silently for the
+    life of the deployment.
+
+    Without DATABASE_URL a serverless box falls back to SQLite under /tmp, which
+    is PER-INSTANCE and wiped between invocations. Every write appeared to
+    succeed — refresh fetched genuine Yahoo data, paper trades were accepted,
+    ledger entries were hash-chained — and the next request landed on a
+    different instance that had never seen any of it. The observed symptom was a
+    site reporting 54 price rows while refresh kept "working".
+
+    It matters most for the LEDGER, which is the forward-testing record: losing
+    it silently means nine months of calibration evidence never accumulates
+    while appearing to.
+    """
+    import inspect
+
+    from equisense.api import app as A
+    src = inspect.getsource(A._reject_if_ephemeral)
+    assert "IS_HOSTED_ENV" in src and "IS_SQLITE" in src
+    assert "503" in src
+    assert "refused rather" in src, "must say the write was refused, not lost"
+
+
+def test_every_persisting_endpoint_is_guarded():
+    """A write path that skips the guard reintroduces the silent loss."""
+    import inspect
+
+    from equisense.api import app as A
+    src = inspect.getsource(A)
+    assert src.count("_reject_if_ephemeral()") >= 4, (
+        "refresh, refresh-stream, paper trades and the dossier ledger write "
+        "must all refuse on ephemeral storage")
+
+
+def test_a_missing_database_driver_cannot_make_the_app_unimportable():
+    """create_engine imports the DBAPI eagerly, so a missing psycopg raises at
+    MODULE IMPORT, before any handler exists. The whole site then 500s on every
+    path including /favicon.ico, with no page left able to explain why — which
+    is exactly what a deployment hit: `ModuleNotFoundError: No module named
+    'psycopg'` while the requirement sat in requirements.txt, because the
+    builder had skipped the extras-bracket syntax."""
+    import inspect
+
+    from equisense import db
+    src = inspect.getsource(db)
+    assert "ENGINE_ERROR" in src
+    assert "_build_engine" in src
+    head = src[:src.index("SessionLocal")]
+    assert "try:" in head and "except Exception" in head, (
+        "engine creation is unguarded; a missing driver kills the whole app")
+
+
+def test_requirements_name_the_postgres_driver_without_extras():
+    """`psycopg[binary]` resolved to nothing on the deployment while every other
+    package installed. Naming the binary wheel directly removes the extras
+    resolution that failed."""
+    from pathlib import Path
+    req = (Path(__file__).resolve().parent.parent / "requirements.txt").read_text()
+    # comments explain the fix and mention the broken form, so read the actual
+    # requirement lines only
+    lines = [ln.strip() for ln in req.splitlines()
+             if ln.strip() and not ln.strip().startswith("#")]
+    assert any(ln.startswith("psycopg-binary") for ln in lines), \
+        "the binary wheel is not named directly"
+    assert not any("[" in ln for ln in lines if ln.startswith("psycopg")), \
+        "extras syntax is what silently failed on the deployment"

@@ -39,11 +39,35 @@ def _resolve_url() -> str:
 DB_URL = _resolve_url()
 IS_SQLITE = DB_URL.startswith("sqlite")
 
-engine = create_engine(
-    DB_URL,
-    connect_args={"check_same_thread": False, "timeout": 30} if IS_SQLITE else {},
-    pool_pre_ping=not IS_SQLITE,  # free Postgres tiers suspend when idle
-)
+# Recorded when the configured database cannot be opened at all, so the app can
+# still start and SAY so. Read by api/status.py.
+ENGINE_ERROR: dict = {"detail": None}
+
+
+def _build_engine(url: str, sqlite: bool):
+    return create_engine(
+        url,
+        connect_args={"check_same_thread": False, "timeout": 30} if sqlite else {},
+        pool_pre_ping=not sqlite,  # free Postgres tiers suspend when idle
+    )
+
+
+try:
+    engine = _build_engine(DB_URL, IS_SQLITE)
+except Exception as exc:                           # noqa: BLE001
+    # create_engine imports the DBAPI driver eagerly, so a missing psycopg
+    # raises HERE — at module import, before any handler exists. The whole site
+    # then 500s on every path including /favicon.ico, with no page left able to
+    # explain why. That is exactly what a deployment saw: the requirement was
+    # present in requirements.txt but the builder had skipped it.
+    #
+    # Degrade to local SQLite so the app can boot and report the fault. Writes
+    # are refused separately (api/app.py::_reject_if_ephemeral) so a degraded
+    # boot cannot quietly accept data it will lose.
+    ENGINE_ERROR["detail"] = f"{type(exc).__name__}: {exc}"
+    DB_URL = f"sqlite:///{DATA_DIR / 'equisense.db'}"
+    IS_SQLITE = True
+    engine = _build_engine(DB_URL, True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 # Persistent research records (ledger, vault) default to DB rows on a real

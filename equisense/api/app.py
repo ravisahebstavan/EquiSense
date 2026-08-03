@@ -125,6 +125,30 @@ async def auth_gate(request: Request, call_next):
     return response
 
 
+def _reject_if_ephemeral() -> None:
+    """Refuse writes on a hosted deployment with no real database.
+
+    Without DATABASE_URL a serverless box falls back to SQLite under /tmp, which
+    is PER-INSTANCE and wiped between invocations. Every write still appears to
+    succeed: the refresh fetches genuine Yahoo data, the paper trade is
+    accepted, the ledger entry is hash-chained — and the next request lands on a
+    different instance that has never seen any of it.
+
+    That is the most expensive failure in this codebase, because the ledger is
+    the forward-testing record. Losing it silently means the nine months of
+    calibration evidence never accumulates while appearing to. Better to refuse
+    the write outright.
+    """
+    from ..db import IS_SQLITE
+    if IS_HOSTED_ENV and IS_SQLITE:
+        raise HTTPException(503, (
+            "No database configured. This deployment is running on ephemeral "
+            "per-instance storage, so anything written here is discarded on the "
+            "next request — including paper trades and the hash-chained forecast "
+            "ledger. Set DATABASE_URL and redeploy. The write was refused rather "
+            "than silently lost."))
+
+
 _SCHEMA_READY = {"done": False}
 
 
@@ -349,6 +373,7 @@ def paper_account(s: Session = Depends(db)):
 
 @app.post("/api/paper/trade", status_code=201)
 def paper_trade(t: PaperTradeIn, s: Session = Depends(db)):
+    _reject_if_ephemeral()
     from .paper import place_trade
     try:
         return place_trade(s, t.company_id, t.side, t.quantity, t.dossier_hash)
@@ -590,6 +615,7 @@ def live_regime(s: Session = Depends(db)):
 @app.post("/api/live/dossier/{company_id}")
 def live_dossier(company_id: int, s: Session = Depends(db)):
     """Build, pre-register (hash-chained), and return a full decision dossier."""
+    _reject_if_ephemeral()
     from .live import build_dossier
     c = _get_company(s, company_id)
     profile = services.active_profile(s)
@@ -716,6 +742,7 @@ def live_run_studies(s: Session = Depends(db)):
 def live_refresh(s: Session = Depends(db)):
     """Full staged pipeline WITHOUT streaming — the fallback for hosts that
     buffer SSE. Returns every stage event the stream would have emitted."""
+    _reject_if_ephemeral()
     import json as _json
     from .status import refresh_stream
     stages = [_json.loads(ev[5:].strip()) for ev in refresh_stream(s)
@@ -775,6 +802,7 @@ def live_status(s: Session = Depends(db), verify_ledger: bool = False):
 @app.get("/api/live/refresh/stream")
 def live_refresh_stream(s: Session = Depends(db)):
     """Staged pipeline refresh as Server-Sent Events — everything visible."""
+    _reject_if_ephemeral()
     from fastapi.responses import StreamingResponse
     from .status import refresh_stream
     return StreamingResponse(refresh_stream(s), media_type="text/event-stream",

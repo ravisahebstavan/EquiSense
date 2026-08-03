@@ -72,8 +72,15 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
     # falls back to ephemeral SQLite. The site still renders, so without this
     # the only symptom is implausibly small row counts that look like an
     # ingestion lag rather than a total loss of the database.
-    from ..db import IS_SQLITE
+    from ..db import ENGINE_ERROR, IS_SQLITE
     from .app import IS_HOSTED_ENV, STARTUP_ERROR
+    if ENGINE_ERROR.get("detail"):
+        warnings.insert(0,
+            "DATABASE DRIVER MISSING — the configured database could not be "
+            f"opened ({ENGINE_ERROR['detail']}) and the app fell back to local "
+            "storage. This is a build problem, not a data problem: the Postgres "
+            "driver is absent from the deployed bundle. Writes are refused until "
+            "it is fixed.")
     if STARTUP_ERROR.get("detail"):
         warnings.insert(0,
             "STARTUP FAILED — the app booted but could not reach its database: "
