@@ -325,3 +325,30 @@ def test_status_still_verifies_when_asked():
     src = inspect.getsource(status.data_status)
     assert "ledger.verify_chain()" in src, "explicit verification path removed"
     assert "LEDGER CHAIN BROKEN" in src
+
+
+def test_a_hosted_deployment_never_seeds_demo_data():
+    """A hosted app that falls back to SQLite has lost its database. Seeding
+    demo rows on top makes the failure INVISIBLE — the site renders, charts
+    draw, and 9 fake companies read as real signals. That is worse than an error
+    page. Observed live: the Vercel deployment served 54 rows across 9 companies
+    while the real database held 1,005,145 bars across 501."""
+    import inspect
+
+    from equisense.api import app as A
+    src = inspect.getsource(A)
+    assert "IS_HOSTED_ENV" in src
+    life = inspect.getsource(A.lifespan)
+    assert "not IS_HOSTED_ENV" in life, "a hosted fallback would still be seeded"
+
+
+def test_status_shouts_when_the_database_is_missing():
+    """Without this the only symptom is implausibly small row counts, which read
+    as ingestion lag rather than total loss of the database."""
+    import inspect
+
+    from equisense.api import status
+    src = inspect.getsource(status.data_status)
+    assert "CONFIGURATION ERROR" in src
+    assert "DATABASE_URL" in src
+    assert "warnings.insert(0" in src, "must be the FIRST warning, not buried"

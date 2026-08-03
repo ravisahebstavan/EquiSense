@@ -68,6 +68,19 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
     # makes the whole dataset read fresh while individual names sit frozen for
     # weeks. Measured per name, five Nifty-50 constituents were 17 sessions
     # behind and nothing in the system said so.
+    # The loudest possible failure: a hosted deployment with no DATABASE_URL
+    # falls back to ephemeral SQLite. The site still renders, so without this
+    # the only symptom is implausibly small row counts that look like an
+    # ingestion lag rather than a total loss of the database.
+    from ..db import IS_SQLITE
+    from .app import IS_HOSTED_ENV
+    if IS_HOSTED_ENV and IS_SQLITE:
+        warnings.insert(0,
+            "CONFIGURATION ERROR — this deployment has no DATABASE_URL and is "
+            "running on an empty, ephemeral local database. Every figure on this "
+            "site is meaningless until the environment variable is set and the "
+            "app redeployed. Nothing shown here reflects the real portfolio.")
+
     stale_names = per_company_staleness(session)
     if stale_names:
         worst = ", ".join(f"{t} ({n}d)" for t, n in list(stale_names.items())[:5])

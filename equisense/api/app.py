@@ -27,6 +27,11 @@ from . import services
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 
+# Serverless platforms set these. Used only to decide whether a SQLite fallback
+# is a development convenience or a production misconfiguration.
+IS_HOSTED_ENV = bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV")
+                     or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,7 +41,11 @@ async def lifespan(app: FastAPI):
     from ..db import IS_SQLITE, ensure_schema
     ensure_schema()
     with get_session() as s:
-        if IS_SQLITE and os.environ.get("EQUISENSE_AUTO_INGEST") != "1":
+        # A hosted deployment that falls back to SQLite has lost its database,
+        # and seeding demo rows on top makes the failure INVISIBLE: the site
+        # renders, the charts draw, and 9 fake companies read as real signals.
+        # That is worse than an error page. Detect the host and refuse to seed.
+        if IS_SQLITE and not IS_HOSTED_ENV and os.environ.get("EQUISENSE_AUTO_INGEST") != "1":
             seed(s)  # demo data only for local SQLite dev — never into a hosted DB
         if not s.scalars(select(InvestorProfileRow)).first():
             s.add(InvestorProfileRow(name="default", is_active=True))
