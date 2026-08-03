@@ -461,8 +461,22 @@ def test_the_postgres_driver_is_a_base_dependency_not_an_extra():
     set. A driver the deployment cannot boot without is not optional."""
     from pathlib import Path
     pt = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
-    base = pt[pt.index("dependencies = ["):pt.index("[project.optional-dependencies]")]
-    assert "psycopg" in base, "the driver is still not in base dependencies"
+    # Parse by SECTION HEADER at line start, and read requirement strings only.
+    # A substring search matched the explanatory comment above the dependency —
+    # which quotes the very section name being searched for — and truncated the
+    # slice before reaching it. The comment broke the test that guards it.
+    lines, section, base = pt.splitlines(), None, []
+    for ln in lines:
+        st = ln.strip()
+        if st.startswith("[") and st.endswith("]"):
+            section = st
+            continue
+        if st.startswith("#") or not st:
+            continue
+        if section == "[project]" and st.startswith('"'):
+            base.append(st)
+    assert any("psycopg" in r for r in base), (
+        f"the driver is still not in base dependencies: {base}")
 
 
 def test_a_driver_failure_is_not_reported_as_a_missing_env_var():
