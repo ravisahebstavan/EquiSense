@@ -87,7 +87,12 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
             f"{STARTUP_ERROR['detail']}. On a free Postgres tier this is usually "
             "the instance auto-suspending; the next request often succeeds. "
             "Figures below may be stale or absent.")
-    if IS_HOSTED_ENV and IS_SQLITE:
+    # Only blame a missing env var when one is actually missing. A driver
+    # failure ALSO lands on SQLite, and reporting both made the second warning
+    # contradict the first and sent the reader chasing the wrong fix.
+    import os as _os
+    _has_url = bool(_os.environ.get("DATABASE_URL") or _os.environ.get("EQUISENSE_DB"))
+    if IS_HOSTED_ENV and IS_SQLITE and not _has_url and not ENGINE_ERROR.get("detail"):
         warnings.insert(0,
             "CONFIGURATION ERROR — this deployment has no DATABASE_URL and is "
             "running on an empty, ephemeral local database. Every figure on this "

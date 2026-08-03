@@ -12,11 +12,22 @@ dependencies = [
     "yfinance>=0.2.40",
     "pandas>=2.0",
     "numpy>=1.26",
+    # Postgres driver lives in the BASE dependencies, not an extra. It was
+    # previously under [project.optional-dependencies] postgres, and the hosted
+    # build installed base deps only — so every other package landed and this one
+    # silently did not. The app then died at import with
+    # ModuleNotFoundError: No module named 'psycopg' the moment DATABASE_URL was
+    # set. A driver the production deployment cannot start without is not
+    # optional.
+    "psycopg>=3.1",
+    "psycopg-binary>=3.1",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.27"]
-postgres = ["psycopg[binary]>=3.1"]  # hosted deployments (DEPLOYMENT.md)
+# retained so `pip install -e ".[postgres]"` keeps working; the driver itself is
+# now a base dependency because the deployment cannot boot without it
+postgres = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

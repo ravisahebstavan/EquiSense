@@ -452,3 +452,25 @@ def test_requirements_name_the_postgres_driver_without_extras():
         "the binary wheel is not named directly"
     assert not any("[" in ln for ln in lines if ln.startswith("psycopg")), \
         "extras syntax is what silently failed on the deployment"
+
+
+def test_the_postgres_driver_is_a_base_dependency_not_an_extra():
+    """It sat under [project.optional-dependencies] while the hosted build
+    installed base deps only, so every other package landed and this one
+    silently did not. The app then died at import the moment DATABASE_URL was
+    set. A driver the deployment cannot boot without is not optional."""
+    from pathlib import Path
+    pt = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+    base = pt[pt.index("dependencies = ["):pt.index("[project.optional-dependencies]")]
+    assert "psycopg" in base, "the driver is still not in base dependencies"
+
+
+def test_a_driver_failure_is_not_reported_as_a_missing_env_var():
+    """Both conditions land on SQLite, so reporting both made the warnings
+    contradict each other and pointed at the wrong fix."""
+    import inspect
+
+    from equisense.api import status
+    src = inspect.getsource(status.data_status)
+    assert 'not ENGINE_ERROR.get("detail")' in src
+    assert "_has_url" in src
