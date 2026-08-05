@@ -49,7 +49,8 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
     # network database charges a few hundred milliseconds per ROUND TRIP, so the
     # query count was the latency. Scalar subqueries collapse them into a single
     # statement without changing a single number.
-    n_companies, n_prices, latest_price, earliest_price, null_vol = session.execute(
+    (n_companies, n_prices, latest_price, earliest_price, null_vol,
+     n_live, n_live_financial) = session.execute(
         select(
             select(func.count(Company.id)).scalar_subquery(),
             select(func.count(PriceObservation.id)).scalar_subquery(),
@@ -57,6 +58,15 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
             select(func.min(PriceObservation.obs_date)).scalar_subquery(),
             select(func.count(PriceObservation.id))
             .where(PriceObservation.volume.is_(None)).scalar_subquery(),
+            # The LIVE analytical universe (current index members). Departed
+            # names keep their price history for survivorship-corrected
+            # backtests but are not part of what the platform analyses today,
+            # so they must not sit in the denominator of a coverage metric.
+            select(func.count(Company.id))
+            .where(Company.is_index_member.is_(True)).scalar_subquery(),
+            select(func.count(Company.id))
+            .where(Company.is_index_member.is_(True),
+                   Company.is_financial.is_(True)).scalar_subquery(),
         )).one()
     price_stale = (today - latest_price).days if latest_price else None
     if price_stale is None:
@@ -99,6 +109,19 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
             "site is meaningless until the environment variable is set and the "
             "app redeployed. Nothing shown here reflects the real portfolio.")
 
+    # The auth gate (app.py) silently disables itself when EQUISENSE_ACCESS_TOKEN
+    # is unset — deliberately, so local dev stays frictionless. On a hosted
+    # deployment that same silence means the real portfolio, the ledger, and
+    # every write endpoint sit open to the public internet with no warning
+    # anywhere. This must fail as loudly as the missing-DATABASE_URL case above.
+    if IS_HOSTED_ENV and not _os.environ.get("EQUISENSE_ACCESS_TOKEN"):
+        warnings.insert(0,
+            "SECURITY: NO ACCESS TOKEN SET — this hosted deployment has no "
+            "EQUISENSE_ACCESS_TOKEN configured, so the auth gate is disabled and "
+            "the entire site (including writes: trades, transactions, ledger) is "
+            "open to anyone with the URL. Set EQUISENSE_ACCESS_TOKEN in the "
+            "hosting environment and redeploy.")
+
     stale_names = per_company_staleness(session)
     if stale_names:
         worst = ", ".join(f"{t} ({n}d)" for t, n in list(stale_names.items())[:5])
@@ -121,13 +144,14 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
 
     n_filings = session.scalar(select(func.count(FilingPeriod.id))
                                .where(FilingPeriod.source == "yahoo"))
+    # Scoped to the live universe, because that is the only set fundamentals
+    # are ever ingested for (ingest_fundamentals runs over sync_universe's ids).
     filing_companies = session.scalar(
         select(func.count(func.distinct(FilingPeriod.company_id)))
-        .where(FilingPeriod.source == "yahoo"))
+        .join(Company, Company.id == FilingPeriod.company_id)
+        .where(FilingPeriod.source == "yahoo", Company.is_index_member.is_(True)))
     latest_fy = session.scalar(select(func.max(FilingPeriod.fiscal_year))
                                .where(FilingPeriod.source == "yahoo"))
-    n_financial = session.scalar(select(func.count(Company.id))
-                                 .where(Company.is_financial.is_(True)))
 
     br_count = session.scalar(select(func.count(BaseRateRecord.id)))
     br_computed = session.scalar(select(func.max(BaseRateRecord.computed_at)))
@@ -161,12 +185,18 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
         # Penalised by BREADTH of staleness as well as its age: a dataset where
         # 5% of names are frozen is not "fresh" merely because one name traded
         # today, which is exactly what the max-date-only score used to claim.
+        # Both ratios are measured against the LIVE universe, not every row the
+        # database has ever held. Departed constituents are retained on purpose
+        # (survivorship-corrected backtests need the dead names) and fundamentals
+        # are never fetched for them, so counting them in the denominator made
+        # coverage read ~14% while the live universe was in fact fully covered —
+        # a gauge that could never reach green, which teaches you to ignore it.
         "price_freshness": (0.0 if price_stale is None else
                             max(0.0, 1 - max(0, price_stale - 3) / 7)
-                            * (1 - min(1.0, len(stale_names) / max(1, n_companies)))),
+                            * (1 - min(1.0, len(stale_names) / max(1, n_live)))),
         "volume_completeness": 0.0 if not n_prices else 1 - (null_vol / n_prices),
-        "fundamental_coverage": 0.0 if not n_companies else
-        filing_companies / max(1, n_companies - n_financial),
+        "fundamental_coverage": 0.0 if not n_live else
+        min(1.0, filing_companies / max(1, n_live - n_live_financial)),
         "studies_current": 0.0 if br_count == 0 else (0.6 if studies_stale else 1.0),
         "ledger_integrity": 1.0 if chain.get("intact", True) else 0.0,
     }
@@ -179,13 +209,18 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
         "quality_components": {k: round(v, 3) for k, v in comp.items()},
         "warnings": warnings,
         "datasets": {
+            # `companies` counts every name with price history, including
+            # departed constituents kept for survivorship-corrected backtests;
+            # `index_members` is the live analytical universe. Showing only the
+            # first made the dashboard's row count look like data loss.
             "prices": {"rows": n_prices, "companies": n_companies,
+                       "index_members": n_live,
                        "coverage": f"{earliest_price} → {latest_price}",
                        "latest": str(latest_price), "staleness_days": price_stale,
                        "null_volume_pct": round(null_vol / n_prices * 100, 2) if n_prices else None},
             "fundamentals": {"rows": n_filings, "companies_covered": filing_companies,
                              "latest_fy": latest_fy, "pit_grade": "reconstructed",
-                             "financial_sector_excluded": n_financial},
+                             "financial_sector_excluded": n_live_financial},
             "macro": macro,
             "base_rates": {"records": br_count,
                            "computed_at": br_computed.isoformat() if br_computed else None,

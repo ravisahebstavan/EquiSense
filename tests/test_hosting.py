@@ -534,3 +534,90 @@ def test_the_storage_panel_reads_the_keys_the_endpoint_actually_returns():
     for ghost in ("database_size", "largest_tables"):
         assert ghost not in report, f"'{ghost}' unexpectedly exists now"
         assert ghost not in block, f"panel still reads the invented key '{ghost}'"
+
+
+def _status_db():
+    """Tiny live universe + a graveyard of departed names, matching production:
+    prices retained for the dead, fundamentals only ever for index members."""
+    from datetime import date
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import equisense.models  # noqa: F401 - registers tables
+    from equisense.db import Base
+    from equisense.models import Company, FilingPeriod, PriceObservation
+
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    s = sessionmaker(bind=eng, expire_on_commit=False)()
+    today = date.today()
+    for i in range(10):
+        c = Company(ticker=f"LIVE{i}", name=f"L{i}",
+                    sector="Financials" if i < 2 else "IT",
+                    is_financial=i < 2, is_index_member=True)
+        s.add(c)
+        s.flush()
+        s.add(PriceObservation(company_id=c.id, obs_date=today, close=100.0, volume=1))
+        if i >= 2:
+            s.add(FilingPeriod(company_id=c.id, period="FY2026", fiscal_year=2026,
+                               source="yahoo", scope="consolidated"))
+    for i in range(400):
+        c = Company(ticker=f"DEAD{i}", name=f"D{i}", sector="IT", is_index_member=False)
+        s.add(c)
+        s.flush()
+        s.add(PriceObservation(company_id=c.id, obs_date=today, close=50.0, volume=1))
+    s.commit()
+    return s
+
+
+def test_coverage_is_measured_against_the_live_universe_not_the_graveyard():
+    """Departed constituents are retained ON PURPOSE (survivorship-corrected
+    backtests need the dead names) and fundamentals are never fetched for them.
+    Counting them in the denominator made production report 13.8% coverage
+    while every live name was in fact covered — a gauge that can never reach
+    green, which just teaches you to ignore the number."""
+    from equisense.api.status import data_status
+
+    st = data_status(_status_db())
+    assert st["datasets"]["prices"]["companies"] == 410, "all names keep their history"
+    assert st["datasets"]["prices"]["index_members"] == 10, "live universe is surfaced"
+    assert st["quality_components"]["fundamental_coverage"] == 1.0, (
+        "the live universe is fully covered, so coverage must read 1.0")
+
+
+def test_status_shouts_when_a_hosted_deployment_has_no_access_token(monkeypatch):
+    """The auth gate disables itself when EQUISENSE_ACCESS_TOKEN is unset — by
+    design, so local dev stays frictionless. On a hosted deployment that same
+    silence leaves the real portfolio, the ledger and every write endpoint open
+    to anyone with the URL, and nothing anywhere says so."""
+    from equisense.api import app as app_mod
+    from equisense.api.status import data_status
+
+    monkeypatch.delenv("EQUISENSE_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(app_mod, "IS_HOSTED_ENV", True)
+    warnings = data_status(_status_db())["warnings"]
+    assert warnings, "a hosted deployment with no token must warn"
+    assert "ACCESS TOKEN" in warnings[0].upper(), (
+        f"must be the FIRST warning, not buried; got {warnings[0]!r}")
+
+    monkeypatch.setenv("EQUISENSE_ACCESS_TOKEN", "a-real-secret")
+    assert not any("ACCESS TOKEN" in w.upper()
+                   for w in data_status(_status_db())["warnings"]), (
+        "must go quiet once the token is configured")
+
+
+def test_ai_reports_a_missing_key_as_configuration_not_a_crash(monkeypatch):
+    """The SDK's raw exception repr ("TypeError: Could not resolve
+    authentication method...") was rendered straight into the UI, which reads
+    as a crash and names nothing the user can act on."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    from equisense.ai import narrator
+
+    out = narrator._grounded_call("sys", {"x": 1}, "do it")
+    assert out["available"] is False
+    assert "ANTHROPIC_API_KEY" in out["reason"]
+    assert "TypeError" not in out["reason"], "no raw exception reprs in the UI"
+    assert out["context"] == {"x": 1}, "grounding context still returned"

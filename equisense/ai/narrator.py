@@ -11,6 +11,7 @@ return the structured facts with `available: false` instead of failing.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Optional
 
 from .grounding import validate
@@ -96,6 +97,15 @@ def _grounded_call(system: str, context: Any, instruction: str,
                    output_schema: Optional[dict] = None) -> dict:
     """One call + grounding validation; one corrective retry on violation
     (§29.2 — automated, not a manual spot check)."""
+    # A deployment with no key is a CONFIGURATION state, not a runtime failure.
+    # Without this the user was shown the SDK's raw exception repr ("TypeError:
+    # Could not resolve authentication method...") in the UI, which reads as a
+    # crash and says nothing about the one thing that actually fixes it.
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return _unavailable(context,
+                            "AI narration is not configured on this deployment — "
+                            "set ANTHROPIC_API_KEY in the hosting environment to "
+                            "enable it. Every figure below is computed without AI.")
     ctx_json = json.dumps(context, indent=1, default=str)
     prompt = f"<context>\n{ctx_json}\n</context>\n\n{instruction}"
     try:
