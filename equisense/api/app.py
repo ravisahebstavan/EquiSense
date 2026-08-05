@@ -816,65 +816,104 @@ def live_portfolio_risk(s: Session = Depends(db)):
     return portfolio_risk(s)
 
 
+# The cron must finish INSIDE the platform's function limit (vercel.json
+# maxDuration). Measured against the real deployment, the full pipeline ran
+# 300s and was killed with a 504 — every day, silently, committing nothing
+# past the point of death. Leave real headroom: a stage started at 239s can
+# still overrun, so the budget is what we refuse to START new work after.
+CRON_BUDGET_S = 210.0
+
+
 @app.get("/api/cron/refresh")
 def cron_refresh(s: Session = Depends(db)):
     """Daily keep-fresh for Vercel Cron (GET; Vercel sends
     `Authorization: Bearer $CRON_SECRET`, which the auth gate accepts when
-    CRON_SECRET equals EQUISENSE_ACCESS_TOKEN). Incremental prices + macro,
-    then recompute studies and score due claims."""
+    CRON_SECRET equals EQUISENSE_ACCESS_TOKEN).
+
+    Stages run in order of IRREPLACEABILITY, not convenience, and each commits
+    on its own. This ordering is the whole point:
+
+    The daily NSE archive and the option surface publish one file per day and
+    cannot be backfilled — a missed day is a permanent hole. Registering
+    forecasts is what lets the system learn at all. Prices, macro, base rates
+    and the snapshot are all fully recomputable from scratch at any time.
+
+    Previously the recomputable work ran FIRST and the irreplaceable work last,
+    so when the function hit its limit the only things that never happened were
+    the ones that could never be recovered. Production showed it exactly: 2
+    stored IV observations, zero scored claims, and base rates frozen for days.
+    """
+    import time as _time
+
     from ..ingestion.yahoo import ingest_macro, ingest_prices, sync_universe
     from ..research.base_rates import run_all_studies
     from .. import ledger as L
-    from .snapshot import build_universe_snapshot
-    ids = sync_universe(s)
-    prices = ingest_prices(s, ids, years=1)
-    macro = ingest_macro(s, years=1)
-    studies = run_all_studies(s)["records"]
-    # Daily NSE archive capture. Delivery %, index valuation and the option
-    # SURFACE SUMMARY all publish one file per day and cannot be backfilled, so
-    # the series only exists if capture runs every day — missing a day is a
-    # permanent hole, not a delay.
     from ..ingestion.nse_archive import backfill as nse_backfill, prune
+    from .autopilot import get_config, register_daily_forecasts, run_autopilot
     from .markets import capture_vol_surface
-    try:
-        nse = nse_backfill(s, days=4, symbols=list(ids))
-    except Exception as exc:                       # noqa: BLE001 - never block the cron
-        nse = {"error": str(exc)[:120]}
-    try:
-        vol = capture_vol_surface(s)
-    except Exception as exc:                       # noqa: BLE001
-        vol = {"error": str(exc)[:120]}
-    try:
-        pruned = prune(s)
-    except Exception as exc:                       # noqa: BLE001
-        pruned = {"error": str(exc)[:120]}
-    # Register today's forecasts BEFORE scoring, so a claim made today is in the
-    # chain and starts its horizon now. This is the step that lets the system
-    # learn at all: calibrated probabilities, calibrated magnitudes and learned
-    # cluster weights all unlock from realised forecasts, and a forecast only
-    # exists once a dossier is registered. Previously that happened solely when
-    # a human clicked "Generate dossier", so the calibration ledger sat at zero
-    # and every weight stayed provisional indefinitely.
-    from .autopilot import register_daily_forecasts
-    try:
-        forecasts = register_daily_forecasts(s)
-    except Exception as exc:                       # noqa: BLE001 - never block the cron
-        forecasts = {"error": str(exc)[:160]}
-    scored = L.score_due_claims(s)["scored"]
-    checkpointed = L.score_interim_checkpoints(s)["checkpointed"]
-    snap = build_universe_snapshot(s)
-    from .autopilot import get_config, run_autopilot
-    auto = run_autopilot(s) if get_config(s)["enabled"] else None
-    return {"price_rows": prices, "macro_rows": macro,
-            "forecasts_registered": (len(forecasts.get("registered", []))
-                                     if isinstance(forecasts, dict)
-                                     and "registered" in forecasts else forecasts),
-            "nse_archives": nse, "vol_surface": vol, "pruned": pruned,
-            "base_rate_records": studies, "claims_scored": scored,
-            "checkpoints_scored": checkpointed,
-            "snapshot_companies": len(snap["companies"]),
-            "autopilot": None if auto is None else
-            {"entries": len(auto["entries"]), "exits": len(auto["exits"])}}
+    from .snapshot import build_universe_snapshot
+
+    t0 = _time.monotonic()
+    out: dict = {}
+
+    def stage(name: str, fn):
+        """Run one stage, commit it, and never let it take down the rest.
+
+        Skipping on budget is reported, not silent: a cron that quietly does
+        half its work is how this failure survived for weeks.
+        """
+        if _time.monotonic() - t0 > CRON_BUDGET_S:
+            out[name] = {"skipped": "time budget exhausted"}
+            return None
+        try:
+            result = fn()
+            s.commit()          # durable per stage, so a later stall cannot undo it
+            out[name] = result
+            return result
+        except Exception as exc:               # noqa: BLE001 - never block the cron
+            s.rollback()
+            out[name] = {"error": f"{type(exc).__name__}: {exc}"[:160]}
+            return None
+
+    # 1. Universe first: everything downstream needs the ids, and it is cheap.
+    ids = stage("universe", lambda: sync_universe(s)) or {}
+    out["universe"] = {"companies": len(ids)}
+
+    # 2. NON-BACKFILLABLE captures, before anything that merely refetches.
+    stage("vol_surface", lambda: capture_vol_surface(s))
+    if ids:
+        stage("nse_archives", lambda: nse_backfill(s, days=4, symbols=list(ids)))
+
+    # 3. Prices and macro — recoverable, but the learning loop below needs them.
+    if ids:
+        stage("price_rows", lambda: ingest_prices(s, ids, years=1))
+    stage("macro_rows", lambda: ingest_macro(s, years=1))
+
+    # 4. The learning loop. Every gated capability unlocks from realised
+    #    forecasts, and a forecast only exists once a dossier is registered.
+    #    Registered BEFORE scoring so a claim made today starts its horizon now.
+    forecasts = stage("forecasts", lambda: register_daily_forecasts(s))
+    if isinstance(forecasts, dict) and "registered" in forecasts:
+        out["forecasts"] = {"registered": len(forecasts["registered"])}
+    stage("claims_scored", lambda: L.score_due_claims(s)["scored"])
+    stage("checkpoints_scored", lambda: L.score_interim_checkpoints(s)["checkpointed"])
+
+    # 5. Fully recomputable, and the most expensive. Last on purpose: if the
+    #    budget runs out here, tomorrow's run rebuilds it with nothing lost.
+    snap = stage("snapshot", lambda: build_universe_snapshot(s))
+    if isinstance(snap, dict) and "companies" in snap:
+        out["snapshot"] = {"companies": len(snap["companies"])}
+    stage("base_rate_records", lambda: run_all_studies(s)["records"])
+    stage("pruned", lambda: prune(s))
+    if get_config(s)["enabled"]:
+        auto = stage("autopilot", lambda: run_autopilot(s))
+        if isinstance(auto, dict):
+            out["autopilot"] = {"entries": len(auto["entries"]),
+                                "exits": len(auto["exits"])}
+
+    out["elapsed_s"] = round(_time.monotonic() - t0, 1)
+    out["budget_s"] = CRON_BUDGET_S
+    return out
 
 
 @app.get("/api/companies/{company_id}/memory")

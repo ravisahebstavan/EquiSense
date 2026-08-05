@@ -621,3 +621,50 @@ def test_ai_reports_a_missing_key_as_configuration_not_a_crash(monkeypatch):
     assert "ANTHROPIC_API_KEY" in out["reason"]
     assert "TypeError" not in out["reason"], "no raw exception reprs in the UI"
     assert out["context"] == {"x": 1}, "grounding context still returned"
+
+
+def test_cron_does_irreplaceable_work_before_recomputable_work():
+    """Measured on the real deployment: the cron ran 300s and was killed with a
+    504 every day, committing nothing past the point of death. Because the
+    recomputable work (prices, macro, base rates, snapshot) ran FIRST, the only
+    stages that never happened were the ones that can never be recovered — the
+    daily NSE archive and option surface publish one file per day and cannot be
+    backfilled, and forecasts are what the entire learning loop unlocks from.
+    Production proved it: 2 stored IV observations and zero scored claims.
+    """
+    import inspect
+
+    from equisense.api.app import cron_refresh
+
+    src = inspect.getsource(cron_refresh)
+    order = {}
+    for stage in ("vol_surface", "nse_archives", "forecasts",
+                  "base_rate_records", "snapshot"):
+        idx = src.find(f'stage("{stage}"')
+        assert idx != -1, f"stage {stage!r} is no longer run by the cron"
+        order[stage] = idx
+
+    for irreplaceable in ("vol_surface", "nse_archives"):
+        for recomputable in ("base_rate_records", "snapshot"):
+            assert order[irreplaceable] < order[recomputable], (
+                f"{irreplaceable} (cannot be backfilled) must run before "
+                f"{recomputable} (recomputable any time)")
+    assert order["forecasts"] < order["base_rate_records"], (
+        "registering forecasts is the learning loop; it cannot sit behind the "
+        "most expensive recomputable stage")
+
+
+def test_cron_refuses_to_start_work_it_cannot_finish():
+    """A stage that starts near the platform's function limit gets killed
+    mid-flight, so the cron must stop STARTING work well before it."""
+    import inspect
+
+    from equisense.api import app as app_mod
+
+    assert app_mod.CRON_BUDGET_S < 300, (
+        "budget must leave headroom under vercel.json maxDuration=300")
+    src = inspect.getsource(app_mod.cron_refresh)
+    assert "CRON_BUDGET_S" in src, "the budget must actually be enforced"
+    assert "time budget exhausted" in src, "skipping must be reported, not silent"
+    assert "s.commit()" in src, (
+        "each stage must commit, or a later stall undoes everything before it")
