@@ -4,6 +4,7 @@ Run:  uvicorn equisense.api.app:app --reload
 """
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date
@@ -26,6 +27,8 @@ from ..seed import seed
 from . import services
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
+
+_log = logging.getLogger("equisense.api")
 
 # Serverless platforms set these. Used only to decide whether a SQLite fallback
 # is a development convenience or a production misconfiguration.
@@ -861,17 +864,30 @@ def cron_refresh(s: Session = Depends(db)):
 
         Skipping on budget is reported, not silent: a cron that quietly does
         half its work is how this failure survived for weeks.
+
+        Timings are LOGGED, not just returned, because the response never
+        arrives when the platform kills the function — the logs are the only
+        record of which stage was holding the budget.
         """
-        if _time.monotonic() - t0 > CRON_BUDGET_S:
-            out[name] = {"skipped": "time budget exhausted"}
+        elapsed = _time.monotonic() - t0
+        if elapsed > CRON_BUDGET_S:
+            _log.warning("cron: SKIP %s (%.1fs elapsed, budget %.0fs)",
+                         name, elapsed, CRON_BUDGET_S)
+            out[name] = {"skipped": f"time budget exhausted at {elapsed:.0f}s"}
             return None
+        _log.info("cron: start %s (%.1fs elapsed)", name, elapsed)
+        t_stage = _time.monotonic()
         try:
             result = fn()
             s.commit()          # durable per stage, so a later stall cannot undo it
+            _log.info("cron: done %s in %.1fs", name, _time.monotonic() - t_stage)
             out[name] = result
+            out.setdefault("timings_s", {})[name] = round(_time.monotonic() - t_stage, 1)
             return result
         except Exception as exc:               # noqa: BLE001 - never block the cron
             s.rollback()
+            _log.warning("cron: FAIL %s after %.1fs: %s",
+                         name, _time.monotonic() - t_stage, exc)
             out[name] = {"error": f"{type(exc).__name__}: {exc}"[:160]}
             return None
 
