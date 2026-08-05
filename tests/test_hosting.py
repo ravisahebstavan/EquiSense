@@ -719,3 +719,61 @@ def test_snapshot_does_not_load_the_whole_price_table():
 
     # and the history itself is untouched, because the backtests need the dead
     assert s.query(PriceObservation).filter_by(company_id=dead.id).count() == 80
+
+
+def test_forecasts_are_registered_even_when_everything_abstains(monkeypatch):
+    """The learning loop was structurally dead in production: 50 names scanned,
+    0 long candidates, 0 forecasts registered, 0 scored claims — so every
+    calibrated capability stayed provisional forever.
+
+    register_daily_forecasts iterated `candidates`, which is deliberately
+    long-only AND gate-filtered. On a universe where abstention is the modal
+    correct output that list is routinely empty, so nothing was ever recorded —
+    even though the ledger has full abstention-counterfactual machinery and the
+    function's own docstring promises abstentions are registered too.
+    """
+    from equisense.api import autopilot
+
+    reviewed = [
+        {"id": 1, "ticker": "AAA", "verdict": "abstain", "net_score": -0.4,
+         "conviction_band": "low", "data_suspect": False},
+        {"id": 2, "ticker": "BBB", "verdict": "avoid_short_candidate",
+         "net_score": -0.9, "conviction_band": "medium", "data_suspect": False},
+        {"id": 3, "ticker": "CCC", "verdict": "abstain", "net_score": 0.1,
+         "conviction_band": "low", "data_suspect": True},   # must be skipped
+    ]
+    # imported INSIDE the function, so it must be patched at its source module
+    import equisense.api.candidates as cand_mod
+    monkeypatch.setattr(cand_mod, "qualified_candidates",
+                        lambda *a, **k: {"candidates": [], "reviewed": reviewed})
+
+    built = []
+
+    class _Co:
+        def __init__(self, tid):
+            self.id = tid
+
+    monkeypatch.setattr(autopilot, "Company", _Co, raising=False)
+
+    def fake_build(session, company):
+        built.append(company.id)
+        return {"synthesis": {"verdict": "abstain"},
+                "ledger": {"hash": f"h{company.id}" * 8}}
+
+    import equisense.api.live as live_mod
+    import equisense.ledger as L
+    monkeypatch.setattr(live_mod, "build_dossier", fake_build)
+    monkeypatch.setattr(L, "read_all", lambda: [])
+
+    class _S:
+        def get(self, _model, tid):
+            return _Co(tid)
+
+    out = autopilot.register_daily_forecasts(_S(), top_n=6)
+
+    tickers = [r["ticker"] for r in out["registered"]]
+    assert "AAA" in tickers and "BBB" in tickers, (
+        "abstain and avoid verdicts must still be registered — that is the "
+        f"whole calibration record; got {out}")
+    assert "CCC" not in tickers, "a data-suspect name must not become a claim"
+    assert any("CCC" in s for s in out["skipped"])

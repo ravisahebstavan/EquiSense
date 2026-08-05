@@ -233,6 +233,15 @@ def qualified_candidates(session: Session, top_n: int = 8,
     session.rollback()
 
     scanned, candidates, verdicts = 0, [], {"long": 0, "avoid": 0, "abstain": 0}
+    # Every name synthesised, whatever the verdict. `candidates` below is
+    # deliberately long-only and gate-filtered — it answers "what could I buy
+    # today". The forecast record must NOT be limited to that: abstentions carry
+    # counterfactual claims (ledger.register_dossier), and on a universe where
+    # abstention is the modal correct output a long-only feed registers nothing
+    # at all, so the calibration ledger never accumulates and every weight stays
+    # provisional forever. That is exactly what production did: 50 scanned, 0
+    # long, 0 forecasts, 0 scored claims.
+    reviewed: list[dict] = []
     for item in universe["companies"]:
         scanned += 1
         E = evidence_from_snapshot(item, sigs, rk, br_cache, fc)
@@ -245,6 +254,10 @@ def qualified_candidates(session: Session, top_n: int = 8,
             verdicts["avoid"] += 1
         else:
             verdicts["abstain"] += 1
+        reviewed.append({"id": item["id"], "ticker": item["ticker"],
+                         "verdict": v, "net_score": round(synth.net_score, 3),
+                         "conviction_band": synth.conviction_band,
+                         "data_suspect": bool(item.get("data_suspect"))})
         if v != "long_candidate":
             continue
 
@@ -338,6 +351,8 @@ def qualified_candidates(session: Session, top_n: int = 8,
             "note": gov.get("note"),
         },
         "candidates": candidates[:top_n],
+        # Ranked by conviction irrespective of verdict, for the forecast record.
+        "reviewed": sorted(reviewed, key=lambda r: -abs(r["net_score"])),
         "discipline_note": (
             f"{scanned} companies scanned; {verdicts['abstain']} abstained — "
             "abstention is the modal, correct output. Candidates shown cleared "

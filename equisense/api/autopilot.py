@@ -115,10 +115,24 @@ def register_daily_forecasts(session: Session, top_n: int = 6) -> dict:
         if r.get("kind") == "dossier" and str(r.get("created_at", ""))[:10] == today
     }
     picks = qualified_candidates(session, top_n=top_n)
+    # The forecast feed is every reviewed name ranked by conviction, NOT the
+    # tradable-candidate list. That list is long-only and gate-filtered, so on a
+    # universe where abstention is the modal correct output it is routinely
+    # empty — and iterating it registered nothing, permanently. Production sat
+    # at 0 scored claims for exactly this reason while the ledger's abstention
+    # machinery went unused. Falls back to `candidates` if an older snapshot has
+    # no `reviewed` key.
+    feed = picks.get("reviewed") or picks.get("candidates", [])
     registered, skipped = [], []
-    for c in picks.get("candidates", [])[:top_n]:
+    for c in feed[:top_n]:
         if c["ticker"] in already:
             skipped.append(c["ticker"])
+            continue
+        # A name whose price series is suspect must not become a scored claim:
+        # the outcome would be measured against a number that may not describe a
+        # price change at all.
+        if c.get("data_suspect"):
+            skipped.append(f"{c['ticker']}:data_suspect")
             continue
         company = session.get(Company, c["id"])
         if company is None:
