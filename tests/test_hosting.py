@@ -668,3 +668,54 @@ def test_cron_refuses_to_start_work_it_cannot_finish():
     assert "time budget exhausted" in src, "skipping must be reported, not silent"
     assert "s.commit()" in src, (
         "each stage must commit, or a later stall undoes everything before it")
+
+
+def test_snapshot_does_not_load_the_whole_price_table():
+    """The cron died at Vercel's 300s limit every day and stage timings put the
+    whole cost here: everything else finished in 14.2s, then the snapshot ate
+    the remaining ~285s.
+
+    The snapshot only ever indexes these by a CURRENT index member, but the
+    bulk loaders selected entire tables — on the real deployment that pulled
+    all 1,005,395 price rows over a network Postgres to use the ~10% belonging
+    to the 50 live constituents. Departed names must keep their history (the
+    survivorship-corrected backtests read it through load_price_panel, which is
+    separate and deliberately unfiltered), so the fix is to scope the read, not
+    to delete the rows.
+    """
+    from datetime import date, timedelta
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import equisense.models  # noqa: F401 - registers tables
+    from equisense.api.snapshot import _bulk_prices
+    from equisense.db import Base
+    from equisense.models import Company, PriceObservation
+
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    s = sessionmaker(bind=eng, expire_on_commit=False)()
+
+    live = Company(ticker="LIVE", name="Live", sector="IT", is_index_member=True)
+    dead = Company(ticker="DEAD", name="Dead", sector="IT", is_index_member=False)
+    s.add_all([live, dead])
+    s.flush()
+    start = date(2026, 1, 1)
+    for i in range(80):
+        d = start + timedelta(days=i)
+        s.add(PriceObservation(company_id=live.id, obs_date=d, close=100.0, volume=1))
+        s.add(PriceObservation(company_id=dead.id, obs_date=d, close=50.0, volume=1))
+    s.commit()
+
+    loaded = _bulk_prices(s)
+    assert live.id in loaded, "the live universe must still be loaded in full"
+    assert len(loaded[live.id][0]) == 80
+    assert dead.id not in loaded, (
+        "a departed constituent's price history must not be pulled into the "
+        "snapshot — that read is what blew the cron's function budget")
+
+    # and the history itself is untouched, because the backtests need the dead
+    assert s.query(PriceObservation).filter_by(company_id=dead.id).count() == 80

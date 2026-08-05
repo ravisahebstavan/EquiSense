@@ -31,6 +31,22 @@ SNAP_VERSION = 5  # bump when the item schema changes → forces a rebuild
 STALE_SESSIONS = 3
 
 
+# Every bulk loader below is scoped to the LIVE universe by these subqueries.
+# The snapshot only ever indexes them by an index member's id/ticker, but they
+# used to SELECT the whole table: on the real deployment that meant pulling all
+# 1,005,395 price rows across a network Postgres to use the ~10% belonging to
+# the 50 current constituents. It took the cron past its 300s function limit
+# every single day. Departed names still keep their history — survivorship-
+# corrected backtests read it through load_price_panel, which is separate and
+# deliberately unfiltered.
+def _live_ids():
+    return select(Company.id).where(Company.is_index_member.is_(True))
+
+
+def _live_tickers():
+    return select(Company.ticker).where(Company.is_index_member.is_(True))
+
+
 def _bulk_delivery(session: Session) -> dict:
     """{ticker: {latest, mean}} delivery percentage from the NSE MTO archive.
 
@@ -43,6 +59,7 @@ def _bulk_delivery(session: Session) -> dict:
     rows = session.execute(
         select(DeliveryStat.symbol, DeliveryStat.trade_date,
                DeliveryStat.delivery_pct)
+        .where(DeliveryStat.symbol.in_(_live_tickers()))
         .order_by(DeliveryStat.symbol, DeliveryStat.trade_date)).all()
     acc: dict = {}
     for sym, _d, pct in rows:
@@ -64,6 +81,7 @@ def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
                PriceObservation.close, PriceObservation.volume,
                PriceObservation.close_raw, PriceObservation.open_price,
                PriceObservation.high_price, PriceObservation.low_price)
+        .where(PriceObservation.company_id.in_(_live_ids()))
         .order_by(PriceObservation.company_id, PriceObservation.obs_date)).all()
     out: dict[int, tuple] = {}
     for cid, d, c, v, raw, op, hi, lo in rows:
@@ -84,7 +102,8 @@ def _bulk_statements(session: Session) -> dict[int, list[StatementData]]:
     restatement versions only."""
     rows = session.scalars(
         select(FilingPeriod)
-        .where(FilingPeriod.scope == "consolidated", FilingPeriod.is_latest.is_(True))
+        .where(FilingPeriod.scope == "consolidated", FilingPeriod.is_latest.is_(True),
+               FilingPeriod.company_id.in_(_live_ids()))
         .order_by(FilingPeriod.company_id, FilingPeriod.fiscal_year)).all()
     fields = [f for f in StatementData.__dataclass_fields__
               if f not in ("period", "fiscal_year", "scope")]
