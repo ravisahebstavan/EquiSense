@@ -1,4 +1,4 @@
-"""Grounding validation (PROJECT_DRAFT §13.4, §29.2).
+"""Grounding validation (§13.2, §13.2).
 
 The load-bearing guarantee behind the AI layer: the LLM never originates a
 number. This module checks it programmatically — every numeric token in an

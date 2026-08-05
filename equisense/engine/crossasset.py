@@ -10,7 +10,7 @@ that are almost never measured. Two things go wrong with the folk versions:
    correlation in a DRAWDOWN, because that is when diversification is supposed
    to pay. Equity correlations converge toward 1 exactly then, so an
    unconditional matrix systematically overstates how diversified a book is.
-   PROJECT_DRAFT §11.4 promised conditional correlation from the start; only the
+   §6.5 promised conditional correlation from the start; only the
    unconditional version was ever built.
 
 2. **They are never tested for significance.** With ~10 assets there are 45

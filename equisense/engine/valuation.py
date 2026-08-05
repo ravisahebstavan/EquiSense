@@ -1,9 +1,9 @@
-"""Valuation engine: WACC estimation and reverse DCF (PROJECT_DRAFT §10.3, §10.5).
+"""Valuation engine: WACC estimation and reverse DCF (§6.2, §6.2).
 
 The reverse DCF deliberately does NOT produce a fair value (Commitment 2.4).
 It solves backward from the current market price: what near-term growth rate
 would have to be true to justify today's price, under stated assumptions?
-Every assumption is exposed and user-adjustable (§19.2).
+Every assumption is exposed and user-adjustable (§6.2).
 """
 from __future__ import annotations
 
@@ -197,7 +197,7 @@ def compute_wacc(s: StatementData, price: float, a: WaccAssumptions) -> Metric:
                                          and s.total_debt not in (None, 0)) else None)},
         period=s.period, family="valuation",
         caveat=("WACC is assumption-sensitive. Every input here is an estimate you "
-                "can and should adjust (§10.3)."
+                "can and should adjust (§6.2)."
                 + (f" {kd_note}" if kd_note else "")))
 
 

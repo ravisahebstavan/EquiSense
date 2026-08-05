@@ -1,9 +1,9 @@
-"""EquiSense proprietary analytics (RESEARCH_BLUEPRINT §3 opportunity map).
+"""EquiSense proprietary analytics (§6.7 opportunity map).
 
 Novel, named composite diagnostics. "Proprietary" here means *original
 construction*, not secret: every score's formula is fully documented, every
 component exposed, and each is a registered hypothesis subject to the
-base-rate module — the anti-Trendlyne commitment (§10.7 of v1 stands).
+base-rate module — the anti-Trendlyne commitment (§6.7 of v1 stands).
 
 All pure functions. Statements oldest → newest.
 """

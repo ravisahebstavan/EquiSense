@@ -1,4 +1,4 @@
-"""EquiSense API + web app (PROJECT_DRAFT §16.2 application layer).
+"""EquiSense API + web app (§14 application layer).
 
 Run:  uvicorn equisense.api.app:app --reload
 """
@@ -108,7 +108,7 @@ background:#3987e5;color:#fff;cursor:pointer}</style></head><body>
 
 @app.middleware("http")
 async def auth_gate(request: Request, call_next):
-    """Single-user token gate (PROJECT_DRAFT §28.2: authenticated access even
+    """Single-user token gate (§3.3: authenticated access even
     for a personal app). Enabled only when EQUISENSE_ACCESS_TOKEN is set —
     local development stays frictionless."""
     token = os.environ.get("EQUISENSE_ACCESS_TOKEN")
@@ -192,7 +192,7 @@ class ProfileUpdate(BaseModel):
 
 
 class ValuationAssumptions(BaseModel):
-    """Editable assumptions for the reverse DCF (§19.2)."""
+    """Editable assumptions for the reverse DCF (§14)."""
     risk_free_rate: float = Field(0.070, ge=0, le=0.25)
     equity_risk_premium: float = Field(0.065, ge=0, le=0.20)
     beta: float = Field(1.0, ge=0.1, le=3.0)
@@ -223,8 +223,8 @@ class TransactionIn(BaseModel):
 class ThesisIn(BaseModel):
     company_id: int
     statement: str = Field(min_length=10)
-    assumptions: list[str] = Field(min_length=1)          # falsifiable, §23.1
-    invalidation_triggers: list[str] = Field(min_length=1)  # required, §23.1
+    assumptions: list[str] = Field(min_length=1)          # falsifiable, §14
+    invalidation_triggers: list[str] = Field(min_length=1)  # required, §14
     sizing_rationale: str = ""
     review_date: Optional[date] = None
     elaboration: str = ""
@@ -243,7 +243,7 @@ class JournalIn(BaseModel):
 
 class WatchlistIn(BaseModel):
     company_id: int
-    rationale: str = Field(min_length=10)  # required rationale at add-time (§21)
+    rationale: str = Field(min_length=10)  # required rationale at add-time (§14)
 
 
 class ThesisDraftRequest(BaseModel):
@@ -275,7 +275,7 @@ def company_detail(company_id: int, s: Session = Depends(db)):
 @app.post("/api/companies/{company_id}/valuation")
 def company_valuation(company_id: int, assumptions: ValuationAssumptions,
                       s: Session = Depends(db)):
-    """Recompute the reverse DCF under user-edited assumptions (§19.2)."""
+    """Recompute the reverse DCF under user-edited assumptions (§14)."""
     c = _get_company(s, company_id)
     stmts = services.latest_statements(s, company_id)
     price = services.latest_price(s, company_id)
@@ -575,8 +575,8 @@ def remove_watchlist(item_id: int, s: Session = Depends(db)):
 
 @app.post("/api/ai/narrate/company/{company_id}")
 def ai_narrate_company(company_id: int, s: Session = Depends(db)):
-    """Statement narrative (§13.3). The full grounded context is returned so
-    the UI can show exactly what the model was given (§19.1 layer 3)."""
+    """Statement narrative (§14). The full grounded context is returned so
+    the UI can show exactly what the model was given (§14 layer 3)."""
     c = _get_company(s, company_id)
     analysis = services.company_analysis(s, c, services.active_profile(s))
     context = {
@@ -779,7 +779,7 @@ def live_calibration():
 
 @app.post("/api/live/reg001")
 def live_reg001(s: Session = Depends(db)):
-    """Run REG-001: the regime engine justifying its own existence (PHASE2 §6.1)."""
+    """Run REG-001: the regime engine justifying its own existence (§11)."""
     from ..research.reg001 import run_reg001
     return run_reg001(s)
 

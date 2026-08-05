@@ -1,4 +1,4 @@
-"""Base-rate studies (RESEARCH_BLUEPRINT §10.1 tier 1–2).
+"""Base-rate studies (§9.1 tier 1–2).
 
 Cross-sectional event studies computed from the platform's OWN stored price
 history — every T2 number in a dossier traces back to a study run here,
@@ -492,7 +492,7 @@ def get_base_rate(session: Session, study_key_prefix: str, horizon_days: int,
     too thin to say" is itself a finding.
 
     Regime fallback: a thin conditional cell shrinks to the unconditional one
-    (§12.2), and the returned record says which regime it actually came from.
+    (§9.1), and the returned record says which regime it actually came from.
     """
     row = session.scalars(
         select(BaseRateRecord)
@@ -500,7 +500,7 @@ def get_base_rate(session: Session, study_key_prefix: str, horizon_days: int,
                BaseRateRecord.regime_filter == regime)).first()
     if row is not None and admissible_only and not row.admissible:
         row = None
-    if row is None and regime != "all":  # shrink to unconditional when cell thin (§12.2)
+    if row is None and regime != "all":  # shrink to unconditional when cell thin (§9.1)
         return get_base_rate(session, study_key_prefix, horizon_days, "all",
                              admissible_only=admissible_only)
     if row is None:

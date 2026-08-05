@@ -1,4 +1,4 @@
-"""The self-refinement loop (PHASE2 §5.4, §7 — now implemented).
+"""The self-refinement loop (§7.4, §7 — now implemented).
 
 Two learned artifacts, both from the platform's own scored history, both
 gated by pre-registered sample thresholds so nothing ever runs on noise:

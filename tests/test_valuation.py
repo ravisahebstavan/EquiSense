@@ -1,5 +1,5 @@
 """Valuation engine: WACC vs. hand-computed value; reverse-DCF solver
-round-trips a known growth rate (§29.1)."""
+round-trips a known growth rate (§15)."""
 import pytest
 
 from equisense.engine import valuation
@@ -14,7 +14,7 @@ def test_wacc_hand_computed(fy2025):
     # wacc = 0.9375*0.135 + 0.0625*0.10*(1-0.2517) = 0.1265625 + 0.00467688
     m = valuation.compute_wacc(fy2025, PRICE, WaccAssumptions())
     assert m.value == pytest.approx((0.9375 * 0.135 + 0.0625 * 0.10 * (1 - 0.2517)) * 100)
-    # assumptions must be exposed as inputs (§10.3 transparency requirement)
+    # assumptions must be exposed as inputs (§15 transparency requirement)
     for k in ("risk_free_rate", "equity_risk_premium", "beta", "tax_rate"):
         assert k in m.inputs
 

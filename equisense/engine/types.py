@@ -1,7 +1,7 @@
 """Core value types for the computation engine.
 
 Every number EquiSense shows a user is a Metric: the value plus the formula
-and raw inputs that produced it (PROJECT_DRAFT §10.2, §18.4, §19). Engines
+and raw inputs that produced it (§6.1, §1, §1). Engines
 never return bare floats to the API layer.
 """
 from __future__ import annotations

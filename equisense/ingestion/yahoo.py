@@ -1,6 +1,6 @@
 """Yahoo Finance ingestion adapter (free, keyless).
 
-Isolated per RESEARCH_BLUEPRINT §6.3 — source death is a *when*, not an *if*;
+Isolated per §5.2 — source death is a *when*, not an *if*;
 nothing outside this module knows Yahoo exists. All fundamentals ingested here
 are flagged pit_grade="reconstructed" (§6.1): Yahoo serves latest-known, not
 point-in-time, figures. Prices don't restate, so price history is PIT-safe.
@@ -410,7 +410,7 @@ def ingest_fundamentals(session: Session, ids: dict[str, int],
                 vals.update(cfvals)
             if vals.get("revenue") is None and vals.get("net_income") is None:
                 continue
-            # supersede any demo rows for the same fiscal year (§14.4 spirit)
+            # supersede any demo rows for the same fiscal year (§5.2 spirit)
             for old in session.scalars(select(FilingPeriod).where(
                     FilingPeriod.company_id == comp.id,
                     FilingPeriod.fiscal_year == fy,

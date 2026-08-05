@@ -29,7 +29,7 @@ def statement_data(fp: FilingPeriod) -> StatementData:
 
 def latest_statements(session: Session, company_id: int,
                       scope: str = "consolidated") -> list[StatementData]:
-    """Latest restatement version per fiscal year, oldest→newest (§14.4)."""
+    """Latest restatement version per fiscal year, oldest→newest (§14)."""
     rows = session.scalars(
         select(FilingPeriod)
         .where(FilingPeriod.company_id == company_id,
@@ -385,7 +385,7 @@ def portfolio_view(session: Session, profile: pers.InvestorProfile) -> dict:
 
     xirr_metric = pf.portfolio_xirr(txns, values, today, divs)
 
-    # Profile-limit checks (diagnostic facts only — no trade suggestions, §11.5)
+    # Profile-limit checks (diagnostic facts only — no trade suggestions, §14)
     breaches = []
     for cid, w in conc["by_position"].items():
         if w > profile.max_position_pct:

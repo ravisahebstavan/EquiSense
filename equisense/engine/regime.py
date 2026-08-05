@@ -1,8 +1,8 @@
-"""Macro regime engine (RESEARCH_BLUEPRINT §7.2).
+"""Macro regime engine (§11).
 
 Regimes are *conditioning descriptions*, never timing signals. Deliberately
 coarse (2×2 core states + context flags): ~25 years of Indian data contain
-single-digit regime episodes, so anything finer is regime-mining (§10.4).
+single-digit regime episodes, so anything finer is regime-mining (§11).
 
 Inputs: aligned macro series (oldest → newest closes).
 """

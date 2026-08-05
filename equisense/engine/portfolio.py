@@ -1,9 +1,9 @@
-"""Portfolio intelligence engine (PROJECT_DRAFT §11).
+"""Portfolio intelligence engine (§6.4).
 
 Portfolio state is always derived from the transaction ledger — never stored
-as a mutable "current holding" (§11.1). XIRR is the primary money-weighted
-return measure (§11.2). Concentration is computed on four axes, including the
-distinctive quality-score-band axis (§11.3).
+as a mutable "current holding" (§6.4). XIRR is the primary money-weighted
+return measure (§6.4). Concentration is computed on four axes, including the
+distinctive quality-score-band axis (§6.4).
 """
 from __future__ import annotations
 
@@ -243,7 +243,7 @@ def concentration(positions: dict[int, Position],
                   sectors: dict[int, str],
                   cap_bands: dict[int, str],
                   quality_tiers: dict[int, Optional[str]]) -> dict:
-    """Four-axis concentration diagnostics (§11.3): position, sector,
+    """Four-axis concentration diagnostics (§6.4): position, sector,
     market-cap band, and quality-score band."""
     values = {cid: p.quantity * current_prices.get(cid, 0.0)
               for cid, p in positions.items() if p.quantity > 1e-9}
@@ -276,7 +276,7 @@ LTCG_THRESHOLD_DAYS = 365  # listed equity: long-term after 12 months
 
 
 def lot_aging(position: Position, as_of: date) -> list[dict]:
-    """Days until each open lot becomes long-term (§11.6, India-specific)."""
+    """Days until each open lot becomes long-term (§6.4, India-specific)."""
     out = []
     for lot in position.lots:
         held = (as_of - lot["date"]).days

@@ -5,7 +5,7 @@ links fills to the dossiers that motivated them, records every fill in the
 hash-chained decision ledger, and — the part that matters — continuously
 measures ALPHA: the account's return versus putting the identical cashflows
 into NIFTY. No self-flattery: if the system isn't beating the index, this
-page says so, which is exactly how it gets better (RESEARCH_BLUEPRINT §18).
+page says so, which is exactly how it gets better (§8.2).
 """
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ from equisense.engine.types import StatementData
 @pytest.fixture
 def fy2025() -> StatementData:
     """Synthetic reference company. Every expected value in the test suite was
-    hand-computed from these inputs (PROJECT_DRAFT §29.1 hard gate)."""
+    hand-computed from these inputs (§15 hard gate)."""
     return StatementData(
         period="FY2025", fiscal_year=2025,
         revenue=1000.0, gross_profit=400.0, ebitda=250.0, depreciation=50.0,

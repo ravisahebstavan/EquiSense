@@ -1,4 +1,4 @@
-"""AI-output grounding validation (§29.2): the automated test that the AI
+"""AI-output grounding validation (§15): the automated test that the AI
 layer can never state a number it wasn't given."""
 from equisense.ai.grounding import collect_context_numbers, validate
 

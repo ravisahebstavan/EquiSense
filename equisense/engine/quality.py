@@ -1,8 +1,8 @@
-"""Cash-flow quality, distress and quality scoring (PROJECT_DRAFT §10.4, §10.7).
+"""Cash-flow quality, distress and quality scoring (§6.3, §6.3).
 
 All methodologies here are published and externally verifiable by design —
 Altman (1968) Z-score and Piotroski (2000) F-Score — per the explainability
-commitment. Proprietary black-box scores were explicitly rejected (§10.7).
+commitment. Proprietary black-box scores were explicitly rejected (§6.3).
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ Z_CAVEAT = (
 
 
 def cash_flow_quality(s: StatementData) -> list[Metric]:
-    """Accruals ratio, CFO/NI, capex intensity (§10.4)."""
+    """Accruals ratio, CFO/NI, capex intensity (§6.3)."""
     out = []
     accruals = None
     if s.net_income is not None and s.cfo is not None and s.total_assets not in (None, 0):

@@ -1,4 +1,4 @@
-"""Core ratio engine (PROJECT_DRAFT §10.2).
+"""Core ratio engine (§6.1).
 
 Five families: liquidity, leverage, profitability, efficiency, per-share /
 valuation-adjacent. Ratio definitions live here and only here — no other
@@ -227,7 +227,7 @@ def roic(s: StatementData, tax_rate: Optional[float] = None,
     """ROIC = NOPAT / average invested capital.
 
     NOPAT = EBIT × (1 − effective tax rate); invested capital = total debt +
-    total equity − cash (§10.3). The tax rate is sanity-bounded (see
+    total equity − cash (§6.1). The tax rate is sanity-bounded (see
     `effective_tax_rate`) and the denominator averages opening and closing
     invested capital when the prior period is available, which is standard
     practice: NOPAT is a flow earned across the year, so charging it against the

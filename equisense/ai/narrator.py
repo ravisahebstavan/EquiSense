@@ -1,9 +1,9 @@
-"""AI orchestration layer (PROJECT_DRAFT §13, §16.2).
+"""AI orchestration layer (§13.1, §13.1).
 
 This layer contains no financial logic. It constructs grounded context from
 the deterministic engines' outputs, calls the LLM, and validates that the
-response introduces no ungrounded numbers (§13.4). Every response returns the
-exact context that was supplied, so the UI can show it (§19.1 layer 3).
+response introduces no ungrounded numbers (§13.1). Every response returns the
+exact context that was supplied, so the UI can show it (§13.1 layer 3).
 
 Degrades gracefully: with no Anthropic credentials configured, endpoints
 return the structured facts with `available: false` instead of failing.
@@ -96,7 +96,7 @@ def _call(system: str, user_content: str, output_schema: Optional[dict] = None) 
 def _grounded_call(system: str, context: Any, instruction: str,
                    output_schema: Optional[dict] = None) -> dict:
     """One call + grounding validation; one corrective retry on violation
-    (§29.2 — automated, not a manual spot check)."""
+    (§13.1 — automated, not a manual spot check)."""
     # A deployment with no key is a CONFIGURATION state, not a runtime failure.
     # Without this the user was shown the SDK's raw exception repr ("TypeError:
     # Could not resolve authentication method...") in the UI, which reads as a
@@ -124,7 +124,7 @@ def _grounded_call(system: str, context: Any, instruction: str,
 
 
 def narrate_statements(context: dict) -> dict:
-    """Financial statement narrative interpretation (§13.3 row 1)."""
+    """Financial statement narrative interpretation (§13.1 row 1)."""
     return _grounded_call(
         _NARRATOR_SYSTEM, context,
         "Explain this company's financial trajectory and what the computed "
@@ -135,7 +135,7 @@ def narrate_statements(context: dict) -> dict:
 
 
 def narrate_portfolio(context: dict) -> dict:
-    """Portfolio diagnostic narrative (§13.3 row 5) — no trade recommendations."""
+    """Portfolio diagnostic narrative (§13.1 row 5) — no trade recommendations."""
     return _grounded_call(
         _NARRATOR_SYSTEM, context,
         "Review this portfolio's composition like an analyst reviewing a "
@@ -146,7 +146,7 @@ def narrate_portfolio(context: dict) -> dict:
 
 
 def draft_thesis(context: dict, user_angle: str) -> dict:
-    """Thesis generation assistant (§13.3 row 2). Returns structured JSON the
+    """Thesis generation assistant (§13.1 row 2). Returns structured JSON the
     user edits — the thesis remains the user's reasoning."""
     result = _grounded_call(
         _THESIS_SYSTEM, context,

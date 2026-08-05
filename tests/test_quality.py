@@ -1,4 +1,4 @@
-"""Quality/distress scoring vs. hand-computed values (§29.1)."""
+"""Quality/distress scoring vs. hand-computed values (§15)."""
 import pytest
 
 from equisense.engine import quality
@@ -21,7 +21,7 @@ def test_altman_z(fy2025):
     m = quality.altman_z(fy2025, price=PRICE)
     assert m.value == pytest.approx(5.7, abs=1e-6)
     assert quality.altman_zone(m.value) == "safe"
-    assert m.caveat and "calibrated" in m.caveat  # §10.7 calibration caveat is mandatory
+    assert m.caveat and "calibrated" in m.caveat  # §15 calibration caveat is mandatory
 
 
 def test_altman_zones():

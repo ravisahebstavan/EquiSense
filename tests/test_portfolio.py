@@ -1,5 +1,5 @@
 """Portfolio engine: FIFO ledger, XIRR vs. closed-form values, concentration
-axes summing to 100% (§29.1)."""
+axes summing to 100% (§15)."""
 from datetime import date
 
 import pytest

@@ -1,4 +1,4 @@
-"""Backtesting upgrades (PHASE2 §8 delivered).
+"""Backtesting upgrades (§12 delivered).
 
 1. moving_block_bootstrap_ci — honest confidence intervals for overlapping
    episode samples (block length ≥ overlap span), used by base-rate studies.

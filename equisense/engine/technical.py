@@ -1,4 +1,4 @@
-"""Technical engine (RESEARCH_BLUEPRINT §7.2).
+"""Technical engine (§11).
 
 Small, defensible roster only: cross-sectional momentum (12-1), 52-week-high
 proximity, 200DMA trend regime, volatility structure, relative strength vs.

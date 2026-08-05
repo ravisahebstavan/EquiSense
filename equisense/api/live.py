@@ -1,4 +1,4 @@
-"""Live dossier assembly (PHASE2 §5, §9, §11).
+"""Live dossier assembly (§7.2, §9, §11).
 
 Phase II discipline applied:
 - Evidence strengths are cross-sectional percentiles (§5.1) — no hand scales.
@@ -610,7 +610,7 @@ def build_dossier(session: Session, company: Company, book_value: float = 1_000_
         "missing_information": missing,
         "claim_horizon_days": 126,
         "epistemics": {
-            "normalization": "strengths = cross-sectional percentiles (PHASE2 §5.1); "
+            "normalization": "strengths = cross-sectional percentiles (§7.2); "
                              "admission caps by hypothesis status (§5.2); "
                              "base-rate depth reads N_eff, not N (§8)",
             "not_advice": "Decision-support dossier, not a recommendation to trade.",

@@ -1,4 +1,4 @@
-"""Hypothesis Registry (RESEARCH_BLUEPRINT §10.5).
+"""Hypothesis Registry (§9.2).
 
 Hypotheses are registered *in code, in the repo, before results exist* — the
 registry is version-controlled pre-registration. No evidence family may cite
@@ -9,7 +9,7 @@ Status lifecycle: registered → computed → (validated | weak | rejected)
 — set by humans reading the study output, never automatically.
 """
 
-# PHASE2 §5.2 — influence is earned through the lifecycle, mechanically.
+# §7.3 — influence is earned through the lifecycle, mechanically.
 # The synthesis plane enforces these caps; engines cannot opt out.
 STATUS_CAPS: dict[str, float] = {
     "registered": 0.25,            # exploratory results only → provisional evidence
@@ -61,7 +61,7 @@ DEFAULT_UNVALIDATED_CAP = 0.25
 
 
 def admission_cap(family: str) -> tuple[float, str]:
-    """(max |strength| into synthesis, reason). PHASE2 §5.2 / autopsy A3."""
+    """(max |strength| into synthesis, reason). §7.3 / autopsy A3."""
     hyp_id = FAMILY_HYPOTHESIS.get(family)
     if hyp_id is None:
         return DEFAULT_UNVALIDATED_CAP, f"unregistered T1 context (cap {DEFAULT_UNVALIDATED_CAP})"

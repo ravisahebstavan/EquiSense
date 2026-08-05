@@ -1,10 +1,10 @@
-"""Append-only, hash-chained decision ledger (RESEARCH_BLUEPRINT §13.4).
+"""Append-only, hash-chained decision ledger (§10.1).
 
 Every dossier is pre-registered here at creation: JSON-lines, each record
 carrying the SHA-256 of the previous record — cheap tamper-evidence. Records
 are never edited; a superseding dossier references its predecessor.
 
-Claim scoring (§12.1): each dossier embeds a falsifiable claim — direction
+Claim scoring (§10.1): each dossier embeds a falsifiable claim — direction
 over a horizon vs. the universe median. Once the horizon expires, score()
 computes the realized outcome from the price store and Brier-scores the
 stated probability. Scores are appended to the same chain.
@@ -27,7 +27,7 @@ GENESIS = "equisense-genesis"
 WRONGFUL_ABSTENTION_PCT = 5.0  # abstained and forward excess beat this → wrongful (§7.1)
 
 # Storage backend: "file" (JSONL, local default) or "db" (hosted deployments,
-# where the filesystem is ephemeral — DEPLOYMENT.md). Same hash chain either way.
+# where the filesystem is ephemeral — README §3.1). Same hash chain either way.
 
 
 def _last_hash() -> str:
@@ -116,7 +116,7 @@ def verify_chain(records: list[dict] | None = None) -> dict:
 def register_dossier(dossier: dict) -> dict:
     """Pre-register a dossier and its falsifiable claim. Non-abstain verdicts
     get a scoreable claim; abstentions are registered too (abstention has a
-    track record — chronic abstention on winners is a measured cost, §15.6)."""
+    track record — chronic abstention on winners is a measured cost, §10.1)."""
     synth = dossier["synthesis"]
     horizon_days = dossier.get("claim_horizon_days", 126)
     score_after = (date.today() + timedelta(days=int(horizon_days * 1.5))).isoformat()
@@ -143,7 +143,7 @@ def register_dossier(dossier: dict) -> dict:
             "entry_price": dossier["company"].get("price"),
         }
     else:
-        # PHASE2 §7.1 (A10 fix): abstentions carry counterfactual claims —
+        # §10.2 (A10 fix): abstentions carry counterfactual claims —
         # "I declined; what would a long have returned?" Chronic wrongful
         # abstention becomes measurable instead of a free pass.
         claim = {
@@ -317,8 +317,8 @@ def _excess_return(session: Session, cid: int, start: date, end: date,
 
 
 def calibration_report() -> dict:
-    """Reliability summary of all scored claims (§12.1), including the
-    wrongful-abstention rate (PHASE2 §7.1). Honest even when thin."""
+    """Reliability summary of all scored claims (§10.1), including the
+    wrongful-abstention rate (§10.2). Honest even when thin."""
     scores = [r for r in read_all() if r["kind"] == "score"]
     directional = [s for s in scores if s.get("claim_type") != "abstention_counterfactual"
                    and s.get("hit") is not None]

@@ -1,4 +1,4 @@
-"""Ratio engine vs. hand-computed reference values (§29.1)."""
+"""Ratio engine vs. hand-computed reference values (§15)."""
 import pytest
 
 from equisense.engine import ratios

@@ -103,7 +103,7 @@ def test_ledger_chain_tamper_evidence(tmp_path, monkeypatch):
 
 
 def test_abstention_registers_counterfactual_claim(tmp_path, monkeypatch):
-    """PHASE2 §7.1 (A10): abstentions are scoreable — direction 0, no stated
+    """§10.2 (A10): abstentions are scoreable — direction 0, no stated
     probability, but a claim exists so wrongful abstention gets measured."""
     from equisense import ledger as L
     monkeypatch.setattr(L, "LEDGER_PATH", tmp_path / "dossiers.jsonl")

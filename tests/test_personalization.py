@@ -1,4 +1,4 @@
-"""The §12.2 acceptance test, encoded: two profiles must produce visibly
+"""The §15 acceptance test, encoded: two profiles must produce visibly
 different card ordering and different priority rankings for the same data."""
 from equisense.engine.personalization import (CARD_KEYS, CompanySignals,
                                               InvestorProfile, attention_score,
@@ -20,7 +20,7 @@ INCOME_PROFILE = InvestorProfile(name="income", style=15, dividend_preference=90
 
 
 def test_same_company_two_profiles_different_card_order():
-    """§12.2 / §18.3: same underlying cards, provably different ordering."""
+    """§15 / §15: same underlying cards, provably different ordering."""
     a = card_order(GROWTH_PROFILE)
     b = card_order(INCOME_PROFILE)
     assert a != b
@@ -46,7 +46,7 @@ def test_sector_exclusion_suppresses_priority():
 
 
 def test_score_breakdown_is_exposed():
-    """Explainability layer 2 (§19.1): weighting logic itself is displayed."""
+    """Explainability layer 2 (§15): weighting logic itself is displayed."""
     r = attention_score(INCOME_PROFILE, INCOME_CO)
     assert set(r["components"]) == set(r["weights"])
     assert r["explanation"]

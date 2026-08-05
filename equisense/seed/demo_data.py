@@ -1,4 +1,4 @@
-"""Demonstration seed data (PROJECT_DRAFT §28.2, §32).
+"""Demonstration seed data (§3.3, §2).
 
 ⚠️ DEMO CONTENT. Revenue and profit series are approximations of public
 figures for well-known Indian listed companies; all other line items are

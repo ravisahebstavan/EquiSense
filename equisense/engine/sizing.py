@@ -1,4 +1,4 @@
-"""Sizing & cost engine (RESEARCH_BLUEPRINT §9).
+"""Sizing & cost engine (§8.1).
 
 Position size is a first-class advised quantity with every term shown.
 Skeleton: volatility-based risk-per-trade, scaled by conviction, disciplined
@@ -7,7 +7,7 @@ liquidity). Fractional-Kelly *spirit* under honest inputs — with base-rate
 edges this thin and provisional, the risk-budget path dominates and pure
 Kelly is deliberately not exposed as a number.
 
-India cost/tax physics (§9.4): delivery equities, FY2026 rules —
+India cost/tax physics (§8.1): delivery equities, FY2026 rules —
   STT 0.1% each side · stamp 0.015% buy · exchange ≈0.00297% · SEBI 0.0001%
   brokerage assumed zero (discount broker delivery)
   STCG 20% (<12m) vs LTCG 12.5% (>12m, above ₹1.25L annual exemption)
@@ -114,7 +114,7 @@ def recommend_size(i: SizingInputs) -> dict:
 
 def cost_tax_breakeven(position_value: float, adv_cr: float | None,
                        expected_hold_months: float) -> dict:
-    """After-cost, after-tax hurdle math (§9.4) — the swing-killer, by design."""
+    """After-cost, after-tax hurdle math (§8.1) — the swing-killer, by design."""
     impact = impact_cost_pct(position_value / 1e7, adv_cr)
     round_trip_pct = ROUND_TRIP_STATUTORY * 100 + impact
     tax_rate = STCG_RATE if expected_hold_months < 12 else LTCG_RATE

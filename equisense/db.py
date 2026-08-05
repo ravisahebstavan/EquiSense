@@ -1,11 +1,11 @@
 """Database setup.
 
 Local default: a SQLite file under ./data (gitignored — real user data never
-enters the repo, PROJECT_DRAFT §28.2).
+enters the repo, §3.3).
 
 Hosted: set DATABASE_URL (e.g. a free Neon Postgres connection string) and
 everything persistent — including the ledger and raw vault — lives in the
-database, because free web hosts have ephemeral filesystems (DEPLOYMENT.md).
+database, because free web hosts have ephemeral filesystems (README §3.1).
 """
 from __future__ import annotations
 

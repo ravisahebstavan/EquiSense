@@ -204,7 +204,7 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
 
     return {
         "as_of_utc": datetime.now(timezone.utc).isoformat(),
-        "provider": "yahoo (bootstrap tier — exchange sources planned, PHASE2 §3.2)",
+        "provider": "yahoo (bootstrap tier — exchange sources planned, §5.2)",
         "quality_score": quality,
         "quality_components": {k: round(v, 3) for k, v in comp.items()},
         "warnings": warnings,

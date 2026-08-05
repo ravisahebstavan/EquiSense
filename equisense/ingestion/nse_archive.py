@@ -19,7 +19,7 @@ plain archive files, free, keyless, and authoritative:
                    yield — index-level valuation history, which makes "is the
                    market itself expensive versus its own history" answerable.
 
-DISCIPLINE (PROJECT_DRAFT §7.10)
+DISCIPLINE (§5.5)
 --------------------------------
 These are published archive FILES, not a scraped API: one request per file per
 trading day, no session/cookie games, no polling, and a descriptive User-Agent.
@@ -398,7 +398,7 @@ def backfill(session: Session, days: int = 30, end: Optional[date] = None,
 
     Deliberately sequential and unthreaded: this is someone else's free
     infrastructure, and a backfill that hammers it is exactly the behaviour
-    PROJECT_DRAFT §7.10 rules out.
+    §5.5 rules out.
     """
     end = end or date.today()
     stats = {"days_attempted": 0, "days_with_data": 0, "derivative_rows": 0,

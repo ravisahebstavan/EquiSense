@@ -1,4 +1,4 @@
-"""Universe definition (RESEARCH_BLUEPRINT §5: bounded, curated).
+"""Universe definition (§5.1: bounded, curated).
 
 NIFTY-50 core (as of mid-2026), with sector labels and cap bands. Yahoo
 symbol = f"{ticker}.NS". Banks/financials are included in the universe for

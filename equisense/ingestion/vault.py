@@ -1,4 +1,4 @@
-"""Raw payload vault (PHASE2_ARCHITECTURE §3.1 — the A6 fix).
+"""Raw payload vault (§5.3 — the A6 fix).
 
 Content-addressed, immutable, append-only archive of data as received from
 providers, stored BEFORE normalization. The canonical store becomes
@@ -27,7 +27,7 @@ from ..db import DATA_DIR, STORAGE
 VAULT_DIR = Path(DATA_DIR) / "vault"
 INDEX_PATH = VAULT_DIR / "index.jsonl"
 # STORAGE == "db" → blobs live in vault_blobs/vault_fetches tables (hosted
-# deployments have ephemeral filesystems — DEPLOYMENT.md).
+# deployments have ephemeral filesystems — README §3.1).
 
 
 def _serialize(payload: Any) -> bytes:

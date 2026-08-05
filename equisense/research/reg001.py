@@ -1,5 +1,5 @@
 """REG-001: does regime conditioning improve out-of-sample calibration?
-(PHASE2 §6.1 — the regime engine is itself a registered hypothesis.)
+(§11 — the regime engine is itself a registered hypothesis.)
 
 Design: momentum-top-quintile episodes (the family regime conditioning is
 actually used on), split at the median episode date. On the train half, fit
@@ -58,7 +58,7 @@ def run_reg001(session: Session, horizon: int = 126) -> dict:
     counts = train.groupby("regime")["win"].agg(["sum", "count"])
     p_regime = {}
     for reg, row in counts.iterrows():
-        # shrinkage toward unconditional: thin cells borrow strength (§12.2)
+        # shrinkage toward unconditional: thin cells borrow strength (§11)
         p_regime[reg] = (row["sum"] + SHRINK_N * p_uncond) / (row["count"] + SHRINK_N)
 
     y = test["win"].astype(float)

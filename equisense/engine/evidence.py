@@ -1,4 +1,4 @@
-"""Evidence objects (RESEARCH_BLUEPRINT §7.1) and builders.
+"""Evidence objects (§7.1) and builders.
 
 An Evidence is one engine's typed, tiered, clustered contribution to a
 decision. `strength` is a bounded [-1, +1] direction·magnitude used by the
@@ -49,7 +49,7 @@ def _clip(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
 
 def xsec_strength(values: dict[str, Optional[float]], key: str,
                   invert: bool = False) -> Optional[float]:
-    """Cross-sectional percentile → strength in [-1, +1] (PHASE2 §5.1, A2 fix).
+    """Cross-sectional percentile → strength in [-1, +1] (§7.2, A2 fix).
 
     Hand-picked scale divisors are abolished: an engine's raw measurement is
     ranked within the universe as-of-date; strength = 2·(percentile − 0.5).

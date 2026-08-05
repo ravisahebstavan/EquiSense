@@ -1,12 +1,12 @@
-"""ORM entities (PROJECT_DRAFT §15.2).
+"""ORM entities (§5.4).
 
 Design decisions carried through from the draft:
-- FilingPeriod is versioned by filing date and restatement version (§14.4) and
+- FilingPeriod is versioned by filing date and restatement version (§5.4) and
   keeps standalone vs consolidated as first-class scopes (§10.1).
-- Ratios are NEVER stored — always computed on read from filings (§15.3).
-- Portfolio state is a transaction ledger, not mutable holdings (§11.1).
+- Ratios are NEVER stored — always computed on read from filings (§5.4).
+- Portfolio state is a transaction ledger, not mutable holdings (§5.4).
 - Thesis is a structured object with falsifiable assumptions and invalidation
-  triggers, not a prose blob (§23.1).
+  triggers, not a prose blob (§5.4).
 """
 from __future__ import annotations
 
@@ -26,9 +26,9 @@ class Company(Base):
     name: Mapped[str] = mapped_column(String(120))
     sector: Mapped[str] = mapped_column(String(60))
     industry: Mapped[str] = mapped_column(String(80), default="")
-    exchange: Mapped[str] = mapped_column(String(10), default="NSE")  # §16.4: market id from day one
+    exchange: Mapped[str] = mapped_column(String(10), default="NSE")  # §5.4: market id from day one
     cap_band: Mapped[str] = mapped_column(String(10), default="large")  # large | mid | small
-    peer_group: Mapped[str] = mapped_column(String(60), default="")     # manually curated (§10.8)
+    peer_group: Mapped[str] = mapped_column(String(60), default="")     # manually curated (§5.4)
     description: Mapped[str] = mapped_column(Text, default="")
     is_demo_data: Mapped[bool] = mapped_column(Boolean, default=False)
     is_financial: Mapped[bool] = mapped_column(Boolean, default=False)  # banks/NBFC: statement engines skip
@@ -45,7 +45,7 @@ class Company(Base):
 
 
 class FilingPeriod(Base):
-    """One fiscal period × scope × restatement version (§14.4, §10.1).
+    """One fiscal period × scope × restatement version (§5.4, §10.1).
     Canonical line items as typed columns (₹ crore; shares in crore)."""
     __tablename__ = "filing_periods"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -158,7 +158,7 @@ class VolSurfaceObservation(Base):
 
 
 class BaseRateRecord(Base):
-    """Cached T2 base-rate study result (RESEARCH_BLUEPRINT §7.1, §10.1).
+    """Cached T2 base-rate study result (§7.1, §10.1).
     Computed from the platform's own stored price history — never asserted."""
     __tablename__ = "base_rates"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -196,7 +196,7 @@ class BaseRateRecord(Base):
 
 
 class SectorAttribute(Base):
-    """Extensible attributes for sector-specific KPIs (§15.1) — e.g. ARPOB,
+    """Extensible attributes for sector-specific KPIs (§5.4) — e.g. ARPOB,
     bed occupancy — without a schema explosion."""
     __tablename__ = "sector_attributes"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -254,7 +254,7 @@ class PaperTrade(Base):
 
 
 class Thesis(Base):
-    """Structured, falsifiable thesis (§23.1) with lifecycle (§23.2)."""
+    """Structured, falsifiable thesis (§5.4) with lifecycle (§5.4)."""
     __tablename__ = "theses"
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), index=True)
@@ -277,7 +277,7 @@ class JournalEntry(Base):
     company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id"), nullable=True)
     thesis_id: Mapped[int | None] = mapped_column(ForeignKey("theses.id"), nullable=True)
     content: Mapped[str] = mapped_column(Text)
-    cfa_topic: Mapped[str] = mapped_column(String(80), default="")  # §22 learning-linked tag
+    cfa_topic: Mapped[str] = mapped_column(String(80), default="")  # §5.4 learning-linked tag
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -296,7 +296,7 @@ class AppSnapshot(Base):
 
 class LedgerRecord(Base):
     """DB backend for the append-only, hash-chained decision ledger — used on
-    hosted deployments where the filesystem is ephemeral (DEPLOYMENT.md).
+    hosted deployments where the filesystem is ephemeral (README §3.1).
     `payload` is the full JSON record including hash and prev_hash; `seq`
     preserves chain order."""
     __tablename__ = "ledger_records"
@@ -328,7 +328,7 @@ class WatchlistItem(Base):
     __tablename__ = "watchlist_items"
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id"), unique=True)
-    rationale: Mapped[str] = mapped_column(Text)  # REQUIRED at add-time (§21)
+    rationale: Mapped[str] = mapped_column(Text)  # REQUIRED at add-time (§5.4)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

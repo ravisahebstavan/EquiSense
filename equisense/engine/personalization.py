@@ -1,15 +1,15 @@
-"""Personalization engine (PROJECT_DRAFT §12).
+"""Personalization engine (§6.6).
 
 Two deterministic functions make personalization structural, not cosmetic
 (Commitment 2.2):
 
 1. attention_score() — a weighted function of the investor profile against
    each company's computed attributes, driving watchlist/dashboard ordering.
-2. card_order() — the lens system (§18.3): the same company cards, reordered
+2. card_order() — the lens system (§6.6): the same company cards, reordered
    by profile. Two different profiles MUST produce visibly different orders
-   (the §12.2 acceptance test — covered by a unit test).
+   (the §6.6 acceptance test — covered by a unit test).
 
-The ranking itself is rules-based; the LLM only ever narrates it (§13.3).
+The ranking itself is rules-based; the LLM only ever narrates it (§6.6).
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class InvestorProfile:
     horizon: str = "long"                  # short | medium | long
     horizon_target_year: Optional[int] = None
     risk_tolerance: str = "moderate"       # conservative | moderate | aggressive
-    style: float = 50.0                    # 0 = deep value … 100 = pure growth (spectrum, §12.1)
+    style: float = 50.0                    # 0 = deep value … 100 = pure growth (spectrum, §6.6)
     dividend_preference: float = 20.0      # 0 = indifferent … 100 = primary objective
     quality_emphasis: float = 60.0         # 0 … 100, weight on quality/governance signals
     sector_preferences: list[str] = field(default_factory=list)
@@ -64,7 +64,7 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 def attention_score(profile: InvestorProfile, sig: CompanySignals) -> dict:
     """Deterministic 0–100 priority score with a full component breakdown
-    (the breakdown IS the explainability — §19.1 layer 2)."""
+    (the breakdown IS the explainability — §6.6 layer 2)."""
     components: dict[str, float] = {}
 
     # Quality (F-score 0–9 → 0–1, Z zone bonus/penalty)
@@ -139,7 +139,7 @@ def attention_score(profile: InvestorProfile, sig: CompanySignals) -> dict:
         "explanation": ("Weighted average of engine-computed component scores; weights "
                         "derive from your profile (style, quality emphasis, dividend "
                         "preference, risk tolerance). Fully deterministic — no AI in the "
-                        "ranking (§13.3)."),
+                        "ranking (§6.6)."),
     }
 
 
@@ -177,7 +177,7 @@ _LENS_ORDERS: dict[str, list[str]] = {
 
 
 def card_order(profile: InvestorProfile) -> list[str]:
-    """Card ordering for a company page under this profile's lens (§18.3).
+    """Card ordering for a company page under this profile's lens (§6.6).
     Falls back from an explicit lens choice to one inferred from the profile."""
     lens = profile.preferred_lens
     if lens not in _LENS_ORDERS or lens == "balanced":
