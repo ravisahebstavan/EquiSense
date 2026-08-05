@@ -85,12 +85,25 @@ def n_effective(n: int, horizon_days: int) -> int:
 
 
 def load_price_panel(session: Session) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(closes, volumes) DataFrames: index=date, columns=ticker."""
-    rows = session.execute(
-        select(PriceObservation.company_id, PriceObservation.obs_date,
-               PriceObservation.close, PriceObservation.volume)).all()
+    """(closes, volumes) DataFrames: index=date, columns=ticker.
+
+    Deliberately UNFILTERED — the corrected backtests need the delisted and
+    departed names, which is the whole point of retaining them (§5.1).
+
+    Read straight into pandas rather than through ``.all()``: materialising a
+    million rows as Python Row objects first, only to rebuild them as a frame,
+    dominated this call on the real deployment. Same rows, same order, without
+    the intermediate objects.
+    """
+    stmt = select(PriceObservation.company_id, PriceObservation.obs_date,
+                  PriceObservation.close, PriceObservation.volume)
+    try:
+        df = pd.read_sql(stmt, session.connection())
+        df.columns = ["cid", "date", "close", "volume"]
+    except Exception:                                  # noqa: BLE001 - driver quirk
+        rows = session.execute(stmt).all()
+        df = pd.DataFrame(rows, columns=["cid", "date", "close", "volume"])
     tickers = {c.id: c.ticker for c in session.scalars(select(Company)).all()}
-    df = pd.DataFrame(rows, columns=["cid", "date", "close", "volume"])
     df["ticker"] = df["cid"].map(tickers)
     closes = df.pivot_table(index="date", columns="ticker", values="close").sort_index()
     volumes = df.pivot_table(index="date", columns="ticker", values="volume").sort_index()
@@ -363,7 +376,13 @@ def run_study(closes: pd.DataFrame, volumes: pd.DataFrame,
 
 def run_all_studies(session: Session, panel=None) -> dict:
     # see run_ic_studies: `panel` shares one load across several studies
+    import logging
+    import time as _time
+    _slog = logging.getLogger("equisense.research")
+    _t = _time.monotonic()
     closes, volumes = load_price_panel(session) if panel is None else panel
+    _slog.info("studies: panel %s x %s loaded in %.1fs",
+               closes.shape[0], closes.shape[1], _time.monotonic() - _t)
     nifty = load_nifty(session)
     regimes = pd.Series(regime_series(nifty.tolist()), index=nifty.index)
     regimes = regimes.reindex(closes.index, method="ffill").fillna("unknown")
@@ -394,8 +413,13 @@ def run_all_studies(session: Session, panel=None) -> dict:
     # while passing every local SQLite test.
     records: list[dict] = []
     for hyp_id, cfg in all_studies.items():
+        _ts = _time.monotonic()
         records.extend(run_study(closes, volumes, regimes, hyp_id, cfg=cfg))
+        _slog.info("studies: %s in %.1fs (%.1fs total)", hyp_id,
+                   _time.monotonic() - _ts, _time.monotonic() - _t)
 
+    # FDR is computed across the WHOLE run, so this cannot be split across days
+    # without corrupting the correction — the run is all-or-nothing by design.
     apply_multiplicity_control(records)
 
     # One short transaction: delete and reinsert together, so a failure rolls
