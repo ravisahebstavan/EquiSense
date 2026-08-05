@@ -92,8 +92,21 @@ MACRO_SERIES = {
 }
 
 
+# Overrides for when our ticker (from the pinned NIFTY50 fallback, or simply
+# stable inside our own DB) no longer resolves on Yahoo under a corporate
+# action, even though the exchange-derived universe above already carries the
+# correct current symbol when its NSE fetch succeeds. TATAMOTORS -> TMPV: the
+# 2026-08-04 Tata Motors demerger renamed the original listing (full price
+# history intact) to Tata Motors Passenger Vehicles/TMPV and spun the
+# commercial-vehicles business off onto a brand-new symbol, TMCV, with no
+# price history before the split.
+YAHOO_SYMBOL_OVERRIDES = {
+    "TATAMOTORS": "TMPV",
+}
+
+
 def yahoo_symbol(ticker: str) -> str:
-    return f"{ticker}.NS"
+    return f"{YAHOO_SYMBOL_OVERRIDES.get(ticker, ticker)}.NS"
 
 
 def is_financial(sector: str) -> bool:

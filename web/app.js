@@ -743,6 +743,10 @@ function valuationCard(card, companyId) {
 
 async function viewCompanyDetail(id, tab = "overview") {
   const d = await api(`/companies/${id}`);
+  if (d.error) {
+    app.innerHTML = `<div class="panel"><div class="empty">${esc(d.error)}</div></div>`;
+    return;
+  }
   const c = d.company;
   const tabs = [["overview", "Overview"], ["dossier", "Dossier"], ["memory", "Memory"], ["ai", "AI Desk"]];
 
