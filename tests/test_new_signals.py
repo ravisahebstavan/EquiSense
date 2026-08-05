@@ -292,3 +292,47 @@ def test_crowding_still_none_without_enough_price_history():
     m = crowding_proxy([100.0] * 10, [1e6] * 10, delivery_pct=20.0,
                        delivery_mean_pct=50.0)
     assert m.value is None
+
+
+def test_rolling_topk_mean_matches_the_naive_form_exactly():
+    """The MAX-effect feature used
+    ``rolling(21, min_periods=15).apply(lambda x: pd.Series(x).nlargest(5).mean())``,
+    which allocates a pandas Series PER WINDOW. On the production panel
+    (2488 x 500 = 1.24M windows) that ran over 200 seconds and was killed by
+    the platform's 300s function limit, so the whole studies stage never
+    committed and base rates silently stopped updating.
+
+    The vectorised replacement must produce the SAME NUMBERS — a quietly
+    changed research signal would be far worse than a slow cron — including
+    pandas' habit of emitting values for partial leading windows once
+    min_periods is satisfied.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from equisense.research.base_rates import _rolling_topk_mean
+
+    rng = np.random.default_rng(7)
+
+    def naive(df):
+        return df.rolling(21, min_periods=15).apply(
+            lambda x: pd.Series(x).nlargest(5).mean(), raw=False)
+
+    cases = {
+        "ragged listings + scattered holidays": None,
+        "no NaN": pd.DataFrame(rng.normal(0, 0.02, (200, 8))),
+        "an entirely absent name": pd.DataFrame(
+            np.column_stack([rng.normal(0, 0.02, 200), np.full(200, np.nan)])),
+        "shorter than the window": pd.DataFrame(rng.normal(0, 0.02, (18, 4))),
+        "exactly min_periods rows": pd.DataFrame(rng.normal(0, 0.02, (15, 4))),
+    }
+    d = rng.normal(0, 0.02, (300, 40))
+    d[:40, :15] = np.nan                       # names that listed late
+    d[rng.random((300, 40)) < 0.03] = np.nan   # scattered gaps
+    cases["ragged listings + scattered holidays"] = pd.DataFrame(d)
+
+    for name, df in cases.items():
+        old, new = naive(df), _rolling_topk_mean(df, 21, 15, 5)
+        assert (old.isna() == new.isna()).all().all(), f"{name}: NaN pattern differs"
+        delta = (old - new).abs().max().max()
+        assert not (delta == delta) or delta < 1e-12, f"{name}: values differ by {delta}"

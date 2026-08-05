@@ -212,6 +212,52 @@ def feat_sector_relative_momentum(closes: pd.DataFrame, volumes,
     return r63 - sector_mean
 
 
+def _rolling_topk_mean(df: pd.DataFrame, window: int, min_periods: int,
+                       k: int) -> pd.DataFrame:
+    """Rolling mean of the k largest values in each window, vectorised.
+
+    Exactly equivalent to ``df.rolling(window, min_periods=min_periods).apply(
+    lambda x: pd.Series(x).nlargest(k).mean())`` — NaNs ignored, fewer than k
+    valid points averaged over however many there are — but without building a
+    pandas Series per window.
+
+    That naive form is why this study stalled the daily cron: a 2488 x 500
+    panel is 1.24 MILLION windows, each allocating a Series and running
+    nlargest. It ran for over 200 seconds and was killed by the platform's
+    function limit, so base rates silently stopped updating.
+    """
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    values = df.to_numpy(dtype="float64", copy=False)
+    n_rows = values.shape[0]
+    out = np.full(values.shape, np.nan)
+
+    def topk_mean(win: np.ndarray) -> np.ndarray:
+        """win: (..., w) → mean of the k largest finite entries per row."""
+        valid = ~np.isnan(win)
+        count = valid.sum(axis=-1)
+        # -inf never wins a "largest" comparison, so NaNs drop out naturally
+        filled = np.where(valid, win, -np.inf)
+        kk = min(k, win.shape[-1])
+        topk = np.partition(filled, -kk, axis=-1)[..., -kk:]
+        # windows with fewer than k valid points average over just those
+        total = np.where(np.isfinite(topk), topk, 0.0).sum(axis=-1)
+        res = total / np.maximum(np.minimum(count, k), 1)
+        return np.where(count >= min_periods, res, np.nan)
+
+    # Leading PARTIAL windows: pandas emits a value as soon as min_periods is
+    # satisfied, before a full window exists. At most (window - min_periods)
+    # rows, so a small loop here costs nothing and keeps the NaN pattern exact.
+    for i in range(min_periods - 1, min(window - 1, n_rows)):
+        out[i] = topk_mean(values[: i + 1].T)
+
+    if n_rows >= window:
+        # (n_rows-window+1, n_cols, window) view — no copy of the panel
+        out[window - 1:] = topk_mean(sliding_window_view(values, window, axis=0))
+    return pd.DataFrame(out, index=df.index, columns=df.columns)
+
+
 def feat_max_effect(closes: pd.DataFrame, volumes) -> pd.DataFrame:
     """Lottery-demand / MAX effect (Bali, Cakici & Whitelaw 2011, J. Financial
     Economics, 'Maxing out: Stocks as lotteries and the cross-section of
@@ -221,9 +267,7 @@ def feat_max_effect(closes: pd.DataFrame, volumes) -> pd.DataFrame:
     expected-outperformance direction — consistent with every other feature's
     selection convention."""
     rets = closes.pct_change()
-    max5 = rets.rolling(21, min_periods=15).apply(
-        lambda x: pd.Series(x).nlargest(5).mean(), raw=False)
-    return -max5
+    return -_rolling_topk_mean(rets, window=21, min_periods=15, k=5)
 
 
 # selector: how a feature frame becomes a boolean "in cohort" mask at date t
