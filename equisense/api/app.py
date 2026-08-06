@@ -1115,10 +1115,8 @@ def markets_transmission(driver: str = "BZ=F", window: int = 260,
     """
     from datetime import timedelta
 
-    from sqlalchemy import func as _func
-
     from ..engine.transmission import build_chain, drivers
-    from ..models import MacroObservation
+    from ..models import MacroObservation, PriceObservation
 
     since = date.today() - timedelta(days=int(window * 1.6))
 

@@ -839,3 +839,35 @@ def test_quote_polling_backs_off_when_the_exchange_is_closed():
     assert "setInterval(quoteLoop" not in src, (
         "a fixed interval cannot respect the exchange clock — quoteLoop must "
         "reschedule itself from cache.market.open")
+
+
+def test_every_get_endpoint_actually_executes():
+    """Reachable-from-the-UI is not the same as WORKS.
+
+    /api/markets/transmission shipped with a NameError on its first line of
+    real work — it referenced PriceObservation without importing it — and every
+    existing guard passed, because they checked that the route was wired to a
+    button, never that calling it returned anything. A 500 in production was
+    the first feedback. This closes that gap: every parameterless GET is
+    invoked, and anything that raises fails here instead of there.
+    """
+    from fastapi.routing import APIRoute
+    from fastapi.testclient import TestClient
+
+    from equisense.api.app import app
+
+    # Endpoints that legitimately need an argument or mutate state are covered
+    # by their own tests; this is the smoke net for the rest.
+    SKIP = {"/api/live/refresh/stream"}
+
+    broken = []
+    with TestClient(app) as c:
+        for r in app.routes:
+            if not isinstance(r, APIRoute) or "GET" not in r.methods:
+                continue
+            if "{" in r.path or r.path in SKIP or not r.path.startswith("/api"):
+                continue
+            resp = c.get(r.path)
+            if resp.status_code >= 500:
+                broken.append(f"{r.path} -> {resp.status_code}")
+    assert not broken, "GET endpoints raising server errors: " + "; ".join(broken)
