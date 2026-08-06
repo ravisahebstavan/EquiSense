@@ -893,6 +893,20 @@ def live_portfolio_risk(s: Session = Depends(db)):
 # still overrun, so the budget is what we refuse to START new work after.
 CRON_BUDGET_S = 210.0
 
+# New names are backfilled a bounded number per run. A universe switch can
+# introduce hundreds at once and a 10y pull for all of them would consume the
+# whole function budget; spreading it over consecutive runs costs days of
+# completeness on names the system has never held, and costs nothing on the
+# ones it has.
+BACKFILL_PER_RUN = 40
+
+
+def _priced_ids(session: Session) -> set[int]:
+    """Company ids that already have at least one stored bar."""
+    from ..models import PriceObservation
+    return set(session.scalars(
+        select(PriceObservation.company_id).distinct()).all())
+
 
 @app.get("/api/cron/refresh")
 def cron_refresh(s: Session = Depends(db)):
@@ -915,7 +929,8 @@ def cron_refresh(s: Session = Depends(db)):
     """
     import time as _time
 
-    from ..ingestion.yahoo import ingest_macro, ingest_prices, sync_universe
+    from ..ingestion.yahoo import (ingest_macro, ingest_prices, refresh_quotes,
+                                   sync_universe)
     from ..research.base_rates import run_all_studies
     from .. import ledger as L
     from ..ingestion.nse_archive import backfill as nse_backfill, prune
@@ -968,8 +983,26 @@ def cron_refresh(s: Session = Depends(db)):
         stage("nse_archives", lambda: nse_backfill(s, days=4, symbols=list(ids)))
 
     # 3. Prices and macro — recoverable, but the learning loop below needs them.
+    #
+    # Incremental, not a blanket re-pull. This downloaded a FULL YEAR of bars
+    # for every name daily; at 50 names that was affordable and at 500 it cost
+    # 155s of a 300s budget to obtain, on almost every name, one new bar.
+    # refresh_quotes sizes its window to the furthest-behind name instead, so a
+    # current universe costs a few days of data rather than a year.
+    #
+    # Names with NO history are a different job: _refresh_period deliberately
+    # ignores them (sizing the window to a new listing would drag the whole
+    # batch to 10y), so they are backfilled separately and in bounded chunks —
+    # a universe switch can introduce hundreds at once, and none of them are
+    # worth losing the rest of the pipeline over.
     if ids:
-        stage("price_rows", lambda: ingest_prices(s, ids, years=1))
+        stage("price_rows", lambda: refresh_quotes(s, ids))
+        missing = [t for t, cid in ids.items() if cid not in _priced_ids(s)]
+        if missing:
+            chunk = dict(list({t: ids[t] for t in missing}.items())[:BACKFILL_PER_RUN])
+            stage("backfilled_names", lambda: {
+                "names": len(chunk), "remaining": len(missing) - len(chunk),
+                "rows": ingest_prices(s, chunk, years=10)})
     stage("macro_rows", lambda: ingest_macro(s, years=1))
 
     # 4. The learning loop. Every gated capability unlocks from realised

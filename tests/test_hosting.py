@@ -871,3 +871,27 @@ def test_every_get_endpoint_actually_executes():
             if resp.status_code >= 500:
                 broken.append(f"{r.path} -> {resp.status_code}")
     assert not broken, "GET endpoints raising server errors: " + "; ".join(broken)
+
+
+def test_cron_refreshes_prices_incrementally_not_a_full_year_every_day():
+    """Measured at 500 names: pulling a full year of bars daily cost 155s of a
+    300s budget to obtain, on almost every name, a single new bar — and left
+    nothing for the stages behind it, so retention stopped running.
+
+    refresh_quotes sizes its window to the furthest-behind name. Names with NO
+    history are a separate, bounded backfill job, because _refresh_period
+    deliberately ignores them and a universe switch can introduce hundreds at
+    once.
+    """
+    import inspect
+
+    from equisense.api import app as app_mod
+
+    src = inspect.getsource(app_mod.cron_refresh)
+    assert "refresh_quotes(s, ids)" in src, (
+        "the daily price stage must be an incremental refresh")
+    assert "ingest_prices(s, ids, years=1)" not in src, (
+        "a blanket one-year re-pull of the WHOLE universe per day does not "
+        "scale with universe size (macro's years=1 is 11 series and is fine)")
+    assert "BACKFILL_PER_RUN" in src, "new names must be backfilled in bounded chunks"
+    assert app_mod.BACKFILL_PER_RUN <= 100
