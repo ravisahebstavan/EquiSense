@@ -432,3 +432,69 @@ def test_implied_move_is_never_presented_as_a_forecast():
     assert "ALREADY occurred" in m["caveat"]
     assert "not a prediction" in m["caveat"]
     assert implied_move(None, -20.0, 0.3) is None
+
+
+def test_sector_basket_must_be_built_by_date_not_by_index():
+    """The bug that made NIFTY Bank read as unrelated to the financials basket
+    it is definitionally composed of (beta +0.025, R² 0.0004 in production).
+
+    Universe members have different history lengths — a name listed later has
+    fewer bars. Combining their return LISTS by position therefore adds up
+    returns from different calendar days, and the basket stops describing any
+    real portfolio. Building it per DATE is what makes the basket the thing it
+    claims to be.
+    """
+    from datetime import date, timedelta
+
+    from equisense.engine.crossasset import (align_on_dates,
+                                             returns_from_dated_closes)
+    from equisense.engine.transmission import measure_link
+
+    d0 = date(2025, 1, 1)
+    days = [d0 + timedelta(days=i) for i in range(300)]
+    moves = [((i * 37) % 11 - 5) / 500.0 for i in range(300)]
+
+    def closes(start_idx, idio=0.0):
+        # Real members track their sector with idiosyncratic noise on top; two
+        # series that are literally identical produce r=1.0, which correlation
+        # maths treats as degenerate and never occurs in market data.
+        import random
+        rng = random.Random(start_idx + 1)
+        px, out = 100.0, []
+        for i in range(start_idx, 300):
+            px *= 1 + moves[i] + (rng.gauss(0, idio) if idio else 0.0)
+            out.append((days[i], px))
+        return out
+
+    old_name = closes(0, idio=0.004)                 # member with its own noise
+    new_name = closes(120, idio=0.004)               # listed 120 days later
+    index_closes = closes(0)                         # the "sector index" itself
+
+    r_old = returns_from_dated_closes(old_name)
+    r_new = returns_from_dated_closes(new_name)
+    r_idx = returns_from_dated_closes(index_closes)
+
+    # CORRECT: average the members trading on each date
+    per_date = {}
+    for rets in (r_old, r_new):
+        for d_, r in rets.items():
+            per_date.setdefault(d_, []).append(r)
+    basket_dated = {d_: sum(v) / len(v) for d_, v in per_date.items()}
+    aligned = align_on_dates({"basket": basket_dated, "index": r_idx})
+    good = measure_link(aligned["basket"], aligned["index"], +1, "by-date")
+
+    # WRONG: combine the two members' lists by position, then tail-align
+    lo = [v for _d, v in sorted(r_old.items())]
+    ln = [v for _d, v in sorted(r_new.items())]
+    by_index = [(a + b) / 2 for a, b in zip(lo, ln)]
+    li = [v for _d, v in sorted(r_idx.items())]
+    n = min(len(by_index), len(li))
+    bad = measure_link(by_index[-n:], li[-n:], +1, "by-index")
+
+    assert good["r_squared"] > 0.7, (
+        f"a basket of members against their own index must track it closely; "
+        f"got R²={good['r_squared']}")
+    assert good["verdict"] == "confirmed"
+    assert bad["r_squared"] < good["r_squared"] / 2, (
+        "combining members by list position must visibly destroy the "
+        f"relationship (good R²={good['r_squared']}, bad R²={bad['r_squared']})")

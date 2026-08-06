@@ -1115,19 +1115,11 @@ def markets_transmission(driver: str = "BZ=F", window: int = 260,
     """
     from datetime import timedelta
 
+    from ..engine.crossasset import align_on_dates, returns_from_dated_closes
     from ..engine.transmission import build_chain, drivers
     from ..models import MacroObservation, PriceObservation
 
     since = date.today() - timedelta(days=int(window * 1.6))
-
-    def _returns(pairs):
-        pairs = sorted(pairs)
-        out, prev = [], None
-        for _d, c in pairs:
-            if c and prev:
-                out.append(c / prev - 1.0)
-            prev = c or prev
-        return out
 
     macro_rows = s.execute(
         select(MacroObservation.symbol, MacroObservation.obs_date,
@@ -1141,11 +1133,10 @@ def markets_transmission(driver: str = "BZ=F", window: int = 260,
                 "reason": f"no stored history for {driver}",
                 "drivers": drivers()}
 
-    driver_series = sorted(by_symbol[driver])
-    driver_returns = _returns(driver_series)
+    driver_closes = sorted(by_symbol[driver])
     move_pct = None
-    if len(driver_series) > 63 and driver_series[-64][1]:
-        move_pct = (driver_series[-1][1] / driver_series[-64][1] - 1.0) * 100
+    if len(driver_closes) > 63 and driver_closes[-64][1]:
+        move_pct = (driver_closes[-1][1] / driver_closes[-64][1] - 1.0) * 100
 
     # Sector baskets are equal-weighted from the LIVE universe: a departed name
     # in the basket would measure a sector this book can no longer hold.
@@ -1155,32 +1146,53 @@ def markets_transmission(driver: str = "BZ=F", window: int = 260,
                PriceObservation.close)
         .where(PriceObservation.company_id.in_(_live_ids()),
                PriceObservation.obs_date >= since)).all()
-    sectors = {c.id: (c.sector, c.ticker) for c in s.scalars(
+    meta = {c.id: (c.sector, c.ticker) for c in s.scalars(
         select(Company).where(Company.is_index_member.is_(True))).all()}
     per_name: dict[str, list] = {}
     for cid, d_, c in px:
-        meta = sectors.get(cid)
-        if meta:
-            per_name.setdefault(meta[1], []).append((d_, c))
+        m = meta.get(cid)
+        if m:
+            per_name.setdefault(m[1], []).append((d_, c))
 
-    name_returns = {t: _returns(v) for t, v in per_name.items() if len(v) > 60}
-    name_sector = {meta[1]: meta[0] for meta in sectors.values()}
-    sector_returns: dict[str, list[float]] = {}
-    for tkr, rets in name_returns.items():
+    # EVERYTHING stays date-keyed until the final intersection. Equity bars and
+    # macro bars come from different providers with different holiday calendars,
+    # so pairing them by position pairs Monday's rupee move with Tuesday's
+    # equity move — the failure crossasset._align documents, and the reason
+    # NIFTY Bank measured a beta of 0.02 against the financials basket it is
+    # definitionally made of.
+    name_rets = {t: returns_from_dated_closes(v) for t, v in per_name.items()
+                 if len(v) > 60}
+    name_sector = {m[1]: m[0] for m in meta.values()}
+
+    # Equal weight means the mean of the members trading THAT DAY, not a
+    # running pairwise average — that would weight the last name added 1/2, the
+    # one before it 1/4, and so on.
+    sector_dated: dict[str, dict] = {}
+    for tkr, rets in name_rets.items():
         sec = name_sector.get(tkr)
         if not sec:
             continue
-        bucket = sector_returns.setdefault(sec, [])
-        for i, r in enumerate(rets):
-            if i < len(bucket):
-                bucket[i] = (bucket[i] + r) / 2.0     # running equal weight
-            else:
-                bucket.append(r)
+        bucket = sector_dated.setdefault(sec, {})
+        for d_, r in rets.items():
+            bucket.setdefault(d_, []).append(r)
+    sector_dated = {sec: {d_: sum(v) / len(v) for d_, v in days.items()}
+                    for sec, days in sector_dated.items()}
 
-    market = _returns(by_symbol.get("^NSEI", []))
-    chain = build_chain(driver, driver_returns, move_pct, market,
-                        sector_returns, name_returns, name_sector)
+    to_align = {"__driver__": returns_from_dated_closes(driver_closes),
+                "__market__": returns_from_dated_closes(
+                    sorted(by_symbol.get("^NSEI", [])))}
+    to_align.update({f"sector::{k}": v for k, v in sector_dated.items()})
+    to_align.update({f"name::{k}": v for k, v in name_rets.items()})
+    aligned = align_on_dates({k: v for k, v in to_align.items() if v})
+
+    chain = build_chain(
+        driver, aligned.get("__driver__", []), move_pct,
+        aligned.get("__market__", []),
+        {k[len("sector::"):]: v for k, v in aligned.items() if k.startswith("sector::")},
+        {k[len("name::"):]: v for k, v in aligned.items() if k.startswith("name::")},
+        name_sector)
     chain["drivers"] = drivers()
+    chain["aligned_observations"] = len(aligned.get("__driver__", []))
     chain["window_days"] = window
     return chain
 
