@@ -813,3 +813,29 @@ def test_realign_touches_no_provider_and_recomputes_no_study():
     for required in ("build_universe_snapshot", "register_daily_forecasts",
                      "score_due_claims", "run_autopilot"):
         assert required in src, f"realign must re-derive {required}"
+
+
+def test_quote_poll_does_not_resync_the_universe_every_time():
+    """Index membership changes on reshuffles, not on a five-minute timer.
+    The quote poll re-fetched NSE's constituent CSV and re-upserted every
+    company on EVERY call, for every open tab — most of the endpoint's latency,
+    and a pointless repeated load on the exchange's published file."""
+    import inspect
+
+    from equisense.api.app import live_quotes
+
+    src = inspect.getsource(live_quotes)
+    assert "universe_sync_day" in src, "membership sync must be throttled per day"
+    assert src.index("universe_sync_day") < src.index("sync_universe("), (
+        "the throttle has to be checked BEFORE syncing, or it saves nothing")
+
+
+def test_quote_polling_backs_off_when_the_exchange_is_closed():
+    """Once NSE closes, today's bar is final: further polls re-download the
+    same numbers, report 'updated 0, inserted 0', and burn a serverless
+    invocation to redraw identical figures."""
+    src = (__import__("pathlib").Path("web/app.js")).read_text()
+    assert "QUOTE_INTERVAL_CLOSED_MS" in src and "QUOTE_INTERVAL_OPEN_MS" in src
+    assert "setInterval(quoteLoop" not in src, (
+        "a fixed interval cannot respect the exchange clock — quoteLoop must "
+        "reschedule itself from cache.market.open")

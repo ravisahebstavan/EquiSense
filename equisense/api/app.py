@@ -397,7 +397,25 @@ def live_quotes(s: Session = Depends(db)):
     """Near-live price upsert (today's running bar) + market clock — called
     on a timer while the site is open so fills stay executable-real."""
     from ..ingestion.yahoo import market_open_ist, refresh_quotes, sync_universe
-    ids = sync_universe(s)
+    from ..models import AppSnapshot
+
+    # Index membership changes on reshuffles, not on a five-minute timer. This
+    # re-fetched NSE's constituent CSV and re-upserted every company on EVERY
+    # quote poll — for every open tab — which is most of the call's latency and
+    # a pointless load on the exchange's file. Once a day is the real cadence.
+    _sync_key = "universe_sync_day"
+    _row = s.get(AppSnapshot, _sync_key)
+    _today = str(date.today())
+    if _row is None or _row.as_of != _today:
+        ids = sync_universe(s)
+        if _row is None:
+            s.add(AppSnapshot(key=_sync_key, as_of=_today, payload="{}"))
+        else:
+            _row.as_of = _today
+        s.commit()
+    else:
+        ids = {c.ticker: c.id for c in s.scalars(
+            select(Company).where(Company.is_index_member.is_(True))).all()}
     result = refresh_quotes(s, ids)
     # New bars landed, so the cached snapshot and its freshness probe are both
     # stale. Without this the refresh button could appear to do nothing for up

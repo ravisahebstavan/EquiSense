@@ -169,7 +169,11 @@ async function refreshStatusStrip() {
       <span class="seg">Coverage <strong>${esc(p.coverage)}</strong></span>
       <span class="seg">Provider ${esc(st.provider.split(" ")[0])}</span>
       ${cache.market ? `<span class="seg">Market <strong>${cache.market.open ? "OPEN" : "closed"}</strong> · ${esc(cache.market.ist)} IST</span>` : ""}
-      ${cache.quotesAt ? `<span class="seg" title="Live quotes are pulled every 5 minutes while this page is open, and the view re-renders on each pull.">Quotes <strong>${cache.quotesAt.toLocaleTimeString()}</strong></span>` : ""}
+      ${cache.quotesAt ? `<span class="seg" title="${cache.market && cache.market.open
+          ? "Live quotes pulled every 5 minutes while this page is open; the view re-renders on each pull."
+          : "The exchange is closed, so today's close is final and further polling cannot change it. Quotes resume at 09:15 IST."}">Quotes
+        <strong>${cache.quotesAt.toLocaleTimeString()}</strong>${cache.market && !cache.market.open
+          ? ' <span class="sub">· session closed, prices final</span>' : ""}</span>` : ""}
       ${autoRefreshing ? '<span class="seg" style="color:var(--accent)">⟳ auto-refreshing…</span>' : ""}
       ${warn}
       <span class="seg" style="margin-left:auto"><a href="#/lab/data">data health →</a></span>`;
@@ -2404,6 +2408,23 @@ async function quoteLoop() {
     if (LIVE_VIEWS.has(currentView()) && !isEditingForm()) await route({ silent: true });
     refreshStatusStrip();
   } catch { /* quotes are best-effort; status strip reports staleness */ }
+  finally { scheduleQuotes(); }
+}
+
+/* Poll on the exchange's clock, not a fixed timer. Once NSE closes, today's
+   bar is final: every further poll re-downloads the same numbers, reports
+   "updated 0, inserted 0", and spends a serverless invocation to redraw
+   identical figures. Back off to a slow heartbeat that still catches the
+   post-close settle and the next open. */
+const QUOTE_INTERVAL_OPEN_MS = 5 * 60 * 1000;
+const QUOTE_INTERVAL_CLOSED_MS = 30 * 60 * 1000;
+let quoteTimer = null;
+
+function scheduleQuotes() {
+  clearTimeout(quoteTimer);
+  const open = !!(cache.market && cache.market.open);
+  quoteTimer = setTimeout(quoteLoop,
+    open ? QUOTE_INTERVAL_OPEN_MS : QUOTE_INTERVAL_CLOSED_MS);
 }
 
 document.getElementById("help-grid").innerHTML = SHORTCUTS.map(([k, d]) =>
@@ -2416,6 +2437,5 @@ initTheme();
 window.addEventListener("hashchange", route);
 refreshStatusStrip();
 setInterval(refreshStatusStrip, 120000);
-quoteLoop();
-setInterval(quoteLoop, 300000);
+quoteLoop();   // self-reschedules on the exchange clock (see scheduleQuotes)
 route();
