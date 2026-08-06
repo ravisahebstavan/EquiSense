@@ -1104,6 +1104,89 @@ def storage_view(universe_size: int = 50, s: Session = Depends(db)):
             "projection": projected_headroom(s, max(10, min(universe_size, 2000)))}
 
 
+@app.get("/api/markets/transmission")
+def markets_transmission(driver: str = "BZ=F", window: int = 260,
+                         s: Session = Depends(db)):
+    """Macro → market → sector → security, one measured link at a time (§6.5).
+
+    Answers the question every other engine here skips: a macro variable just
+    moved — by what PATH does that reach a price, and does this platform's own
+    data actually show the path exists?
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import func as _func
+
+    from ..engine.transmission import build_chain, drivers
+    from ..models import MacroObservation
+
+    since = date.today() - timedelta(days=int(window * 1.6))
+
+    def _returns(pairs):
+        pairs = sorted(pairs)
+        out, prev = [], None
+        for _d, c in pairs:
+            if c and prev:
+                out.append(c / prev - 1.0)
+            prev = c or prev
+        return out
+
+    macro_rows = s.execute(
+        select(MacroObservation.symbol, MacroObservation.obs_date,
+               MacroObservation.close)
+        .where(MacroObservation.obs_date >= since)).all()
+    by_symbol: dict[str, list] = {}
+    for sym, d_, c in macro_rows:
+        by_symbol.setdefault(sym, []).append((d_, c))
+    if driver not in by_symbol:
+        return {"available": False,
+                "reason": f"no stored history for {driver}",
+                "drivers": drivers()}
+
+    driver_series = sorted(by_symbol[driver])
+    driver_returns = _returns(driver_series)
+    move_pct = None
+    if len(driver_series) > 63 and driver_series[-64][1]:
+        move_pct = (driver_series[-1][1] / driver_series[-64][1] - 1.0) * 100
+
+    # Sector baskets are equal-weighted from the LIVE universe: a departed name
+    # in the basket would measure a sector this book can no longer hold.
+    from .snapshot import _live_ids
+    px = s.execute(
+        select(PriceObservation.company_id, PriceObservation.obs_date,
+               PriceObservation.close)
+        .where(PriceObservation.company_id.in_(_live_ids()),
+               PriceObservation.obs_date >= since)).all()
+    sectors = {c.id: (c.sector, c.ticker) for c in s.scalars(
+        select(Company).where(Company.is_index_member.is_(True))).all()}
+    per_name: dict[str, list] = {}
+    for cid, d_, c in px:
+        meta = sectors.get(cid)
+        if meta:
+            per_name.setdefault(meta[1], []).append((d_, c))
+
+    name_returns = {t: _returns(v) for t, v in per_name.items() if len(v) > 60}
+    name_sector = {meta[1]: meta[0] for meta in sectors.values()}
+    sector_returns: dict[str, list[float]] = {}
+    for tkr, rets in name_returns.items():
+        sec = name_sector.get(tkr)
+        if not sec:
+            continue
+        bucket = sector_returns.setdefault(sec, [])
+        for i, r in enumerate(rets):
+            if i < len(bucket):
+                bucket[i] = (bucket[i] + r) / 2.0     # running equal weight
+            else:
+                bucket.append(r)
+
+    market = _returns(by_symbol.get("^NSEI", []))
+    chain = build_chain(driver, driver_returns, move_pct, market,
+                        sector_returns, name_returns, name_sector)
+    chain["drivers"] = drivers()
+    chain["window_days"] = window
+    return chain
+
+
 @app.get("/api/markets/events")
 def markets_events(s: Session = Depends(db)):
     """Scheduled corporate events for names this book actually cares about.

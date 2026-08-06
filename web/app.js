@@ -2074,6 +2074,7 @@ const MARKET_TABS = [
   ["risk", "Risk (Monte Carlo)"],
   ["relations", "Cross-Asset"], ["valuation", "Valuation Regime"],
   ["flow", "Institutional Flow"], ["events", "Event Calendar"],
+  ["transmission", "Transmission"],
 ];
 
 async function viewMarkets(tab) {
@@ -2088,7 +2089,8 @@ async function viewMarkets(tab) {
     b.addEventListener("click", () => location.hash = `#/markets/${b.dataset.tab}`));
   const body = document.getElementById("mk-body");
   try {
-    if (tab === "events") await renderEvents(body);
+    if (tab === "transmission") await renderTransmission(body);
+    else if (tab === "events") await renderEvents(body);
     else if (tab === "vrp") await renderVrp(body);
     else if (tab === "risk") await renderMarketRisk(body);
     else if (tab === "relations") await renderRelations(body);
@@ -2156,6 +2158,78 @@ async function renderDerivatives(body) {
       </div></div>`;
   const go = document.getElementById("mk-go");
   if (go) go.addEventListener("click", () => renderDerivatives(body));
+}
+
+const VERDICT_STYLE = {
+  confirmed:      ["var(--good-text)", "confirmed"],
+  contradicted:   ["var(--critical)", "CONTRADICTED"],
+  not_detectable: ["var(--muted)", "not detectable"],
+  negligible:     ["var(--muted)", "negligible"],
+  underpowered:   ["var(--muted)", "underpowered"],
+};
+
+function transmissionLink(l, depth) {
+  const [colour, label] = VERDICT_STYLE[l.verdict] || ["var(--muted)", l.verdict];
+  const imp = l.implied;
+  return `
+    <div class="evi" style="margin-left:${depth * 18}px;border-left-color:${colour}">
+      <span class="tier" style="color:${colour};border-color:${colour}">${esc(label)}</span>
+      <strong>${esc(l.ticker || l.label)}</strong>
+      ${l.beta != null ? `<span class="sub"> · β ${signed(l.beta, 3)}` +
+        (l.explains_pct != null ? ` · explains ${l.explains_pct}% of variance` : "") +
+        ` · n=${l.observations}${l.ci95 ? ` · r95 [${l.ci95[0]}, ${l.ci95[1]}]` : ""}</span>` : ""}
+      <div class="sub" style="margin-top:3px">${esc(l.mechanism || "")}</div>
+      <div class="sub" style="color:${colour}">${esc(l.why || "")}</div>
+      ${imp && l.verdict === "confirmed" ? `<div class="base-rate">
+        driver moved ${signed(imp.driver_move_pct)}% → implied ${signed(imp.implied_pct)}%
+        (${esc(imp.confidence)} confidence) · ${esc(imp.caveat)}</div>` : ""}
+    </div>`;
+}
+
+async function renderTransmission(body) {
+  const driver = cache.txDriver || "BZ=F";
+  body.innerHTML = skeleton(5);
+  const d = await api(`/markets/transmission?driver=${encodeURIComponent(driver)}`);
+  const picker = (d.drivers || []).map(([k, label]) =>
+    `<option value="${esc(k)}" ${k === driver ? "selected" : ""}>${esc(label)}</option>`).join("");
+  if (!d.available) {
+    body.innerHTML = `<div class="panel"><select id="tx-driver">${picker}</select>
+      <div class="unavail" style="margin-top:8px">${esc(d.reason || "unavailable")}</div></div>`;
+  } else {
+    const s = d.summary;
+    body.innerHTML = `
+      <div class="panel">
+        <div class="frm"><div><label>Macro driver</label>
+          <select id="tx-driver">${picker}</select></div></div>
+        <h2 style="margin-top:10px">${esc(d.driver_label)}
+          ${d.driver_move_pct != null ? `<span class="sub">observed ${signed(d.driver_move_pct)}% over ~3 months</span>` : ""}</h2>
+        <div class="tiles">
+          <div class="tile"><div class="label">Channels declared</div><div class="value">${s.channels_declared}</div></div>
+          <div class="tile"><div class="label">Confirmed</div><div class="value" style="color:var(--good-text)">${s.confirmed}</div></div>
+          <div class="tile"><div class="label">Contradicted</div><div class="value" style="color:var(--critical)">${s.contradicted}</div></div>
+          <div class="tile"><div class="label">Not detectable</div><div class="value">${s.not_detectable}</div></div>
+        </div>
+        <div class="sub" style="margin-top:8px">${esc(d.reading)}</div>
+      </div>
+      <div class="panel"><h2>1 · Macro → market</h2>
+        ${d.market_links.map(l => transmissionLink(l, 0)).join("") || '<div class="empty">No market-level channel declared.</div>'}
+      </div>
+      <div class="panel"><h2>2 · Macro → sector</h2>
+        ${d.sector_links.map(l => transmissionLink(l, 1)).join("") || '<div class="empty">No sector channel declared for this driver.</div>'}
+      </div>
+      <div class="panel"><h2>3 · Sector → security</h2>
+        <div class="sub" style="margin-bottom:8px">Only names whose SECTOR link was confirmed are
+          measured here. Testing every name against every driver regardless would guarantee
+          false positives — with 50 names something always looks significant.</div>
+        ${d.security_links.map(l => transmissionLink(l, 2)).join("")
+          || '<div class="empty">No sector channel was confirmed, so the chain stops before individual names.</div>'}
+      </div>`;
+  }
+  const sel = document.getElementById("tx-driver");
+  if (sel) sel.addEventListener("change", () => {
+    cache.txDriver = sel.value;
+    renderTransmission(body);
+  });
 }
 
 async function renderEvents(body) {

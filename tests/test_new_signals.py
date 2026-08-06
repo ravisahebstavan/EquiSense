@@ -370,3 +370,65 @@ def test_event_risk_is_a_caveat_not_a_veto():
     assert "failed:" not in window.split("caveat:")[1][:200], (
         "an upcoming result must not hard-fail a candidate")
     assert C.EVENT_RISK_DAYS > 0
+
+
+def _synthetic_chain(follower_beta, expected_driver="BZ=F", seed=3):
+    import random
+    random.seed(seed)
+    n = 300
+    drv = [random.gauss(0, 0.02) for _ in range(n)]
+    fol = [follower_beta * d + random.gauss(0, 0.005) for d in drv]
+    return drv, fol
+
+
+def test_a_link_that_does_not_measure_passes_nothing_downstream():
+    """A chain of plausible mechanisms is a story, and stories are how a
+    research system talks itself into a position. An undetectable link must
+    stop the chain rather than quietly forward its prior."""
+    import random
+
+    from equisense.engine.transmission import build_chain
+
+    random.seed(5)
+    n = 300
+    drv = [random.gauss(0, 0.02) for _ in range(n)]
+    unrelated = [random.gauss(0, 0.02) for _ in range(n)]      # no relationship
+    chain = build_chain("BZ=F", drv, -10.0, unrelated,
+                        {"Energy": unrelated, "Materials": unrelated},
+                        {"AAA": unrelated}, {"AAA": "Energy"})
+
+    assert chain["available"]
+    assert chain["summary"]["confirmed"] == 0
+    # the security leg is only measured off a CONFIRMED sector link
+    assert chain["security_links"] == [], (
+        "names must not be measured against a driver whose sector channel was "
+        "never established — that is fishing")
+
+
+def test_a_wrong_signed_link_is_reported_not_hidden():
+    """The most valuable output here is the mechanism everyone believes that
+    this market does not honour. Dropping it would leave the chain looking
+    cleaner than the evidence is."""
+    from equisense.engine.transmission import CHANNELS, build_chain
+
+    exp = next(c for c in CHANNELS if c.driver == "BZ=F" and c.sector == "Materials")
+    assert exp.expected_sign == -1
+    drv, fol = _synthetic_chain(+0.9)          # opposite of the declared sign
+    chain = build_chain("BZ=F", drv, -10.0, drv, {"Materials": fol})
+
+    link = next(l for l in chain["sector_links"] if l["sector"] == "Materials")
+    assert link["verdict"] == "contradicted"
+    assert chain["summary"]["contradicted"] >= 1
+    assert "OPPOSITE" in link["why"]
+
+
+def test_implied_move_is_never_presented_as_a_forecast():
+    """It is the arithmetic of a measured sensitivity applied to a move that
+    already happened — exposure carried, not a prediction."""
+    from equisense.engine.transmission import implied_move
+
+    m = implied_move(-0.5, -20.0, 0.30)
+    assert m["implied_pct"] == 10.0
+    assert "ALREADY occurred" in m["caveat"]
+    assert "not a prediction" in m["caveat"]
+    assert implied_move(None, -20.0, 0.3) is None
