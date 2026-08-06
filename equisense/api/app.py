@@ -1032,10 +1032,27 @@ def cron_refresh(s: Session = Depends(db)):
                                 "exits": len(auto["exits"])}
     stage("pruned", lambda: prune(s))
 
-    # 7. The most expensive stage and the most recomputable one, so it is the
-    #    correct thing to sacrifice on a heavy day: base rates are 10-year
-    #    statistics, and yesterday's are not meaningfully worse than today's.
-    stage("base_rate_records", lambda: run_all_studies(s)["records"])
+    # 7. The most expensive stage and the most recomputable one, so it is both
+    #    the correct thing to sacrifice on a heavy day AND the wrong thing to
+    #    repeat daily. It reloads the ENTIRE price table — unfiltered, because
+    #    survivorship correction needs the delisted names — which on a database
+    #    that meters data transfer is the single largest recurring cost in the
+    #    system, roughly 60 MB a run. Base rates are ten-year statistics: doing
+    #    that every day bought a number that had not moved.
+    from ..models import BaseRateRecord
+    from .status import STALE_STUDY_DAYS
+    _computed = s.scalar(select(func.max(BaseRateRecord.computed_at)))
+    _due = (_computed is None
+            or (date.today() - _computed.date()).days >= STALE_STUDY_DAYS)
+    if _due:
+        stage("base_rate_records", lambda: run_all_studies(s)["records"])
+    else:
+        age = (date.today() - _computed.date()).days
+        out["base_rate_records"] = {
+            "skipped": f"studies are {age}d old; recomputed every "
+                       f"{STALE_STUDY_DAYS}d. Ten-year statistics do not move "
+                       "on one session, and the full-panel reload is the "
+                       "largest recurring data transfer in the system."}
 
     out["elapsed_s"] = round(_time.monotonic() - t0, 1)
     out["budget_s"] = CRON_BUDGET_S

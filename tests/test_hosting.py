@@ -1007,3 +1007,22 @@ def test_dashboard_reads_the_snapshot_not_raw_price_history():
     assert "get_universe" in src
     assert "PriceObservation" not in src, (
         "the dashboard must not touch the price table directly")
+
+
+def test_base_rates_are_not_recomputed_every_single_day():
+    """run_all_studies reloads the ENTIRE price table — unfiltered, because
+    survivorship correction needs the delisted names — at roughly 60 MB a run.
+    On a database that meters data transfer that is the single largest
+    recurring cost in the system, and doing it daily bought a number that had
+    not moved: these are ten-year statistics.
+    """
+    import inspect
+
+    from equisense.api import app as app_mod
+    from equisense.api.status import STALE_STUDY_DAYS
+
+    src = inspect.getsource(app_mod.cron_refresh)
+    assert "STALE_STUDY_DAYS" in src, "the studies stage must be gated on age"
+    i = src.find("base_rate_records")
+    assert "if _due:" in src[:i], "the gate has to precede the stage"
+    assert STALE_STUDY_DAYS >= 7
