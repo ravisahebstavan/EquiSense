@@ -144,7 +144,18 @@ async function refreshStatusStrip() {
   const el = document.getElementById("status-strip");
   try {
     const [st, rg] = await Promise.all([api("/live/status"), api("/live/regime")]);
+    /* Research and Lab don't move with quotes, but they DO go stale the moment
+       the pipeline lands new prices or recomputes studies. Fingerprint what
+       they actually render off, and silently redraw only when it changes —
+       otherwise those pages showed yesterday's studies until a manual reload,
+       which on a page whose whole job is data trust is the worst place to be
+       quietly wrong. */
+    const stamp = [st.datasets.prices.latest, st.datasets.prices.rows,
+                   st.datasets.base_rates.computed_at, st.datasets.ledger.records].join("|");
+    const moved = cache.dataStamp !== undefined && cache.dataStamp !== stamp;
+    cache.dataStamp = stamp;
     cache.status = st; cache.regime = rg;
+    if (moved && !LIVE_VIEWS.has(currentView()) && !isEditingForm()) route({ silent: true });
     maybeAutoRefresh(st);
     const p = st.datasets.prices;
     const warn = st.warnings.length
@@ -2306,13 +2317,31 @@ async function renderFlow(body) {
 
 /* ============================================================== routing */
 
-async function route() {
+/* Views whose numbers move with live quotes. Lab and Research render study
+   output that only changes when the PIPELINE runs, so re-rendering them on a
+   quote tick would refetch heavy endpoints and fight the user's scroll to
+   redraw identical figures. They refresh when the data behind them actually
+   changes instead — see refreshStatusStrip. */
+const LIVE_VIEWS = new Set(["dashboard", "companies", "portfolio", "trading", "markets"]);
+
+function currentView() {
+  return (location.hash.replace(/^#\//, "") || "dashboard").split("/")[0];
+}
+
+async function route(opts) {
+  /* opts.silent: redraw in place for an automatic refresh — no skeleton flash,
+     scroll position preserved. Called with a hashchange Event for real
+     navigation, where `silent` is simply absent. */
+  const silent = !!(opts && opts.silent === true);
   const parts = (location.hash.replace(/^#\//, "") || "dashboard").split("/");
   const [name, arg, sub] = parts;
+  const scrollY = window.scrollY;
   document.querySelectorAll("#nav a").forEach(a =>
     a.classList.toggle("active", a.dataset.route === name));
-  app.innerHTML = `<div class="skel" style="height:22px;width:220px;margin:4px 0 16px"></div>
-    ${skeleton(5)}<div class="grid2">${skeleton(4)}${skeleton(4)}</div>`;
+  if (!silent) {
+    app.innerHTML = `<div class="skel" style="height:22px;width:220px;margin:4px 0 16px"></div>
+      ${skeleton(5)}<div class="grid2">${skeleton(4)}${skeleton(4)}</div>`;
+  }
   try {
     if (name === "companies" && arg) await viewCompanyDetail(parseInt(arg), sub || "overview");
     else if (name === "companies") await viewCompanies();
@@ -2327,6 +2356,7 @@ async function route() {
       <div class="sub" style="margin-top:6px">If this is a data problem, the
       <a href="#/lab/data">data health page</a> is the place to start.</div></div>`;
   }
+  if (silent) window.scrollTo(0, scrollY);
 }
 
 async function quoteLoop() {
@@ -2335,12 +2365,13 @@ async function quoteLoop() {
     cache.market = q.market;
     cache.quotes = q.prices;
     cache.quotesAt = new Date();
-    /* Re-render whatever is on screen, not just the trading desk. Quotes were
-       being fetched every 5 minutes on every page and then thrown into the
-       cache while the view kept showing the numbers it rendered on load — so
-       the site looked frozen everywhere except one tab. The form guard stays:
-       never yank the DOM out from under an in-progress edit. */
-    if (!isEditingForm()) route();
+    /* Re-render the market-facing views, not just the trading desk. Quotes
+       were being fetched every 5 minutes on every page and then thrown into
+       the cache while the view kept showing the numbers it rendered on load —
+       so the site looked frozen everywhere except one tab. Silent redraw, so
+       an automatic refresh never flashes a skeleton or moves the scroll, and
+       never yanks the DOM out from under an in-progress edit. */
+    if (LIVE_VIEWS.has(currentView()) && !isEditingForm()) await route({ silent: true });
     refreshStatusStrip();
   } catch { /* quotes are best-effort; status strip reports staleness */ }
 }
