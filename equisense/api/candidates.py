@@ -22,6 +22,11 @@ from .live import (_corr, cluster_correlation, current_regime,
                    universe_signals, within_cluster_effective_n)
 from .snapshot import get_universe
 
+# A scheduled result inside this window is flagged on the candidate. Roughly a
+# fortnight: long enough to catch the run-up, short enough that most of the
+# universe is not permanently caveated into meaninglessness.
+EVENT_RISK_DAYS = 14
+
 # Naive/risk-parity-style concentration heuristic: two names correlated above
 # this on trailing daily returns are treated as one bet, not two — a common
 # threshold in practitioner diversification rules (e.g. Qian's risk-budgeting
@@ -203,6 +208,13 @@ def qualified_candidates(session: Session, top_n: int = 8,
     eff_n = within_cluster_effective_n(session)
     # what each signal's OWN quantile study found wrong with it, if anything
     fc = factor_caveats(session)
+    # Once per scan, never per name, and never fatal: an unreachable
+    # calendar must cost this run a caveat, not the whole scan.
+    try:
+        from ..ingestion.nse_events import fetch_event_calendar
+        event_cal = fetch_event_calendar()
+    except Exception:                              # noqa: BLE001
+        event_cal = {"available": False, "events": {}}
     regime = current_regime(session)
     rk = regime["conditioning_key"]
     br_cache = {
@@ -304,6 +316,19 @@ def qualified_candidates(session: Session, top_n: int = 8,
         # gate 3: affordability in the paper account
         if cash is not None and sizing["recommended_value"] > cash:
             gates.append(f"failed: recommended size exceeds available cash")
+        # gate 4: scheduled event risk. Nothing in the evidence stack can see a
+        # results date — momentum and valuation read identically the day before
+        # earnings and the day after — so a position could be opened into a
+        # binary event the exchange had already published. A caveat, not a
+        # veto: the event is a fact about uncertainty, not about direction.
+        nxt = (event_cal.get("events") or {}).get(item["ticker"].upper())
+        if nxt:
+            e = nxt[0]
+            if e["days_away"] <= EVENT_RISK_DAYS:
+                gates.append(
+                    f"caveat: {e['purpose'] or 'scheduled event'} on {e['date']} "
+                    f"({e['days_away']}d away) — entering now takes the outcome "
+                    "of a binary event no signal here can read")
 
         failed = any(g.startswith("failed") for g in gates)
         drivers = sorted([e for e in E if e.direction != "shadow"],

@@ -2073,7 +2073,7 @@ const MARKET_TABS = [
   ["derivatives", "Derivatives"], ["vrp", "Variance Premium"],
   ["risk", "Risk (Monte Carlo)"],
   ["relations", "Cross-Asset"], ["valuation", "Valuation Regime"],
-  ["flow", "Institutional Flow"],
+  ["flow", "Institutional Flow"], ["events", "Event Calendar"],
 ];
 
 async function viewMarkets(tab) {
@@ -2088,7 +2088,8 @@ async function viewMarkets(tab) {
     b.addEventListener("click", () => location.hash = `#/markets/${b.dataset.tab}`));
   const body = document.getElementById("mk-body");
   try {
-    if (tab === "vrp") await renderVrp(body);
+    if (tab === "events") await renderEvents(body);
+    else if (tab === "vrp") await renderVrp(body);
     else if (tab === "risk") await renderMarketRisk(body);
     else if (tab === "relations") await renderRelations(body);
     else if (tab === "valuation") await renderValuationRegime(body);
@@ -2155,6 +2156,40 @@ async function renderDerivatives(body) {
       </div></div>`;
   const go = document.getElementById("mk-go");
   if (go) go.addEventListener("click", () => renderDerivatives(body));
+}
+
+async function renderEvents(body) {
+  const d = await api("/markets/events");
+  if (!d.available) {
+    body.innerHTML = `<div class="panel"><div class="unavail">Event calendar unavailable —
+      ${esc(d.reason || "the exchange feed could not be reached")}.</div>
+      <div class="sub" style="margin-top:6px">This is not a statement that there is no
+      event risk; it means the calendar could not be read.</div></div>`;
+    return;
+  }
+  const row = (e, showDir) => `
+    <div class="metric-row" style="cursor:default">
+      <span class="m-label"><strong>${esc(e.ticker)}</strong>${showDir && e.direction
+        ? ` <span class="chip ${e.direction === "short" ? "grey" : "active"}">${esc(e.direction)} ${Math.abs(e.quantity)}</span>` : ""}
+        · ${esc(e.purpose || "scheduled event")}
+        <div class="sub">${esc(e.detail || "")}</div></span>
+      <span class="m-value" style="color:${e.days_away <= 7 ? "var(--critical)" : "inherit"}">
+        ${esc(e.date)}</span>
+      <span class="m-unit">${e.days_away}d</span></div>`;
+
+  body.innerHTML = `
+    <div class="panel"><h2>Open positions with a scheduled event</h2>
+      <div class="sub" style="margin-bottom:8px">Momentum and valuation read identically
+        the day before a result and the day after — nothing in the evidence stack can see
+        a results date. These are the positions currently carrying one.</div>
+      ${d.held_with_events.length ? d.held_with_events.map(e => row(e, true)).join("")
+        : '<div class="empty">No open position has a published event ahead of it.</div>'}
+    </div>
+    <div class="panel"><h2>Next ${d.upcoming.length} across the exchange
+      <span class="sub">(${d.symbols} symbols scheduled)</span></h2>
+      ${d.upcoming.map(e => row(e, false)).join("")}
+      <div class="sub" style="margin-top:8px">${esc(d.note || "")}</div>
+    </div>`;
 }
 
 async function renderVrp(body) {

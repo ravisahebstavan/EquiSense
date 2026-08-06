@@ -1104,6 +1104,36 @@ def storage_view(universe_size: int = 50, s: Session = Depends(db)):
             "projection": projected_headroom(s, max(10, min(universe_size, 2000)))}
 
 
+@app.get("/api/markets/events")
+def markets_events(s: Session = Depends(db)):
+    """Scheduled corporate events for names this book actually cares about.
+
+    Live from NSE's published calendar, never stored (§5.2). Annotated onto the
+    open paper positions, because holding into a result you did not know was
+    coming is a risk the evidence stack cannot see: momentum and valuation read
+    identically the day before earnings and the day after.
+    """
+    from ..ingestion.nse_events import fetch_event_calendar
+    from .paper import account
+
+    cal = fetch_event_calendar()
+    events = cal.get("events") or {}
+    held = []
+    if cal.get("available"):
+        for p in account(s, include_curve=False)["positions"]:
+            evs = events.get(p["ticker"].upper())
+            if evs:
+                held.append({"ticker": p["ticker"], "direction": p["direction"],
+                             "quantity": p["quantity"], **evs[0]})
+        held.sort(key=lambda e: e["days_away"])
+    upcoming = sorted(
+        ({"ticker": t, **evs[0]} for t, evs in events.items() if evs),
+        key=lambda e: e["days_away"])[:60]
+    return {"available": cal.get("available"), "reason": cal.get("reason"),
+            "note": cal.get("note"), "symbols": cal.get("symbols", 0),
+            "held_with_events": held, "upcoming": upcoming}
+
+
 @app.get("/api/markets/vrp")
 def markets_vrp(symbol: str = "NIFTY", horizon_days: int = 21,
                 s: Session = Depends(db)):

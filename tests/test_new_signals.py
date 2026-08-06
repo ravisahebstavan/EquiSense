@@ -336,3 +336,37 @@ def test_rolling_topk_mean_matches_the_naive_form_exactly():
         assert (old.isna() == new.isna()).all().all(), f"{name}: NaN pattern differs"
         delta = (old - new).abs().max().max()
         assert not (delta == delta) or delta < 1e-12, f"{name}: values differ by {delta}"
+
+
+def test_event_calendar_fails_open_and_says_so(monkeypatch):
+    """An unreachable calendar must not halt the book — but it must never be
+    mistaken for "no event scheduled". Reporting absence of knowledge as
+    absence of risk is the failure mode that matters here."""
+    import equisense.ingestion.nse_events as EV
+
+    EV._CACHE.update(at=0.0, payload=None)
+    monkeypatch.setattr(EV, "_opener", lambda: (_ for _ in ()).throw(OSError("blocked")))
+    out = EV.fetch_event_calendar(force=True)
+
+    assert out["available"] is False
+    assert out["events"] == {}
+    assert "NOT a statement that there is none" in out["note"]
+    assert EV.next_event("ITC", out) is None
+
+
+def test_event_risk_is_a_caveat_not_a_veto():
+    """A scheduled result is a fact about UNCERTAINTY, not about direction.
+    Vetoing on it would abstain through every earnings season; ignoring it lets
+    a position be opened into a binary event the exchange already published."""
+    import inspect
+
+    from equisense.api import candidates as C
+
+    src = inspect.getsource(C.qualified_candidates)
+    idx = src.find("days_away")
+    assert idx != -1, "event risk must be consulted in the gate stack"
+    window = src[idx - 400:idx + 400]
+    assert "caveat:" in window, "event risk must be raised as a caveat"
+    assert "failed:" not in window.split("caveat:")[1][:200], (
+        "an upcoming result must not hard-fail a candidate")
+    assert C.EVENT_RISK_DAYS > 0
