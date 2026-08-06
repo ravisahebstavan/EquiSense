@@ -471,3 +471,50 @@ def test_short_stop_fires_above_entry_not_below(world, monkeypatch):
     assert rep["exits"][0]["direction"] == "short"
     assert "above" in rep["exits"][0]["reason"]
     assert account(s)["positions"] == [], "cover must flatten the position"
+
+
+def _force_vix_pctile(monkeypatch, pctile):
+    import equisense.api.live as live_mod
+    monkeypatch.setattr(live_mod, "current_regime", lambda s: {
+        "label": "test", "conditioning_key": "test",
+        "components": [{"key": "vix_percentile", "value": pctile}]})
+
+
+def test_autopilot_stops_adding_exposure_when_the_price_of_risk_spikes(world, monkeypatch):
+    """The loss this prevents: the diversification gate treats two names
+    correlated above 0.75 as one bet, but measures correlation over a TRAILING
+    window. In an Indian equity crash cross-sectional correlation converges
+    toward 0.9 across the board, so a book assembled as independent bets in a
+    calm regime becomes one leveraged bet on index beta exactly when that
+    matters — and a cash account cannot hedge it, because Indian retail cannot
+    hold a short equity position overnight.
+
+    Conditioning on VIX here is not market timing: the position COUNT is not a
+    forecast of direction. It refuses to add new exposure while the price of
+    risk says diversification is about to stop working.
+    """
+    s, a, b = world
+    from equisense.api.autopilot import VIX_HALT_PCTILE, run_autopilot, set_config
+
+    _force_long(monkeypatch, ["AAA", "BBB"])
+    _force_vix_pctile(monkeypatch, VIX_HALT_PCTILE + 5)
+    set_config(s, {"enabled": True, "max_new_per_run": 2, "max_open_positions": 8})
+
+    rep = run_autopilot(s)
+    assert rep["entries"] == [], "no new exposure may be opened in a halt regime"
+    assert any("regime halt" in x for x in rep["skipped"]), rep["skipped"]
+
+
+def test_calm_regime_still_trades(world, monkeypatch):
+    """The guard must not become a permanent off switch — if it fired in calm
+    conditions it would silently convert the book to cash forever."""
+    s, a, b = world
+    from equisense.api.autopilot import run_autopilot, set_config
+
+    _force_long(monkeypatch, ["AAA"])
+    _force_vix_pctile(monkeypatch, 30.0)
+    set_config(s, {"enabled": True, "max_new_per_run": 1, "max_open_positions": 8})
+
+    rep = run_autopilot(s)
+    assert len(rep["entries"]) == 1, rep
+    assert not any("regime" in x for x in rep["skipped"])

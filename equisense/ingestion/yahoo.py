@@ -43,7 +43,48 @@ def _f(df, labels: list[str], col) -> float | None:
     return None
 
 
-def sync_universe(session: Session, index_key: str = "nifty50") -> dict[str, int]:
+def active_index_key(session: Session, default: str = "nifty500") -> str:
+    """Which NSE index defines the live analytical universe.
+
+    Defaults to the BROADEST index rather than NIFTY 50, because universe size
+    is the binding constraint on this platform's ability to learn anything. The
+    calibration gates need scored claims, claims come from names, and a 50-name
+    cross-section produces them roughly ten times slower than a 500-name one —
+    while also giving percentile normalisation only 50 points to rank against,
+    which makes every "top quintile" a 10-name bet.
+    """
+    from ..models import AppSnapshot
+    row = session.get(AppSnapshot, "universe_index")
+    if row is None:
+        return default
+    try:
+        import json as _json
+        return (_json.loads(row.payload) or {}).get("index_key") or default
+    except Exception:                                  # noqa: BLE001
+        return default
+
+
+def set_index_key(session: Session, index_key: str) -> str:
+    import json as _json
+
+    from ..models import AppSnapshot
+    from .universe import INDEX_CAP_BAND
+    key = (index_key or "").strip().lower()
+    if key not in INDEX_CAP_BAND:
+        raise ValueError(f"unknown index {index_key!r}; "
+                         f"choose from {sorted(INDEX_CAP_BAND)}")
+    row = session.get(AppSnapshot, "universe_index")
+    payload = _json.dumps({"index_key": key})
+    if row is None:
+        session.add(AppSnapshot(key="universe_index", as_of=str(date.today()),
+                                payload=payload))
+    else:
+        row.payload, row.as_of = payload, str(date.today())
+    session.commit()
+    return key
+
+
+def sync_universe(session: Session, index_key: str | None = None) -> dict[str, int]:
     """Create/refresh Company rows from the EXCHANGE'S OWN index membership.
 
     Membership, industry classification and ISINs come from NSE's published
@@ -52,9 +93,12 @@ def sync_universe(session: Session, index_key: str = "nifty50") -> dict[str, int
     fallback and the fallback is reported, never silent — analysing a stale
     membership list means holding names the index dropped and missing the ones
     it added.
+
+    The index is configuration, not a constant: see active_index_key.
     """
     from .universe import resolve_universe
 
+    index_key = index_key or active_index_key(session)
     universe, source = resolve_universe(index_key)
     log.info("universe source: %s", source)
     fell_back = "FALLBACK" in source

@@ -1875,6 +1875,18 @@ async function viewLab(section = "hypotheses") {
     document.getElementById("score-claims").addEventListener("click", async (e) => {
       e.target.disabled = true; await api("/live/score", { method: "POST" }); viewLab("calibration");
     });
+    const uniBtn = document.getElementById("uni-save");
+    if (uniBtn) uniBtn.addEventListener("click", async () => {
+      const msg = document.getElementById("uni-msg");
+      uniBtn.disabled = true; msg.textContent = "re-syncing membership…";
+      try {
+        const r = await api("/universe", { method: "PUT", body: JSON.stringify({
+          index_key: document.getElementById("uni-index").value })});
+        msg.textContent = `Universe is now ${r.index_key} — ${r.live_members} live members. ${r.note}`;
+        toast(`Universe set to ${r.index_key} (${r.live_members} names)`);
+      } catch (e) { msg.textContent = "Failed: " + e.message; }
+      finally { uniBtn.disabled = false; }
+    });
   } else if (section === "backtest") {
     const bt = await api("/backtest/strategy");
     body.innerHTML = (bt.error || !bt.vol_managed_overlay)
@@ -1926,9 +1938,25 @@ async function viewLab(section = "hypotheses") {
       await api("/backtest/strategy?refresh=true"); viewLab("backtest");
     });
   } else if (section === "data") {
-    const st = await api("/live/status");
+    const [st, uni] = await Promise.all([api("/live/status"), api("/universe")]);
     const p = st.datasets.prices, f = st.datasets.fundamentals;
     body.innerHTML = `
+      <div class="panel"><h2>Analytical universe</h2>
+        <div class="sub" style="margin-bottom:8px">Universe size is the binding constraint on
+          learning. Claims come from names: a 50-name cross-section produces them roughly ten
+          times slower than a 500-name one, and gives percentile ranking only 50 points to rank
+          against — which makes every "top quintile" a 10-name bet.</div>
+        <div class="frm">
+          <div><label>NSE index</label><select id="uni-index">
+            ${uni.choices.map(k => `<option value="${esc(k)}" ${k === uni.index_key ? "selected" : ""}>${esc(k)}</option>`).join("")}
+          </select></div>
+          <div><label>Live members</label><input value="${uni.live_members}" disabled></div>
+          <div><label>Companies with history</label><input value="${uni.companies_known}" disabled></div>
+        </div>
+        <button class="primary" id="uni-save">Apply universe</button>
+        <span class="sub" style="margin-left:10px">${esc(uni.note)}</span>
+        <div id="uni-msg" class="sub" style="margin-top:6px"></div>
+      </div>
       <div class="grid2">
         <div class="panel"><h2>Data quality — decomposed, never a mystery number</h2>
           <div class="tiles" style="grid-template-columns:1fr 1fr">

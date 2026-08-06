@@ -33,6 +33,14 @@ LAST_RUN_KEY = "autopilot_last"
 DEFAULTS = {"enabled": False, "max_new_per_run": 2, "max_open_positions": 8,
             "cash_reserve_pct": 10.0, "time_exit_days": 185}
 
+# India VIX percentile within its own trailing 3y range, above which the book
+# stops ADDING exposure. Percentile rather than an absolute level because 20 on
+# the VIX means something different in 2020 than in 2026; the distribution is
+# the honest reference. Existing positions keep exiting on their own triggers —
+# this caps new risk, it does not liquidate.
+VIX_DERISK_PCTILE = 75.0
+VIX_HALT_PCTILE = 90.0
+
 
 def get_config(session: Session) -> dict:
     row = session.get(AppSnapshot, CONFIG_KEY)
@@ -158,7 +166,7 @@ def register_daily_forecasts(session: Session, top_n: int = 6) -> dict:
 
 def run_autopilot(session: Session, force: bool = False) -> dict:
     from .candidates import qualified_candidates
-    from .live import build_dossier
+    from .live import build_dossier, current_regime
     from .paper import account, place_trade
     from .snapshot import get_universe
 
@@ -221,6 +229,33 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
     open_names = {p["ticker"] for p in acct["positions"]}
     reserve = acct["equity"] * cfg["cash_reserve_pct"] / 100
     cash = acct["cash"]
+
+    # Regime-conditional exposure cap. The diversification gate treats two names
+    # correlated above 0.75 as one bet, but it measures correlation over a
+    # TRAILING window — and in an Indian equity crash cross-sectional
+    # correlation goes to ~0.9 across the board. So a book assembled as five
+    # independent bets in a calm regime becomes one leveraged bet on index beta
+    # precisely when that matters, and a cash account cannot hedge it: shorting
+    # equity delivery overnight is not available to Indian retail.
+    #
+    # Conditioning on VIX is not market timing — the position count is not a
+    # forecast of direction. It is refusing to add NEW exposure while the price
+    # of risk says diversification is about to stop working.
+    max_open = cfg["max_open_positions"]
+    vix_pct = next((c.get("value") for c in current_regime(session)["components"]
+                    if c.get("key") == "vix_percentile"), None)
+    if vix_pct is not None and vix_pct >= VIX_HALT_PCTILE:
+        max_open = len(open_names)          # hold what is held; add nothing
+        report["skipped"].append(
+            f"regime halt: India VIX at the {vix_pct:.0f}th percentile of its "
+            f"3y range (≥{VIX_HALT_PCTILE}) — cross-sectional correlation "
+            "converges in stress, so new positions would concentrate rather "
+            "than diversify. Existing positions still exit on their own rules.")
+    elif vix_pct is not None and vix_pct >= VIX_DERISK_PCTILE:
+        max_open = max(len(open_names), max_open // 2)
+        report["skipped"].append(
+            f"regime de-risk: India VIX at the {vix_pct:.0f}th percentile "
+            f"(≥{VIX_DERISK_PCTILE}) — open-position cap halved to {max_open}.")
     cands = qualified_candidates(session, top_n=10,
                                  book_value=acct["equity"], cash=cash)
     new_count = 0
@@ -229,9 +264,9 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
             report["skipped"].append(f"{c['ticker']}: run cap reached "
                                      f"({cfg['max_new_per_run']} new positions/run)")
             continue
-        if len(open_names) >= cfg["max_open_positions"]:
+        if len(open_names) >= max_open:
             report["skipped"].append(f"{c['ticker']}: portfolio at max "
-                                     f"{cfg['max_open_positions']} open positions")
+                                     f"{max_open} open positions")
             continue
         if c["ticker"] in open_names:
             report["skipped"].append(f"{c['ticker']}: already held — no pyramiding")

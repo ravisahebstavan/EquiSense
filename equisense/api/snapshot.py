@@ -75,25 +75,38 @@ def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
     `closes` is the TOTAL-RETURN series (returns/momentum/vol basis);
     `nominal_closes` is split-adjusted only and is what anything dividing a
     price by a per-share accounting figure must use. See PriceObservation.
+
+    Streamed rather than materialised: ``.all()`` builds a Row object per bar
+    before any of it is used, which is affordable for a 50-name universe and is
+    not for a 500-name one — the same shape of cost that put the snapshot over
+    the platform's function limit at >285s. Iterating the result keeps one row
+    alive at a time and lets the lists be built directly.
     """
-    rows = session.execute(
+    result = session.execute(
         select(PriceObservation.company_id, PriceObservation.obs_date,
                PriceObservation.close, PriceObservation.volume,
                PriceObservation.close_raw, PriceObservation.open_price,
                PriceObservation.high_price, PriceObservation.low_price)
         .where(PriceObservation.company_id.in_(_live_ids()))
-        .order_by(PriceObservation.company_id, PriceObservation.obs_date)).all()
+        .order_by(PriceObservation.company_id, PriceObservation.obs_date)
+    ).yield_per(20_000)
     out: dict[int, tuple] = {}
-    for cid, d, c, v, raw, op, hi, lo in rows:
-        if cid not in out:
-            out[cid] = ([], [], [], [], [], [], [])
-        out[cid][0].append(d)
-        out[cid][1].append(c)
-        out[cid][2].append(v)
-        out[cid][3].append(raw)
-        out[cid][4].append(op)
-        out[cid][5].append(hi)
-        out[cid][6].append(lo)
+    cur_id, cur = None, None
+    for cid, d, c, v, raw, op, hi, lo in result:
+        # Ordered by company, so the bucket is looked up once per NAME rather
+        # than once per bar — a dict lookup a million times is not free either.
+        if cid != cur_id:
+            cur = out.get(cid)
+            if cur is None:
+                cur = out[cid] = ([], [], [], [], [], [], [])
+            cur_id = cid
+        cur[0].append(d)
+        cur[1].append(c)
+        cur[2].append(v)
+        cur[3].append(raw)
+        cur[4].append(op)
+        cur[5].append(hi)
+        cur[6].append(lo)
     return out
 
 

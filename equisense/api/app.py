@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..ai import narrator
@@ -1102,6 +1102,48 @@ def storage_view(universe_size: int = 50, s: Session = Depends(db)):
     from ..ingestion.retention import projected_headroom, storage_report
     return {"report": storage_report(s),
             "projection": projected_headroom(s, max(10, min(universe_size, 2000)))}
+
+
+class UniverseIn(BaseModel):
+    index_key: str
+
+
+@app.get("/api/universe")
+def universe_state(s: Session = Depends(db)):
+    """Which NSE index defines the live analytical universe, and the options.
+
+    Universe size is the binding constraint on this system's ability to learn.
+    Claims come from names; a 50-name cross-section produces them roughly ten
+    times slower than a 500-name one, and gives percentile normalisation only
+    50 points to rank against — which makes every "top quintile" a 10-name bet.
+    """
+    from ..ingestion.universe import INDEX_CAP_BAND
+    from ..ingestion.yahoo import active_index_key
+    live = s.scalar(select(func.count()).select_from(Company)
+                    .where(Company.is_index_member.is_(True))) or 0
+    known = s.scalar(select(func.count()).select_from(Company)) or 0
+    return {"index_key": active_index_key(s),
+            "choices": sorted(INDEX_CAP_BAND),
+            "live_members": live, "companies_known": known,
+            "note": ("Changing this takes effect on the next universe sync "
+                     "(Sync or Refresh). Departed names keep their price "
+                     "history — they leave the live cross-section, they are "
+                     "never deleted.")}
+
+
+@app.put("/api/universe")
+def universe_set(body: UniverseIn, s: Session = Depends(db)):
+    _reject_if_ephemeral()
+    from ..ingestion.yahoo import set_index_key, sync_universe
+    try:
+        key = set_index_key(s, body.index_key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    ids = sync_universe(s, index_key=key)
+    from .snapshot import invalidate_universe_cache
+    invalidate_universe_cache()
+    return {"index_key": key, "live_members": len(ids),
+            "note": "Universe re-synced. Run Refresh to ingest any new names' history."}
 
 
 @app.get("/api/markets/transmission")
