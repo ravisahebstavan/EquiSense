@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import yfinance as yf
 from sqlalchemy import func, select, text
@@ -271,6 +271,12 @@ def _refresh_period(session: Session, ids: dict[str, int]) -> str:
     return "2y"
 
 
+# Yahoo period string -> calendar days, for sizing the prefetch of existing
+# bars. Generous on purpose: over-fetching by a few days costs one small query,
+# under-fetching silently reintroduces the per-bar SELECT.
+PERIOD_DAYS = {"5d": 12, "1mo": 45, "3mo": 130, "6mo": 260, "1y": 400}
+
+
 def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
     """Near-live price refresh: re-fetch recent daily bars and UPSERT — today's
     running bar updates intraday (Yahoo serves the live running candle,
@@ -286,6 +292,23 @@ def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
                        progress=False, group_by="ticker", threads=True)
     updated = inserted = 0
     latest_prices: dict[str, float] = {}
+
+    # Every bar in the window that ALREADY exists, in one round trip keyed by
+    # (company, date). This previously issued a SELECT per bar per name — at 500
+    # names over a five-day window that is ~2,500 queries, each returning a full
+    # entity, on a path that runs in the cron AND every five minutes while a tab
+    # is open. On a database that meters data transfer, a hot loop pulling whole
+    # rows to decide whether to write them is the most expensive way possible to
+    # do nothing: the common case is that the bar is already correct.
+    existing: dict[tuple[int, date], PriceObservation] = {}
+    if ids:
+        cutoff = date.today() - timedelta(days=PERIOD_DAYS.get(period, 400))
+        for row in session.scalars(
+                select(PriceObservation)
+                .where(PriceObservation.company_id.in_(list(ids.values())),
+                       PriceObservation.obs_date >= cutoff)).all():
+            existing[(row.company_id, row.obs_date)] = row
+
     for t, sym in zip(ids, symbols):
         cid = ids[t]
         try:
@@ -300,10 +323,7 @@ def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
             v = None if v is None or math.isnan(v) else float(v)
             adj = total_ret.get(d)
             adj = float(nom) if adj is None or math.isnan(adj) else float(adj)
-            row = session.execute(
-                select(PriceObservation)
-                .where(PriceObservation.company_id == cid,
-                       PriceObservation.obs_date == d.date())).scalar_one_or_none()
+            row = existing.get((cid, d.date()))
             if row is None:
                 session.add(PriceObservation(company_id=cid, obs_date=d.date(),
                                              close=adj, close_raw=float(nom),

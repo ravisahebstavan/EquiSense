@@ -969,3 +969,41 @@ def test_snapshot_does_not_pull_ten_years_of_ohlc():
     for col in ("open_price", "high_price", "low_price"):
         assert col not in head, (
             f"{col} is still being pulled across the entire history")
+
+
+def test_quote_refresh_prefetches_instead_of_querying_per_bar():
+    """refresh_quotes issued a SELECT per bar per name to decide whether that
+    bar needed writing. At 500 names over a five-day window that is ~2,500
+    round trips, each returning a full entity — on a path that runs in the cron
+    AND every five minutes while a tab is open.
+
+    On a database that meters DATA TRANSFER, a hot loop pulling whole rows to
+    discover that the common case needs no write at all is the most expensive
+    way possible to do nothing.
+    """
+    import inspect
+
+    from equisense.ingestion import yahoo
+
+    src = inspect.getsource(yahoo.refresh_quotes)
+    body = src[src.find("for t, sym in zip"):]
+    assert "select(PriceObservation)" not in body, (
+        "the per-bar SELECT is back inside the loop")
+    assert "existing.get((cid, d.date()))" in body, (
+        "existing bars must come from a single prefetched map")
+    assert "PERIOD_DAYS" in src, "the prefetch must be bounded by the window"
+
+
+def test_dashboard_reads_the_snapshot_not_raw_price_history():
+    """The list views must never reconstruct signals from raw bars. They read
+    ONE precomputed AppSnapshot row, which is what keeps a 500-name dashboard
+    off the metered path entirely — the browser payload is Vercel egress, which
+    is not the constrained resource."""
+    import inspect
+
+    from equisense.api import services
+
+    src = inspect.getsource(services.dashboard)
+    assert "get_universe" in src
+    assert "PriceObservation" not in src, (
+        "the dashboard must not touch the price table directly")
