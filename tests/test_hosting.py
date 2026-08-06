@@ -1026,3 +1026,35 @@ def test_base_rates_are_not_recomputed_every_single_day():
     i = src.find("base_rate_records")
     assert "if _due:" in src[:i], "the gate has to precede the stage"
     assert STALE_STUDY_DAYS >= 7
+
+
+def test_heavy_loaders_report_how_much_they_read():
+    """The quota that took this deployment down was exhausted invisibly. Every
+    cost in the system had been instrumented in rows and SECONDS — the cron
+    logs per-stage duration — but nothing anywhere reported the VOLUME of a
+    read, so no measurement existed that could have seen it coming.
+
+    Self-reported by the loaders rather than via pg_stat_statements: that
+    extension may not be exposed on a free tier, its byte figures are a
+    heuristic, and a loader knows exactly how many rows it pulled.
+    """
+    import inspect
+
+    from equisense.api import snapshot as snap
+    from equisense.db import ROWS_READ, note_rows, rows_read_report
+    from equisense.research import base_rates
+
+    assert "note_rows" in inspect.getsource(base_rates.load_price_panel), (
+        "the unfiltered full-table panel is the largest recurring read and "
+        "must report itself")
+    assert "note_rows" in inspect.getsource(snap._bulk_prices)
+
+    ROWS_READ.clear()
+    note_rows("a", 1000)
+    note_rows("b", 3000)
+    note_rows("a", 500)
+    rep = rows_read_report(reset=True)
+    assert rep["rows_total"] == 4500
+    assert list(rep["rows_by_source"]) == ["b", "a"], "must rank by volume"
+    assert rep["approx_mb"] > 0
+    assert ROWS_READ == {}, "reset must clear, so a cron run reports ITS run"

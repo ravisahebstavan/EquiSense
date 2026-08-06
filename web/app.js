@@ -1953,7 +1953,8 @@ async function viewLab(section = "hypotheses") {
       await api("/backtest/strategy?refresh=true"); viewLab("backtest");
     });
   } else if (section === "data") {
-    const [st, uni] = await Promise.all([api("/live/status"), api("/universe")]);
+    const [st, uni, reads] = await Promise.all([
+      api("/live/status"), api("/universe"), api("/storage/reads")]);
     const p = st.datasets.prices, f = st.datasets.fundamentals;
     body.innerHTML = `
       <div class="panel"><h2>Analytical universe</h2>
@@ -1971,6 +1972,20 @@ async function viewLab(section = "hypotheses") {
         <button class="primary" id="uni-save">Apply universe</button>
         <span class="sub" style="margin-left:10px">${esc(uni.note)}</span>
         <div id="uni-msg" class="sub" style="margin-top:6px"></div>
+      </div>
+      <div class="panel"><h2>Database reads this process
+        <span class="sub">${reads.rows_total.toLocaleString()} rows ≈ ${reads.approx_mb} MB</span></h2>
+        <div class="sub" style="margin-bottom:8px">A free Postgres tier meters DATA TRANSFER,
+          not just storage. This deployment was taken down by an exhausted transfer quota while
+          disk sat at 41%, and nothing could say which read was responsible — every cost here had
+          been reasoned about in rows and seconds, never in bytes off the database.</div>
+        ${Object.entries(reads.rows_by_source || {}).map(([k, v]) => `
+          <div class="metric-row" style="cursor:default">
+            <span class="m-label">${esc(k)}</span>
+            <span class="m-value">${v.toLocaleString()}</span>
+            <span class="m-unit">rows</span></div>`).join("")
+          || '<div class="empty">No heavy reads yet in this process.</div>'}
+        <div class="sub" style="margin-top:6px">${esc(reads.note)}</div>
       </div>
       <div class="grid2">
         <div class="panel"><h2>Data quality — decomposed, never a mystery number</h2>

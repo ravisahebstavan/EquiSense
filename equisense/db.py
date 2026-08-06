@@ -180,3 +180,44 @@ def ensure_schema() -> None:
                                                        "v": SCHEMA_VERSION})
     except Exception:                              # noqa: BLE001
         pass                                       # an optimisation, never required
+
+
+# ---------------------------------------------------------------- egress meter
+# A free Postgres tier meters DATA TRANSFER, not just storage — a limit that
+# took this deployment down while disk sat at 41%. Nothing in the codebase could
+# say which query was responsible, because cost had only ever been reasoned
+# about in rows and seconds.
+#
+# pg_stat_statements would answer it, but it needs an extension this tier may
+# not expose, and its bytes are a heuristic anyway. The loaders know exactly how
+# many rows they pulled, so they report it themselves: no privileges, no
+# extension, and the number is exact rather than inferred.
+ROWS_READ: dict[str, int] = {}
+
+
+def note_rows(source: str, n: int) -> None:
+    ROWS_READ[source] = ROWS_READ.get(source, 0) + int(n)
+
+
+def rows_read_report(reset: bool = False) -> dict:
+    """Rows pulled per source since the process started (or since last reset).
+
+    Bytes are estimated at a deliberately ROUND per-row figure. The point is
+    ranking which read dominates, not a billing-accurate total — and a precise
+    looking number here would invite exactly the false confidence that let the
+    quota be exhausted unnoticed.
+    """
+    per_row_bytes = 60
+    total = sum(ROWS_READ.values())
+    out = {
+        "rows_by_source": dict(sorted(ROWS_READ.items(), key=lambda kv: -kv[1])),
+        "rows_total": total,
+        "approx_mb": round(total * per_row_bytes / 1e6, 1),
+        "assumed_bytes_per_row": per_row_bytes,
+        "note": ("Self-reported by the loaders, so it needs no database "
+                 "extension and no privileges. Ranks which read dominates; the "
+                 "byte figure is a round estimate, not a billing total."),
+    }
+    if reset:
+        ROWS_READ.clear()
+    return out

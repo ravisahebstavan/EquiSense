@@ -127,6 +127,9 @@ def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
             .where(PriceObservation.company_id.in_(_live_ids()),
                    PriceObservation.obs_date >= since)).yield_per(20_000):
         tail.setdefault(cid, {})[d] = (op, hi, lo)
+    from ..db import note_rows
+    note_rows("snapshot._bulk_prices.full", sum(len(c[0]) for c in out.values()))
+    note_rows("snapshot._bulk_prices.ohlc_tail", sum(len(v) for v in tail.values()))
     for cid, cols in out.items():
         by_date = tail.get(cid) or {}
         for d in cols[0]:

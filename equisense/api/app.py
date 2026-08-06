@@ -1056,6 +1056,11 @@ def cron_refresh(s: Session = Depends(db)):
 
     out["elapsed_s"] = round(_time.monotonic() - t0, 1)
     out["budget_s"] = CRON_BUDGET_S
+    # What this run actually pulled out of the database. The quota that took the
+    # site down was exhausted invisibly, because nothing anywhere reported the
+    # volume of a read — only its duration.
+    from ..db import rows_read_report
+    out["data_read"] = rows_read_report(reset=True)
     return out
 
 
@@ -1169,6 +1174,20 @@ def storage_view(universe_size: int = 50, s: Session = Depends(db)):
 
 class UniverseIn(BaseModel):
     index_key: str
+
+
+@app.get("/api/storage/reads")
+def storage_reads():
+    """How many rows this process has pulled per source, since it started.
+
+    Exists because the deployment was taken down by an exhausted DATA TRANSFER
+    quota while disk sat at 41%, and nothing could say which read was
+    responsible: every cost in this system had been reasoned about in rows and
+    seconds, never in bytes off the database. Self-reported by the loaders, so
+    it needs no extension and no privileges.
+    """
+    from ..db import rows_read_report
+    return rows_read_report()
 
 
 @app.get("/api/universe")

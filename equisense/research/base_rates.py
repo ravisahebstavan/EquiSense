@@ -103,6 +103,8 @@ def load_price_panel(session: Session) -> tuple[pd.DataFrame, pd.DataFrame]:
     except Exception:                                  # noqa: BLE001 - driver quirk
         rows = session.execute(stmt).all()
         df = pd.DataFrame(rows, columns=["cid", "date", "close", "volume"])
+    from ..db import note_rows
+    note_rows("base_rates.load_price_panel", len(df))
     tickers = {c.id: c.ticker for c in session.scalars(select(Company)).all()}
     df["ticker"] = df["cid"].map(tickers)
     closes = df.pivot_table(index="date", columns="ticker", values="close").sort_index()
