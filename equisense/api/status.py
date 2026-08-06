@@ -22,6 +22,12 @@ from ..research.registry import REGISTRY
 STALE_PRICE_DAYS = 4      # > this (covers weekends+holiday) → warning
 STALE_MACRO_DAYS = 6
 
+# Base rates are ten-year statistics; a few more sessions cannot meaningfully
+# move them. Recomputing reloads the whole price panel from a metered database,
+# so a daily "stale" warning was pushing the user toward the single most
+# expensive operation in the system for no analytical gain.
+STALE_STUDY_DAYS = 7
+
 
 def per_company_staleness(session: Session, max_lag_days: int = STALE_PRICE_DAYS
                           ) -> dict[str, int]:
@@ -155,12 +161,20 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
 
     br_count = session.scalar(select(func.count(BaseRateRecord.id)))
     br_computed = session.scalar(select(func.max(BaseRateRecord.computed_at)))
+    # Base rates are TEN-YEAR statistics. One more session moves them by
+    # essentially nothing, so "older than the newest bar" was never the right
+    # staleness test — it flagged a warning every single day and, worse, implied
+    # the fix was to recompute, which reloads the entire price history from a
+    # metered database. A week is the honest threshold for a decade of data.
     studies_stale = bool(br_computed and latest_price
-                         and br_computed.date() < latest_price)
+                         and (latest_price - br_computed.date()).days
+                         > STALE_STUDY_DAYS)
     if br_count == 0:
         warnings.append("no base-rate studies computed — run studies in the Lab")
     elif studies_stale:
-        warnings.append("base rates predate latest prices — recompute studies")
+        warnings.append(
+            f"base rates are more than {STALE_STUDY_DAYS} days behind the "
+            "latest prices — recompute studies in the Lab")
 
     from ..ingestion.vault import vault_stats
     vault = vault_stats()

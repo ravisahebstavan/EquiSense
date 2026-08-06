@@ -10,7 +10,7 @@ rebuild it explicitly.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -29,6 +29,11 @@ SNAP_VERSION = 5  # bump when the item schema changes → forces a rebuild
 # weekends and the long Indian holiday calendar would otherwise make a healthy
 # name look stale, and a genuinely frozen one look fine across a holiday week.
 STALE_SESSIONS = 3
+
+# How far back intraday OHLC is fetched. The Yang-Zhang estimator uses a 21-day
+# window and its completeness check looks at the trailing 260 bars, so a year
+# and a half of calendar days covers it with room for holidays and gaps.
+OHLC_WINDOW_DAYS = 540
 
 
 # Every bulk loader below is scoped to the LIVE universe by these subqueries.
@@ -82,17 +87,21 @@ def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
     the platform's function limit at >285s. Iterating the result keeps one row
     alive at a time and lets the lists be built directly.
     """
-    result = session.execute(
+    # OHLC is read ONLY by the 21-day Yang-Zhang estimator, which is validated
+    # over the trailing 260 bars — so pulling open/high/low across ten years was
+    # three of eight columns of pure waste. That matters beyond latency: a free
+    # Postgres tier meters DATA TRANSFER as well as storage, and at 500 names
+    # this single query is the largest recurring egress in the system.
+    full = session.execute(
         select(PriceObservation.company_id, PriceObservation.obs_date,
                PriceObservation.close, PriceObservation.volume,
-               PriceObservation.close_raw, PriceObservation.open_price,
-               PriceObservation.high_price, PriceObservation.low_price)
+               PriceObservation.close_raw)
         .where(PriceObservation.company_id.in_(_live_ids()))
         .order_by(PriceObservation.company_id, PriceObservation.obs_date)
     ).yield_per(20_000)
     out: dict[int, tuple] = {}
     cur_id, cur = None, None
-    for cid, d, c, v, raw, op, hi, lo in result:
+    for cid, d, c, v, raw in full:
         # Ordered by company, so the bucket is looked up once per NAME rather
         # than once per bar — a dict lookup a million times is not free either.
         if cid != cur_id:
@@ -104,9 +113,27 @@ def _bulk_prices(session: Session) -> dict[int, tuple[list, list, list, list]]:
         cur[1].append(c)
         cur[2].append(v)
         cur[3].append(raw)
-        cur[4].append(op)
-        cur[5].append(hi)
-        cur[6].append(lo)
+
+    # The OHLC tail, aligned by date onto the series just built. Anything older
+    # than the estimator's own window is padded with None, which is exactly what
+    # the ohlc_ok completeness check already expects to see for a name that has
+    # no usable intraday history.
+    since = date.today() - timedelta(days=OHLC_WINDOW_DAYS)
+    tail: dict[int, dict] = {}
+    for cid, d, op, hi, lo in session.execute(
+            select(PriceObservation.company_id, PriceObservation.obs_date,
+                   PriceObservation.open_price, PriceObservation.high_price,
+                   PriceObservation.low_price)
+            .where(PriceObservation.company_id.in_(_live_ids()),
+                   PriceObservation.obs_date >= since)).yield_per(20_000):
+        tail.setdefault(cid, {})[d] = (op, hi, lo)
+    for cid, cols in out.items():
+        by_date = tail.get(cid) or {}
+        for d in cols[0]:
+            op, hi, lo = by_date.get(d, (None, None, None))
+            cols[4].append(op)
+            cols[5].append(hi)
+            cols[6].append(lo)
     return out
 
 

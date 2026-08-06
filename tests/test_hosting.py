@@ -942,3 +942,30 @@ def test_frontend_stops_polling_a_hidden_tab_and_handles_session_expiry():
     assert 'async src="https://unpkg.com' in html, (
         "the charting CDN is used by one view and guarded at every call site; "
         "it must not sit between the user and time-to-interactive")
+
+
+def test_snapshot_does_not_pull_ten_years_of_ohlc():
+    """A free Postgres tier meters DATA TRANSFER, not just storage — a limit
+    nothing in this codebase accounted for. At 500 names the snapshot query was
+    the largest recurring egress in the system, and three of its eight columns
+    (open/high/low) exist solely for a 21-day Yang-Zhang window validated over
+    the trailing 260 bars. Pulling them across a decade was pure waste.
+
+    The failure this prevents is not slowness: it is the database refusing
+    connections mid-month because the transfer quota is exhausted, which takes
+    the whole site down while storage sits at 41%.
+    """
+    import inspect
+
+    from equisense.api import snapshot as snap
+
+    src = inspect.getsource(snap._bulk_prices)
+    assert "OHLC_WINDOW_DAYS" in src, "OHLC must be windowed, not full-history"
+    assert snap.OHLC_WINDOW_DAYS <= 800, (
+        "the window has to be comfortably smaller than the full history or it "
+        "saves nothing")
+    # the full-history query must NOT carry the intraday columns
+    head = src[:src.find("OHLC tail")]
+    for col in ("open_price", "high_price", "low_price"):
+        assert col not in head, (
+            f"{col} is still being pulled across the entire history")
