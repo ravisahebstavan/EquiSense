@@ -794,3 +794,22 @@ def test_refresh_stream_registers_forecasts_like_the_cron_does():
     assert src.index("register_daily_forecasts") < src.index("score_due_claims"), (
         "forecasts are registered BEFORE scoring so a claim made today is in "
         "the chain and starts its horizon now")
+
+
+def test_realign_touches_no_provider_and_recomputes_no_study():
+    """Sync exists because Refresh is the wrong tool for "is what I'm looking
+    at consistent with the database?". If it quietly grew into a second full
+    pipeline it would be a multi-minute button wearing a seconds-long label,
+    and people would stop pressing either one."""
+    import inspect
+
+    from equisense.api.app import live_realign
+
+    src = inspect.getsource(live_realign)
+    for forbidden in ("ingest_prices", "ingest_macro", "sync_universe",
+                      "run_all_studies", "nse_backfill", "capture_vol_surface"):
+        assert forbidden not in src, (
+            f"realign must not {forbidden} — that is Refresh's job")
+    for required in ("build_universe_snapshot", "register_daily_forecasts",
+                     "score_due_claims", "run_autopilot"):
+        assert required in src, f"realign must re-derive {required}"

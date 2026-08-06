@@ -741,6 +741,52 @@ def live_run_studies(s: Session = Depends(db)):
     return run_all_studies(s)
 
 
+@app.post("/api/live/realign")
+def live_realign(s: Session = Depends(db)):
+    """Re-derive everything the stored data implies, WITHOUT re-ingesting it.
+
+    The full refresh downloads a decade of prices and recomputes every
+    hypothesis — minutes of work, and the wrong tool when the question is
+    simply "is what I am looking at consistent with what the database already
+    knows?". Derived state can drift behind stored state for ordinary reasons:
+    a snapshot built before the last quote poll, forecasts not yet registered
+    today, claims whose horizon has since expired, an autopilot that has not
+    seen the newest marks.
+
+    So this rebuilds the published snapshot, registers today's forecasts,
+    scores whatever is now due, and lets the autopilot act on the current
+    book — the alignment pass, not the data cycle. Seconds, not minutes, and
+    it touches no external provider.
+    """
+    _reject_if_ephemeral()
+    from .. import ledger as L
+    from .autopilot import get_config, register_daily_forecasts, run_autopilot
+    from .snapshot import build_universe_snapshot
+
+    out: dict = {}
+    snap = build_universe_snapshot(s)
+    s.commit()
+    out["snapshot_companies"] = len(snap["companies"])
+    try:
+        fc = register_daily_forecasts(s)
+        s.commit()
+        out["forecasts_registered"] = len(fc.get("registered", []))
+        out["forecasts_skipped"] = len(fc.get("skipped", []))
+    except Exception as exc:                           # noqa: BLE001
+        s.rollback()
+        out["forecasts_error"] = f"{type(exc).__name__}: {exc}"[:160]
+    out["claims_scored"] = L.score_due_claims(s)["scored"]
+    out["checkpoints_scored"] = L.score_interim_checkpoints(s)["checkpointed"]
+    s.commit()
+    if get_config(s)["enabled"]:
+        rep = run_autopilot(s)
+        s.commit()
+        out["autopilot"] = {"entries": len(rep["entries"]), "exits": len(rep["exits"])}
+    out["note"] = ("Derived state realigned from stored data — no provider was "
+                   "contacted and no study was recomputed. Use Refresh for that.")
+    return out
+
+
 @app.post("/api/live/refresh")
 def live_refresh(s: Session = Depends(db)):
     """Full staged pipeline WITHOUT streaming — the fallback for hosts that

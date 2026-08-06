@@ -254,6 +254,36 @@ function openRefreshDrawer() {
   };
 }
 document.getElementById("refresh-btn").addEventListener("click", openRefreshDrawer);
+
+/* Sync ≠ Refresh. Refresh re-ingests and re-runs every hypothesis (minutes,
+   hits providers). Sync only re-derives what the stored data already implies —
+   snapshot, today's forecasts, due scoring, autopilot — which is the honest
+   answer to "is what I'm looking at consistent with the database?" and takes
+   seconds. Separated because reaching for a multi-minute ingest to fix a stale
+   panel is how people learn not to press the button at all. */
+document.getElementById("sync-btn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  if (btn.disabled) return;
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "⟳ Syncing…";
+  try {
+    const r = await api("/live/realign", { method: "POST" });
+    const bits = [`${r.snapshot_companies} companies`];
+    if (r.forecasts_registered) bits.push(`${r.forecasts_registered} forecast(s)`);
+    if (r.claims_scored) bits.push(`${r.claims_scored} claim(s) scored`);
+    if (r.checkpoints_scored) bits.push(`${r.checkpoints_scored} checkpoint(s)`);
+    if (r.autopilot) bits.push(`autopilot ${r.autopilot.entries}↑ ${r.autopilot.exits}↓`);
+    if (r.forecasts_error) bits.push(`forecasts failed: ${r.forecasts_error}`);
+    toast("Synced — " + bits.join(" · "));
+    cache.companies = null;
+    await refreshStatusStrip();
+    if (!isEditingForm()) await route({ silent: true });
+  } catch (err) {
+    toast("Sync failed: " + err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+});
 document.getElementById("drawer-close").addEventListener("click", () => drawer.hidden = true);
 
 /* =================================================== command palette */
