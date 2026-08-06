@@ -397,3 +397,77 @@ def test_a_missing_breadth_reading_holds_exposure_rather_than_resetting():
     from equisense.research.backtest import breadth_exposure
     e = breadth_exposure([0.30, float("nan"), float("nan"), 0.30])
     assert e == [0.2, 0.2, 0.2, 0.2], "an outage reset exposure to full risk"
+
+
+def _force_direction(monkeypatch, tickers, direction):
+    """qualified_candidates returning candidates in a chosen direction."""
+    import equisense.api.candidates as C
+
+    def fake(session, top_n=8, book_value=None, cash=None):
+        return {"as_of": "t", "regime": "test", "scanned": 2,
+                "verdict_counts": {"long": 0, "avoid": len(tickers), "abstain": 0},
+                "weights_status": "uniform",
+                "candidates": [{"id": i + 1, "ticker": t, "name": t, "sector": "IT",
+                                "price": 100.0, "net_score": -0.6 if direction == "short" else 0.6,
+                                "direction": direction,
+                                "conviction_band": "low", "dispersion": 0.1,
+                                "drivers": ["MAX-effect -1.4"], "dissent": [],
+                                "sizing": {"shares": 5, "value": 500.0,
+                                           "stop_distance_pct": 3.0,
+                                           "binding": "risk_budget"},
+                                "round_trip_cost_pct": 0.25, "breakeven_move_pct": 0.25,
+                                "gates": [], "tradable": True}
+                               for i, t in enumerate(tickers)],
+                "reviewed": [], "discipline_note": ""}
+
+    monkeypatch.setattr(C, "qualified_candidates", fake)
+
+
+def test_autopilot_opens_a_short_on_an_avoid_verdict(world, monkeypatch):
+    """Autopilot was long-only: it computed qualified avoid_short verdicts and
+    then discarded them, so on a universe where the only names clearing the
+    significance bar are short-side it sat idle indefinitely while the
+    synthesis was in fact producing signal."""
+    s, a, b = world
+    _force_direction(monkeypatch, ["AAA"], "short")
+    from equisense.api.autopilot import run_autopilot, set_config
+    from equisense.api.paper import account
+
+    set_config(s, {"enabled": True, "max_new_per_run": 1})
+    rep = run_autopilot(s)
+
+    assert len(rep["entries"]) == 1, rep
+    assert rep["entries"][0]["direction"] == "short"
+    pos = account(s)["positions"][0]
+    assert pos["quantity"] < 0, "a short entry must leave a negative position"
+    assert pos["direction"] == "short"
+
+
+def test_short_stop_fires_above_entry_not_below(world, monkeypatch):
+    """A short's stop sits ABOVE its entry. Sharing the long-side test would
+    leave every short with no stop at all, and its verdict-flip exit would fire
+    on the thesis WORKING rather than failing."""
+    from datetime import date as _date
+
+    from equisense.models import PriceObservation
+    s, a, b = world
+    _force_direction(monkeypatch, ["AAA"], "short")
+    from equisense.api.autopilot import run_autopilot, set_config
+    from equisense.api.paper import account
+
+    set_config(s, {"enabled": True, "max_new_per_run": 1})
+    run_autopilot(s)
+    entry = account(s)["positions"][0]["avg_cost"]
+
+    # price RISES hard against the short → stop must fire. Must be the LATEST
+    # bar or the position still marks at the old close.
+    s.add(PriceObservation(company_id=a.id, obs_date=_date.today(),
+                           close=entry * 1.60, volume=1000))
+    s.commit()
+    _force_direction(monkeypatch, [], "short")     # no new entries this run
+    rep = run_autopilot(s)
+
+    assert len(rep["exits"]) == 1, rep
+    assert rep["exits"][0]["direction"] == "short"
+    assert "above" in rep["exits"][0]["reason"]
+    assert account(s)["positions"] == [], "cover must flatten the position"

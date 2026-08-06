@@ -292,6 +292,21 @@ def refresh_stream(session: Session):
         rep = run_all_studies(session)
         yield sse("running_studies", "done", records=rep["records"])
 
+        # Register today's forecasts BEFORE scoring, exactly as the cron does.
+        # This stage was missing here, so clicking Refresh ran the whole
+        # pipeline and the autopilot without ever recording a prediction — the
+        # calibration ledger only ever grew on days the cron itself succeeded.
+        yield sse("registering_forecasts", "running")
+        from .autopilot import register_daily_forecasts
+        try:
+            fc = register_daily_forecasts(session)
+            yield sse("registering_forecasts", "done",
+                      registered=len(fc.get("registered", [])),
+                      skipped=len(fc.get("skipped", [])))
+        except Exception as exc:                       # noqa: BLE001
+            yield sse("registering_forecasts", "failed",
+                      error=f"{type(exc).__name__}: {exc}"[:160])
+
         yield sse("scoring_claims", "running")
         scored = ledger.score_due_claims(session)
         checkpointed = ledger.score_interim_checkpoints(session)

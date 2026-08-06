@@ -53,12 +53,69 @@ def test_insufficient_cash_rejected(sess):
         place_trade(s, cid, "buy", 100_000)
 
 
-def test_oversell_rejected(sess):
+def test_selling_past_the_holding_flips_to_short(sess):
+    """DELIBERATE CHANGE: selling more than held is no longer an error.
+
+    The paper book is direction-agnostic now — synthesis produces qualified
+    avoid_short verdicts and refusing to act on them threw away half the
+    system's actionable output. A sell that crosses through flat closes the
+    long at its own basis and opens the remainder short at the fill price; the
+    two sides are never blended into a meaningless average cost.
+    """
+    from equisense.api.paper import account, place_trade
+    s, cid = sess
+    place_trade(s, cid, "buy", 10)      # long 10 @ 139
+    place_trade(s, cid, "sell", 30)     # close 10, open short 20 @ 139
+
+    pos = account(s)["positions"][0]
+    assert pos["quantity"] == pytest.approx(-20)
+    assert pos["direction"] == "short"
+    assert pos["avg_cost"] == pytest.approx(139.0)   # re-based, not averaged
+    assert pos["realized_pnl"] == pytest.approx(0.0)  # closed at its entry
+
+
+def test_short_is_margin_constrained(sess):
+    """A short still has to be funded. Without this an unfunded book could take
+    unbounded short exposure, and every risk number computed off it would be
+    fiction."""
     from equisense.api.paper import place_trade
     s, cid = sess
-    place_trade(s, cid, "buy", 10)
-    with pytest.raises(ValueError, match="insufficient position"):
-        place_trade(s, cid, "sell", 20)
+    with pytest.raises(ValueError, match="insufficient margin to short"):
+        place_trade(s, cid, "sell", 100_000)
+
+
+def test_short_makes_money_when_the_price_falls(sess):
+    """The P&L sign is the whole point of supporting shorts."""
+    from equisense.api.paper import account, paper_positions, place_trade
+    from equisense.models import PriceObservation
+    s, cid = sess
+
+    place_trade(s, cid, "sell", 100)            # short 100 @ 139
+    a = account(s)
+    assert a["cash"] == pytest.approx(1_000_000 + 100 * 139.0)  # proceeds credited
+    assert a["equity"] == pytest.approx(1_000_000)              # no P&L at entry
+
+    s.add(PriceObservation(company_id=cid, obs_date=date(2026, 6, 1), close=119.0))
+    s.commit()
+    a = account(s)
+    assert a["positions"][0]["unrealized_pnl"] == pytest.approx(100 * 20.0)
+    assert a["equity"] == pytest.approx(1_000_000 + 100 * 20.0)
+
+    place_trade(s, cid, "buy", 100)             # cover
+    a = account(s)
+    assert a["positions"] == []
+    assert a["equity"] == pytest.approx(1_000_000 + 100 * 20.0)
+
+
+def test_covering_a_short_does_not_need_new_cash(sess):
+    """Buying to cover releases capital; funding it like a fresh long purchase
+    would block legitimate exits when cash is tied up."""
+    from equisense.api.paper import account, place_trade
+    s, cid = sess
+    place_trade(s, cid, "sell", 7000)                 # large short, funded
+    assert account(s)["cash"] < 1_000_000 + 7000 * 139.0 + 1
+    place_trade(s, cid, "buy", 7000)                  # cover must be allowed
+    assert account(s)["positions"] == []
 
 
 def test_alpha_vs_nifty_counterfactual(sess):

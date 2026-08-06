@@ -1,10 +1,13 @@
 """Autopilot — the system trades its own book (paper), on policy, with reasons.
 
 Runs after every data refresh (cron + pipeline) when enabled:
-  EXITS first, positions checked against three triggers —
-    stop breach   price ≤ avg cost × (1 − 2.5 × daily vol)
+  EXITS first, positions checked against three triggers (each mirrored for
+  shorts, whose stop sits ABOVE entry and whose adverse flip is the bullish
+  one) —
+    stop breach   long: price ≤ avg cost × (1 − 2.5 × daily vol)
+                  short: price ≥ avg cost × (1 + 2.5 × daily vol)
     time exit     oldest lot older than the claim horizon (~126 trading days)
-    verdict flip  the synthesis now says avoid/short for a held name
+    verdict flip  synthesis now reads the opposite way for a held name
   ENTRIES second — top qualified candidates (full gate stack) not already
     held, capped by policy: max new/run, max open positions, cash reserve.
     Each entry generates a FULL dossier first (claim + cluster attribution)
@@ -176,25 +179,41 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
     oldest_fill: dict[str, date] = {}
     for t in session.scalars(select(PaperTrade)).all():
         c = session.get(Company, t.company_id)
-        if c and c.ticker in held and t.side == "buy":
+        # Any side: a short position is OPENED by a sell, so a buy-only scan
+        # left shorts with no opening date and therefore no time exit.
+        if c and c.ticker in held:
             oldest_fill[c.ticker] = min(oldest_fill.get(c.ticker, t.trade_date),
                                         t.trade_date)
     for ticker, pos in held.items():
         item = universe.get(ticker, {})
         dv = ((item.get("signals") or {}).get("vol") or 25.0) / (252 ** 0.5)
         stop_pct = 2.5 * dv
+        # A short loses money as the price RISES, so its stop sits above entry
+        # and its adverse verdict flip is the bullish one. Sharing the long-side
+        # tests would have left every short position with no stop at all and an
+        # exit trigger that fires on the thesis WORKING.
+        is_short = pos["quantity"] < 0
+        qty = abs(pos["quantity"])
         reason = None
-        if pos["price"] is not None and pos["price"] <= pos["avg_cost"] * (1 - stop_pct / 100):
+        if pos["price"] is not None and (
+                pos["price"] >= pos["avg_cost"] * (1 + stop_pct / 100) if is_short
+                else pos["price"] <= pos["avg_cost"] * (1 - stop_pct / 100)):
             reason = (f"stop breach: price ₹{pos['price']:,.1f} is more than "
-                      f"{stop_pct:.1f}% below avg cost ₹{pos['avg_cost']:,.1f}")
+                      f"{stop_pct:.1f}% {'above' if is_short else 'below'} "
+                      f"avg cost ₹{pos['avg_cost']:,.1f}")
         elif (date.today() - oldest_fill.get(ticker, date.today())).days > cfg["time_exit_days"]:
             reason = (f"time exit: held past the {cfg['time_exit_days']}-day claim "
                       "horizon — realize and let scoring judge the call")
-        elif verdicts.get(ticker) == "avoid_short_candidate":
-            reason = "verdict flip: synthesis now reads Avoid/Short for this name"
+        elif verdicts.get(ticker) == ("long_candidate" if is_short
+                                      else "avoid_short_candidate"):
+            reason = ("verdict flip: synthesis now reads "
+                      f"{'Long' if is_short else 'Avoid/Short'} for this name")
         if reason:
-            fill = place_trade(session, pos["company_id"], "sell", pos["quantity"])
-            report["exits"].append({"ticker": ticker, "quantity": pos["quantity"],
+            # Close in the opposite direction: buy to cover a short.
+            fill = place_trade(session, pos["company_id"],
+                               "buy" if is_short else "sell", qty)
+            report["exits"].append({"ticker": ticker, "quantity": qty,
+                                    "direction": "short" if is_short else "long",
                                     "fill_price": fill["fill_price"], "reason": reason})
 
     # -------------------------------------------------------------- entries
@@ -231,12 +250,18 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
         if shares <= 0:
             report["skipped"].append(f"{c['ticker']}: dossier sizing came back zero")
             continue
-        fill = place_trade(session, c["id"], "buy", shares,
+        # Enter in the candidate's own direction: buy a long, sell to open a
+        # short. Sizing is already a magnitude, so the sign lives only here.
+        side = "sell" if c.get("direction") == "short" else "buy"
+        fill = place_trade(session, c["id"], side, shares,
                            dossier_hash=dossier["ledger"]["hash"])
+        # A short credits proceeds but ties up the same margin, so either way
+        # this run has that much less capital available to commit.
         cash -= shares * fill["fill_price"]
         open_names.add(c["ticker"])
         new_count += 1
         report["entries"].append({"ticker": c["ticker"], "quantity": shares,
+                                  "direction": c.get("direction", "long"),
                                   "fill_price": fill["fill_price"],
                                   "dossier": dossier["ledger"]["hash"][:16],
                                   "reason": "qualified candidate: "

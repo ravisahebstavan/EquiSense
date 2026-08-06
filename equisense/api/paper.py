@@ -36,6 +36,65 @@ def _config(session: Session) -> dict:
     return json.loads(row.payload)
 
 
+class PaperPosition:
+    """Signed paper position: quantity > 0 long, < 0 short.
+
+    Deliberately SEPARATE from engine.portfolio.positions_from_ledger, which
+    accounts for the real book — that one is long-only by design and carries
+    the FIFO tax lots and XIRR for actual holdings. Teaching it about shorts to
+    serve the paper account would put the user's real cost basis at risk for no
+    benefit, so the paper book gets its own engine instead.
+
+    Short exposure here is F&O-STYLE. It is not executable as cash-market
+    delivery: Indian retail cannot carry a short equity position overnight.
+    """
+
+    __slots__ = ("quantity", "avg_cost", "realized_pnl")
+
+    def __init__(self) -> None:
+        self.quantity = 0.0
+        self.avg_cost = 0.0
+        self.realized_pnl = 0.0
+
+    @property
+    def invested(self) -> float:
+        """Signed cost basis of the open position."""
+        return self.quantity * self.avg_cost
+
+
+def paper_positions(trades) -> dict[int, PaperPosition]:
+    """Fold fills into signed positions, handling opens, adds, partial closes
+    and direction flips in one pass.
+
+    Realised P&L is direction-aware: a long books (exit - entry), a short books
+    (entry - exit). Averaging only ever applies to ADDS in the same direction —
+    a trade that crosses through flat closes the old position at its own basis
+    and re-opens the remainder at the fill price, so a flip never blends the
+    two sides into a meaningless average.
+    """
+    out: dict[int, PaperPosition] = {}
+    for t in trades:
+        p = out.setdefault(t.company_id, PaperPosition())
+        signed = t.quantity if t.side == "buy" else -t.quantity
+        if abs(p.quantity) < 1e-9:                      # opening from flat
+            p.quantity, p.avg_cost = signed, t.price
+            continue
+        if (p.quantity > 0) == (signed > 0):            # adding to the position
+            total = abs(p.quantity) + abs(signed)
+            p.avg_cost = (p.avg_cost * abs(p.quantity) + t.price * abs(signed)) / total
+            p.quantity += signed
+            continue
+        closing = min(abs(signed), abs(p.quantity))     # reducing / closing / flipping
+        direction = 1.0 if p.quantity > 0 else -1.0
+        p.realized_pnl += direction * (t.price - p.avg_cost) * closing
+        p.quantity += signed
+        if abs(p.quantity) < 1e-9:
+            p.quantity, p.avg_cost = 0.0, 0.0
+        elif (p.quantity > 0) != (direction > 0):       # crossed through flat
+            p.avg_cost = t.price
+    return out
+
+
 def latest_close(session: Session, company_id: int) -> tuple[float, date] | None:
     row = session.execute(
         select(PriceObservation.close, PriceObservation.obs_date)
@@ -59,14 +118,26 @@ def place_trade(session: Session, company_id: int, side: str, quantity: float,
     price, px_date = px
 
     acct = account(session, include_curve=False)
-    if side == "buy" and quantity * price > acct["cash"] + 1e-6:
-        raise ValueError(f"insufficient cash: need ₹{quantity * price:,.0f}, "
-                         f"have ₹{acct['cash']:,.0f}")
-    if side == "sell":
-        held = next((p["quantity"] for p in acct["positions"]
-                     if p["company_id"] == company_id), 0.0)
-        if quantity > held + 1e-6:
-            raise ValueError(f"insufficient position: selling {quantity}, hold {held}")
+    held = next((p["quantity"] for p in acct["positions"]
+                 if p["company_id"] == company_id), 0.0)
+    notional = quantity * price
+    if side == "buy":
+        # Covering a short releases capital rather than consuming it, so only
+        # the portion that ends up LONG has to be funded.
+        opening_long = max(0.0, quantity - max(0.0, -held))
+        if opening_long * price > acct["cash"] + 1e-6:
+            raise ValueError(f"insufficient cash: need ₹{opening_long * price:,.0f}, "
+                             f"have ₹{acct['cash']:,.0f}")
+    else:
+        # Selling beyond what is held opens a SHORT. Real brokers post margin
+        # against it; requiring the opened notional to be covered by cash is a
+        # deliberately conservative stand-in, and stops an unfunded book from
+        # taking unbounded short exposure.
+        opening_short = max(0.0, quantity - max(0.0, held))
+        if opening_short * price > acct["cash"] + 1e-6:
+            raise ValueError(
+                f"insufficient margin to short: opening ₹{opening_short * price:,.0f} "
+                f"of short exposure against ₹{acct['cash']:,.0f} cash")
 
     trade = PaperTrade(company_id=company_id, side=side, quantity=quantity,
                        price=price, trade_date=px_date, dossier_hash=dossier_hash)
@@ -116,23 +187,29 @@ def account(session: Session, include_curve: bool = True) -> dict:
             cash -= t.quantity * t.price
         else:
             cash += t.quantity * t.price
-    positions = positions_from_ledger([
-        Transaction(t.company_id, t.side, t.quantity, t.price, t.trade_date)
-        for t in trades])
+    positions = paper_positions(trades)
 
     pos_rows, invested_value = [], 0.0
     for cid, p in positions.items():
-        if p.quantity <= 1e-9:
+        if abs(p.quantity) <= 1e-9:
             continue
         px = latest_close(session, cid)
-        value = p.quantity * (px[0] if px else 0.0)
+        mark = px[0] if px else 0.0
+        # Signed throughout: a short marks as NEGATIVE value, which is what
+        # makes equity = cash + exposure come out right. Shorting 10 @ 100
+        # credits ₹1,000 cash and books -₹1,000 exposure (no P&L at entry); if
+        # the price falls to 90 the exposure is -₹900 and the account is ₹100 up.
+        value = p.quantity * mark
         invested_value += value
         pos_rows.append({
             "company_id": cid, "ticker": companies[cid].ticker,
             "name": companies[cid].name, "sector": companies[cid].sector,
             "quantity": round(p.quantity, 4), "avg_cost": round(p.avg_cost, 2),
-            "price": px[0] if px else None, "value": round(value, 2),
-            "unrealized_pnl": round(value - p.invested, 2),
+            "direction": "short" if p.quantity < 0 else "long",
+            "price": mark if px else None, "value": round(value, 2),
+            # (mark - entry) x signed quantity: a long gains as price rises, a
+            # short as it falls, without a special case.
+            "unrealized_pnl": round((mark - p.avg_cost) * p.quantity, 2),
             "realized_pnl": round(p.realized_pnl, 2),
         })
     equity = cash + invested_value
@@ -157,7 +234,16 @@ def account(session: Session, include_curve: bool = True) -> dict:
         # That is exactly why it is worth reporting: if it ever fires, the
         # validation was bypassed and the cash balance above is wrong too —
         # `cash` is summed from raw trades, so a phantom sell mints phantom cash.
-        "data_integrity": ledger_integrity(positions),
+        # ledger_integrity flags "sold without an open lot", which is the right
+        # alarm for the REAL book (it means the recorded history is not a
+        # possible sequence of trades). In the paper book that same pattern is
+        # a deliberate short, so the check would fire on correct behaviour.
+        # Every paper fill is machine-placed against a live price, so the
+        # failure it guards against — mistyped or misdated manual entry — does
+        # not arise here.
+        "data_integrity": {"ok": True, "unmatched_sells": {}, "warning": None,
+                           "note": "Paper fills are machine-placed; a sell with "
+                                   "no open lot is a short, not a data error."},
         "trades": [{
             "id": t.id, "ticker": companies[t.company_id].ticker, "side": t.side,
             "quantity": t.quantity, "price": t.price, "date": str(t.trade_date),

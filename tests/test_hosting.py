@@ -777,3 +777,20 @@ def test_forecasts_are_registered_even_when_everything_abstains(monkeypatch):
         f"whole calibration record; got {out}")
     assert "CCC" not in tickers, "a data-suspect name must not become a claim"
     assert any("CCC" in s for s in out["skipped"])
+
+
+def test_refresh_stream_registers_forecasts_like_the_cron_does():
+    """Clicking Refresh ran the whole pipeline AND the autopilot but never
+    recorded a prediction, so the calibration ledger only grew on days the
+    server-side cron itself succeeded. While the cron was timing out that
+    meant it never grew at all, and no amount of manual refreshing helped."""
+    import inspect
+
+    from equisense.api.status import refresh_stream
+
+    src = inspect.getsource(refresh_stream)
+    assert "register_daily_forecasts" in src, (
+        "the manual refresh must register forecasts, exactly as the cron does")
+    assert src.index("register_daily_forecasts") < src.index("score_due_claims"), (
+        "forecasts are registered BEFORE scoring so a claim made today is in "
+        "the chain and starts its horizon now")

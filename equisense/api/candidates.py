@@ -258,8 +258,14 @@ def qualified_candidates(session: Session, top_n: int = 8,
                          "verdict": v, "net_score": round(synth.net_score, 3),
                          "conviction_band": synth.conviction_band,
                          "data_suspect": bool(item.get("data_suspect"))})
-        if v != "long_candidate":
+        # Both directions are actionable. Refusing to act on a qualified
+        # avoid_short verdict discarded half the system's actionable output —
+        # on this universe the only names clearing the significance bar are
+        # routinely short-side, so a long-only feed left autopilot idle
+        # indefinitely while the synthesis was in fact producing signal.
+        if v not in ("long_candidate", "avoid_short_candidate"):
             continue
+        direction = 1 if v == "long_candidate" else -1
 
         gates = []
         # No invented volatility. The fallback here used to be a hardcoded 25%
@@ -279,7 +285,9 @@ def qualified_candidates(session: Session, top_n: int = 8,
         sizing = recommend_size(SizingInputs(
             book_value=book_value or 1_000_000.0, price=item["price"],
             daily_vol_pct=daily_vol, conviction_band=synth.conviction_band,
-            net_score=synth.net_score, adv_cr=item.get("adv_cr"),
+            # Magnitude of conviction, not its sign — a short sized off a
+            # negative score would come back at or below zero shares.
+            net_score=abs(synth.net_score), adv_cr=item.get("adv_cr"),
             max_position_pct=10.0))
         costs = cost_tax_breakeven(max(sizing["recommended_value"], 1.0),
                                    item.get("adv_cr"), expected_hold_months=6)
@@ -303,6 +311,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
         candidates.append({
             "id": item["id"], "ticker": item["ticker"], "name": item["name"],
             "sector": item["sector"], "price": item["price"],
+            "direction": "long" if direction > 0 else "short",
             "net_score": round(synth.net_score, 3),
             "conviction_band": synth.conviction_band,
             "dispersion": round(synth.dispersion, 3),
@@ -318,7 +327,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
             "tradable": not failed and sizing["recommended_shares"] > 0,
         })
 
-    candidates.sort(key=lambda c: (-c["tradable"], -c["net_score"]))
+    candidates.sort(key=lambda c: (-c["tradable"], -abs(c["net_score"])))
 
     # Runtime governance veto. The catastrophe this book cannot survive is not a
     # bad momentum reading — it is an insolvency filing or forensic audit on a
@@ -337,7 +346,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
             c["gates"] = list(c.get("gates") or []) + [f"failed: {reason}"]
 
     _apply_diversification_gate(session, candidates)
-    candidates.sort(key=lambda c: (-c["tradable"], -c["net_score"]))  # re-sort post-gate
+    candidates.sort(key=lambda c: (-c["tradable"], -abs(c["net_score"])))  # re-sort post-gate
 
     return {
         "as_of": universe.get("as_of"),

@@ -158,6 +158,7 @@ async function refreshStatusStrip() {
       <span class="seg">Coverage <strong>${esc(p.coverage)}</strong></span>
       <span class="seg">Provider ${esc(st.provider.split(" ")[0])}</span>
       ${cache.market ? `<span class="seg">Market <strong>${cache.market.open ? "OPEN" : "closed"}</strong> · ${esc(cache.market.ist)} IST</span>` : ""}
+      ${cache.quotesAt ? `<span class="seg" title="Live quotes are pulled every 5 minutes while this page is open, and the view re-renders on each pull.">Quotes <strong>${cache.quotesAt.toLocaleTimeString()}</strong></span>` : ""}
       ${autoRefreshing ? '<span class="seg" style="color:var(--accent)">⟳ auto-refreshing…</span>' : ""}
       ${warn}
       <span class="seg" style="margin-left:auto"><a href="#/lab/data">data health →</a></span>`;
@@ -176,8 +177,9 @@ const STAGE_LABEL = {
   bootstrap: "First-boot bootstrap", universe: "Syncing universe",
   downloading_prices: "Downloading prices", downloading_macro: "Downloading macro",
   fundamentals: "Fetching fundamentals", validating: "Validating",
-  running_studies: "Running hypotheses", scoring_claims: "Scoring claims",
-  publishing: "Publishing snapshot", pipeline: "Pipeline",
+  running_studies: "Running hypotheses",
+  registering_forecasts: "Registering forecasts", scoring_claims: "Scoring claims",
+  publishing: "Publishing snapshot", autopilot: "Autopilot", pipeline: "Pipeline",
 };
 
 function renderStage(d) {
@@ -2332,7 +2334,14 @@ async function quoteLoop() {
     const q = await api("/live/quotes", { method: "POST" });
     cache.market = q.market;
     cache.quotes = q.prices;
-    if ((location.hash || "").includes("trading") && !isEditingForm()) route();
+    cache.quotesAt = new Date();
+    /* Re-render whatever is on screen, not just the trading desk. Quotes were
+       being fetched every 5 minutes on every page and then thrown into the
+       cache while the view kept showing the numbers it rendered on load — so
+       the site looked frozen everywhere except one tab. The form guard stays:
+       never yank the DOM out from under an in-progress edit. */
+    if (!isEditingForm()) route();
+    refreshStatusStrip();
   } catch { /* quotes are best-effort; status strip reports staleness */ }
 }
 
