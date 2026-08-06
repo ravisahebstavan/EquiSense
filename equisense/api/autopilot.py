@@ -31,7 +31,21 @@ from ..models import AppSnapshot, Company, PaperTrade
 CONFIG_KEY = "autopilot_config"
 LAST_RUN_KEY = "autopilot_last"
 DEFAULTS = {"enabled": False, "max_new_per_run": 2, "max_open_positions": 8,
-            "cash_reserve_pct": 10.0, "time_exit_days": 185}
+            "cash_reserve_pct": 10.0, "time_exit_days": 185,
+            "daily_forecasts": 25}
+
+# How many forecasts to register per day, taken from the TOP of the universe
+# ranked by conviction magnitude. This is the single biggest lever on how fast
+# anything here can be calibrated: the probability map needs 30 scored claims
+# and learned cluster weights need 150 per family, and until those arrive every
+# weight stays provisional and every conviction is capped.
+#
+# Not unbounded, for two reasons. Each registered claim is a permanent ledger
+# record, and the ledger lives in a 0.5 GB Postgres — 25/day is roughly 6k
+# records a year, 500/day would be 125k and would consume the tier by itself.
+# And claims on 25 names ranked by conviction carry far more independent
+# information than claims on all 500, most of which the system has explicitly
+# said it has no view on.
 
 # India VIX percentile within its own trailing 3y range, above which the book
 # stops ADDING exposure. Percentile rather than an absolute level because 20 on
@@ -95,7 +109,7 @@ def _held_verdicts(session: Session, tickers: list[str]) -> dict[str, str]:
     return out
 
 
-def register_daily_forecasts(session: Session, top_n: int = 6) -> dict:
+def register_daily_forecasts(session: Session, top_n: int | None = None) -> dict:
     """Issue and register a dossier for the day's top candidates, traded or not.
 
     This is what makes the system able to learn. Every gated capability here —
@@ -119,6 +133,9 @@ def register_daily_forecasts(session: Session, top_n: int = 6) -> dict:
     from .live import build_dossier
     from .candidates import qualified_candidates
 
+    if top_n is None:
+        top_n = int(get_config(session).get("daily_forecasts")
+                    or DEFAULTS["daily_forecasts"])
     today = date.today().isoformat()
     already = {
         (r.get("company") or {}).get("ticker")

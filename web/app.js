@@ -1329,6 +1329,8 @@ async function viewTrading() {
         <div><label>Max new positions / run</label><input id="ap-max" type="number" min="0" max="10" value="${ap.config.max_new_per_run}"></div>
         <div><label>Max open positions</label><input id="ap-open" type="number" min="1" max="20" value="${ap.config.max_open_positions}"></div>
         <div><label>Cash reserve %</label><input id="ap-cash" type="number" min="0" max="90" value="${ap.config.cash_reserve_pct}"></div>
+        <div><label>Forecasts / day</label>
+          <input id="ap-forecasts" type="number" min="0" max="100" value="${ap.config.daily_forecasts ?? 25}"></div>
         <div><label>Time exit (days)</label><input id="ap-days" type="number" min="30" max="730" value="${ap.config.time_exit_days}"></div>
       </div>
       <button id="ap-save" style="margin-top:2px">Save policy</button>
@@ -1415,7 +1417,8 @@ async function viewTrading() {
       max_new_per_run: parseInt(document.getElementById("ap-max").value),
       max_open_positions: parseInt(document.getElementById("ap-open").value),
       cash_reserve_pct: parseFloat(document.getElementById("ap-cash").value),
-      time_exit_days: parseInt(document.getElementById("ap-days").value) }) });
+      time_exit_days: parseInt(document.getElementById("ap-days").value),
+      daily_forecasts: parseInt(document.getElementById("ap-forecasts").value) }) });
     toast("Autopilot policy saved.", "ok");
   });
   document.getElementById("ap-run").addEventListener("click", async (e) => {

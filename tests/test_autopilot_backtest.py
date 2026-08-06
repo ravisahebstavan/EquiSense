@@ -518,3 +518,48 @@ def test_calm_regime_still_trades(world, monkeypatch):
     rep = run_autopilot(s)
     assert len(rep["entries"]) == 1, rep
     assert not any("regime" in x for x in rep["skipped"])
+
+
+def test_forecast_density_is_configurable_and_bounded(world, monkeypatch):
+    """Claim density is the single biggest lever on time-to-calibration: the
+    probability map needs 30 scored claims and learned weights need 150 per
+    family, and until those land every weight stays provisional.
+
+    It is bounded rather than "register everything" for two reasons. Each claim
+    is a PERMANENT ledger record in a 0.5 GB database. And claims on the most
+    convicted names carry more independent information than claims on all 500,
+    most of which the system has explicitly said it has no view on.
+    """
+    import equisense.api.candidates as C
+    from equisense.api.autopilot import (DEFAULTS, register_daily_forecasts,
+                                         set_config)
+    import equisense.api.live as live_mod
+    import equisense.ledger as L
+
+    s, a, b = world
+    reviewed = [{"id": 1, "ticker": f"T{i}", "verdict": "abstain",
+                 "net_score": -1.0 + i / 100.0, "conviction_band": "low",
+                 "data_suspect": False} for i in range(60)]
+    monkeypatch.setattr(C, "qualified_candidates",
+                        lambda *a_, **k: {"candidates": [], "reviewed": reviewed})
+    monkeypatch.setattr(L, "read_all", lambda: [])
+    built = []
+
+    def fake_build(session, company, **kw):
+        built.append(company)
+        return {"synthesis": {"verdict": "abstain"}, "ledger": {"hash": "h" * 64}}
+
+    monkeypatch.setattr(live_mod, "build_dossier", fake_build)
+
+    assert DEFAULTS["daily_forecasts"] >= 20, (
+        "a 500-name universe registering a handful of claims a day cannot "
+        "reach the calibration gates in any useful timeframe")
+
+    set_config(s, {"daily_forecasts": 12})
+    out = register_daily_forecasts(s)
+    assert len(out["registered"]) == 12, out
+
+    built.clear()
+    set_config(s, {"daily_forecasts": 3})
+    out = register_daily_forecasts(s)
+    assert len(out["registered"]) == 3

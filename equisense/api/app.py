@@ -451,6 +451,9 @@ class AutopilotConfigIn(BaseModel):
     max_open_positions: Optional[int] = Field(None, ge=1, le=20)
     cash_reserve_pct: Optional[float] = Field(None, ge=0, le=90)
     time_exit_days: Optional[int] = Field(None, ge=30, le=730)
+    # Upper bound is a storage decision, not a statistical one: every claim is a
+    # permanent ledger record in a 0.5 GB database.
+    daily_forecasts: Optional[int] = Field(None, ge=0, le=100)
 
 
 @app.get("/api/autopilot")
