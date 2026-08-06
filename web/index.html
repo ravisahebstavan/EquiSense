@@ -59,7 +59,11 @@
   <div id="drawer-body"></div>
 </div>
 
-<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<!-- async, not blocking: this is used by exactly ONE view (the company price
+     chart) and every call site already guards `typeof LightweightCharts`, so a
+     slow or unreachable CDN must cost that one chart, never the whole app's
+     time-to-interactive. -->
+<script async src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

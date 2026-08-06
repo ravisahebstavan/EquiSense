@@ -95,6 +95,18 @@ const human = (s) => LABELS[s] ?? String(s ?? "")
 async function api(path, opts = {}) {
   const r = await fetch("/api" + path, { headers: { "Content-Type": "application/json" }, ...opts });
   if (!r.ok) {
+    /* An expired or cleared token is a SESSION event, not a data error. Left as
+       a thrown "401: unauthorized" it surfaces as cryptic red text on whatever
+       panel happened to ask — and the 90-day cookie guarantees this eventually
+       happens mid-session. Reloading hands the request back to the server,
+       which serves the login page for a non-API path. */
+    if (r.status === 401) {
+      stopQuotes();
+      document.body.innerHTML =
+        '<div style="font:15px system-ui;padding:40px">Session expired — returning to sign-in…</div>';
+      location.replace("/");
+      return new Promise(() => {});      // never resolves; the page is leaving
+    }
     let detail = r.statusText;
     try { detail = JSON.stringify((await r.json()).detail); } catch { /* noop */ }
     throw new Error(`${r.status}: ${detail}`);
@@ -2560,12 +2572,25 @@ const QUOTE_INTERVAL_OPEN_MS = 5 * 60 * 1000;
 const QUOTE_INTERVAL_CLOSED_MS = 30 * 60 * 1000;
 let quoteTimer = null;
 
+function stopQuotes() { clearTimeout(quoteTimer); quoteTimer = null; }
+
 function scheduleQuotes() {
   clearTimeout(quoteTimer);
+  /* A hidden tab cannot show a price, so polling one spends a serverless
+     invocation to update pixels nobody is looking at — and a user with the
+     dashboard and trading desk both open doubles that for no benefit. Polling
+     resumes on focus with an IMMEDIATE fetch, so returning to the tab never
+     shows a stale number while waiting out the rest of an interval. */
+  if (document.hidden) { quoteTimer = null; return; }
   const open = !!(cache.market && cache.market.open);
   quoteTimer = setTimeout(quoteLoop,
     open ? QUOTE_INTERVAL_OPEN_MS : QUOTE_INTERVAL_CLOSED_MS);
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopQuotes();
+  else if (!quoteTimer) quoteLoop();     // refetch at once, then reschedule
+});
 
 document.getElementById("help-grid").innerHTML = SHORTCUTS.map(([k, d]) =>
   `<span>${k.split(" ").map(p => `<kbd>${p}</kbd>`).join(" ")}</span><span>${d}</span>`).join("");

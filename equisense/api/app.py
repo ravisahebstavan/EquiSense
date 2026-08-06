@@ -1014,18 +1014,28 @@ def cron_refresh(s: Session = Depends(db)):
     stage("claims_scored", lambda: L.score_due_claims(s)["scored"])
     stage("checkpoints_scored", lambda: L.score_interim_checkpoints(s)["checkpointed"])
 
-    # 5. Fully recomputable, and the most expensive. Last on purpose: if the
-    #    budget runs out here, tomorrow's run rebuilds it with nothing lost.
+    # 5. The snapshot, which everything below reads.
     snap = stage("snapshot", lambda: build_universe_snapshot(s))
     if isinstance(snap, dict) and "companies" in snap:
         out["snapshot"] = {"companies": len(snap["companies"])}
-    stage("base_rate_records", lambda: run_all_studies(s)["records"])
-    stage("pruned", lambda: prune(s))
+
+    # 6. Acting on the live book, and protecting the database. Both sit AHEAD
+    #    of base rates because neither is recomputable tomorrow: a stop-loss or
+    #    time exit that does not fire today did not fire, and retention that
+    #    does not run lets a 0.5 GB tier fill. Measured at 500 names, studies
+    #    took 112s and pushed both of these past the budget — the book stopped
+    #    being managed so that a statistic could be one day fresher.
     if get_config(s)["enabled"]:
         auto = stage("autopilot", lambda: run_autopilot(s))
         if isinstance(auto, dict):
             out["autopilot"] = {"entries": len(auto["entries"]),
                                 "exits": len(auto["exits"])}
+    stage("pruned", lambda: prune(s))
+
+    # 7. The most expensive stage and the most recomputable one, so it is the
+    #    correct thing to sacrifice on a heavy day: base rates are 10-year
+    #    statistics, and yesterday's are not meaningfully worse than today's.
+    stage("base_rate_records", lambda: run_all_studies(s)["records"])
 
     out["elapsed_s"] = round(_time.monotonic() - t0, 1)
     out["budget_s"] = CRON_BUDGET_S

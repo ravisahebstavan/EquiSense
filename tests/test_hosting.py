@@ -649,6 +649,19 @@ def test_cron_does_irreplaceable_work_before_recomputable_work():
             assert order[irreplaceable] < order[recomputable], (
                 f"{irreplaceable} (cannot be backfilled) must run before "
                 f"{recomputable} (recomputable any time)")
+
+    # Acting on the book and protecting the database are not recomputable
+    # tomorrow: a stop-loss that did not fire today did not fire, and retention
+    # that did not run lets a 0.5 GB tier fill. Base rates are 10-year
+    # statistics and yesterday's are not meaningfully worse, so they are the
+    # correct thing to sacrifice when the budget runs short.
+    for time_sensitive in ("autopilot", "pruned"):
+        idx = src.find(f'stage("{time_sensitive}"')
+        assert idx != -1, f"{time_sensitive} is no longer run by the cron"
+        assert idx < order["base_rate_records"], (
+            f"{time_sensitive} must run BEFORE base_rate_records — at 500 "
+            "names studies cost 112s and pushed it past the budget, so the "
+            "book stopped being managed to keep a statistic one day fresher")
     assert order["forecasts"] < order["base_rate_records"], (
         "registering forecasts is the learning loop; it cannot sit behind the "
         "most expensive recomputable stage")
@@ -895,3 +908,37 @@ def test_cron_refreshes_prices_incrementally_not_a_full_year_every_day():
         "scale with universe size (macro's years=1 is 11 series and is fine)")
     assert "BACKFILL_PER_RUN" in src, "new names must be backfilled in bounded chunks"
     assert app_mod.BACKFILL_PER_RUN <= 100
+
+
+def test_frontend_stops_polling_a_hidden_tab_and_handles_session_expiry():
+    """Two deployment-side failures that the engine tests cannot see.
+
+    A hidden tab cannot show a price, so polling one spends a serverless
+    invocation to update pixels nobody is looking at — and a user with the
+    dashboard and the trading desk both open doubles it for no benefit.
+
+    And the access cookie is 90 days, which guarantees it expires mid-session
+    eventually. Left unhandled, api() throws "401: unauthorized" and it renders
+    as cryptic red text on whichever panel happened to ask, so the app looks
+    broken rather than logged out.
+    """
+    import pathlib
+
+    src = pathlib.Path("web/app.js").read_text()
+
+    assert "visibilitychange" in src, "polling must pause when the tab is hidden"
+    assert "if (document.hidden) { quoteTimer = null; return; }" in src, (
+        "scheduling must refuse to arm a timer for a hidden tab")
+    assert "else if (!quoteTimer) quoteLoop();" in src, (
+        "returning to the tab must refetch immediately, not wait out the "
+        "remainder of an interval showing a stale price")
+
+    i401 = src.find("r.status === 401")
+    assert i401 != -1, "401 must be intercepted centrally in api()"
+    window = src[i401:i401 + 400]
+    assert "location.replace" in window, "an expired session must return to sign-in"
+
+    html = pathlib.Path("web/index.html").read_text()
+    assert 'async src="https://unpkg.com' in html, (
+        "the charting CDN is used by one view and guarded at every call site; "
+        "it must not sit between the user and time-to-interactive")
