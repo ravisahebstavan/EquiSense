@@ -194,6 +194,47 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
                  "note": "hash chain not walked on this request — it is an O(n) "
                          "re-hash from genesis. Verify explicitly to check it."}
 
+    # Series completeness. Distinct from staleness and invisible to it: a hole
+    # in the middle of a series leaves the newest bar current, so a name missing
+    # three weeks of 2024 reports as perfectly fresh while every return,
+    # volatility and correlation computed across the gap is wrong.
+    from ..ingestion.coverage import price_coverage
+    try:
+        coverage = price_coverage(session)
+    except Exception as exc:                           # noqa: BLE001
+        coverage = {"error": f"{type(exc).__name__}: {exc}"[:120]}
+    gap_ratio = 0.0
+    if coverage.get("sessions"):
+        expected = coverage["names"] * coverage["sessions"]
+        gap_ratio = min(1.0, coverage["missing_sessions"] / max(1, expected))
+        if coverage["names_with_gaps"]:
+            warnings.append(
+                f"{coverage['names_with_gaps']} names have gaps in their price "
+                f"history ({coverage['missing_sessions']} missing sessions) — "
+                "the daily repair stage closes these worst-first")
+        if (coverage.get("ohlc_complete_pct") or 100) < 95:
+            warnings.append(
+                f"intraday range missing on {100 - coverage['ohlc_complete_pct']:.1f}% "
+                "of bars — Yang-Zhang volatility falls back to close-to-close, "
+                "which widens stops and shrinks position sizes")
+
+    # A natural key the database is not enforcing means duplicate observations
+    # are possible, and duplicates here are silent: the panel pivot averages
+    # them into a price that never traded.
+    from ..db import unique_keys_missing
+    missing_keys = unique_keys_missing()
+    if missing_keys:
+        warnings.insert(0,
+                        "INTEGRITY: uniqueness is not enforced on "
+                        f"{', '.join(missing_keys)} — duplicate observations "
+                        "would be averaged silently. Re-run schema migration.")
+
+    from ..panel import panel_status
+    try:
+        panel = panel_status(session)
+    except Exception as exc:                           # noqa: BLE001
+        panel = {"error": f"{type(exc).__name__}: {exc}"[:120]}
+
     # Quality score: decomposed, never a mystery number (Phase III rule)
     comp = {
         # Penalised by BREADTH of staleness as well as its age: a dataset where
@@ -209,6 +250,11 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
                             max(0.0, 1 - max(0, price_stale - 3) / 7)
                             * (1 - min(1.0, len(stale_names) / max(1, n_live)))),
         "volume_completeness": 0.0 if not n_prices else 1 - (null_vol / n_prices),
+        # Two faults staleness structurally cannot see, scored explicitly rather
+        # than folded into freshness where they would be invisible again.
+        "series_continuity": round(1.0 - gap_ratio, 4),
+        "intraday_range_coverage": round(
+            (coverage.get("ohlc_complete_pct") or 0) / 100.0, 4),
         "fundamental_coverage": 0.0 if not n_live else
         min(1.0, filing_companies / max(1, n_live - n_live_financial)),
         "studies_current": 0.0 if br_count == 0 else (0.6 if studies_stale else 1.0),
@@ -231,7 +277,8 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
                        "index_members": n_live,
                        "coverage": f"{earliest_price} → {latest_price}",
                        "latest": str(latest_price), "staleness_days": price_stale,
-                       "null_volume_pct": round(null_vol / n_prices * 100, 2) if n_prices else None},
+                       "null_volume_pct": round(null_vol / n_prices * 100, 2) if n_prices else None,
+                       "coverage_detail": coverage, "panel": panel},
             "fundamentals": {"rows": n_filings, "companies_covered": filing_companies,
                              "latest_fy": latest_fy, "pit_grade": "reconstructed",
                              "financial_sector_excluded": n_live_financial},

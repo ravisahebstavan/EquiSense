@@ -900,6 +900,11 @@ CRON_BUDGET_S = 210.0
 # ones it has.
 BACKFILL_PER_RUN = 40
 
+# Names re-pulled per run to close gaps and fill missing intraday range. Smaller
+# than the backfill budget because repair is never urgent and always competes
+# with captures that cannot be backfilled at all (§3.4).
+REPAIR_PER_RUN = 12
+
 
 def _priced_ids(session: Session) -> set[int]:
     """Company ids that already have at least one stored bar."""
@@ -1003,7 +1008,30 @@ def cron_refresh(s: Session = Depends(db)):
             stage("backfilled_names", lambda: {
                 "names": len(chunk), "remaining": len(missing) - len(chunk),
                 "rows": ingest_prices(s, chunk, years=10)})
+        else:
+            # Nothing new to bootstrap, so spend the same budget repairing what
+            # is already there. Staleness cannot see either fault this fixes: a
+            # hole in the MIDDLE of a series leaves the latest bar current, and
+            # a bar missing its intraday range is a bar all the same. Both are
+            # silent, and both corrupt the volatility that sets position size.
+            # Bounded and worst-first, because a hole that has survived a year
+            # survives another day and must never cost the irreplaceable
+            # captures above it.
+            from ..ingestion.coverage import names_needing_repair
+            hurt = names_needing_repair(s, limit=REPAIR_PER_RUN)
+            if hurt:
+                stage("repaired_names", lambda: {
+                    "names": hurt,
+                    "rows": ingest_prices(s, {t: ids[t] for t in hurt if t in ids},
+                                          years=10)})
     stage("macro_rows", lambda: ingest_macro(s, years=1))
+
+    # The columnar panel, rebuilt once here so that every study, IC run, factor
+    # fit and backtest below reads one compressed blob instead of the whole
+    # price table. That read is the largest recurring data transfer in the
+    # system and is what exhausted the tier's quota (§5.3).
+    from ..panel import build_panels
+    stage("panel", lambda: build_panels(s))
 
     # 4. The learning loop. Every gated capability unlocks from realised
     #    forecasts, and a forecast only exists once a dossier is registered.

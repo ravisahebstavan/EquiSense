@@ -15,11 +15,13 @@ import time
 from datetime import date, datetime, timedelta, timezone
 
 import yfinance as yf
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
+from ..db import upsert
 from ..models import Company, FilingPeriod, MacroObservation, PriceObservation
 from .universe import MACRO_SERIES, NIFTY50, is_financial, yahoo_symbol
+from .validate import SeriesReport, clean_bar
 from .vault import store_raw
 
 log = logging.getLogger("equisense.ingest")
@@ -143,6 +145,35 @@ def sync_universe(session: Session, index_key: str | None = None) -> dict[str, i
     return ids
 
 
+# Every optional field of a bar. Updated only when the incoming value is
+# non-null, so a cheap refetch that carries fewer columns than the expensive one
+# can never blank out what is already stored (see db.upsert).
+_BAR_COALESCE = ("close_raw", "open_price", "high_price", "low_price",
+                 "volume", "dividend")
+
+
+def _at(series, d):
+    """One value from a pandas Series by index, or None for missing/NaN.
+
+    yfinance uses NaN, not absence, for a gap inside an otherwise valid frame,
+    and every arithmetic comparison against NaN returns False — so a plain
+    `if x > 0` guard passes it straight through into the database.
+    """
+    if series is None:
+        return None
+    try:
+        x = series.get(d)
+    except (KeyError, TypeError):
+        return None
+    if x is None:
+        return None
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(x) else x
+
+
 def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
                   chunk: int = 25, refetch: bool = False) -> int:
     """Daily price ingestion, storing BOTH price conventions per bar.
@@ -162,12 +193,19 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
     standing bearish tilt on the value cluster. At ~1.3% yield over 10 years the
     oldest bar is deflated ~12%.
 
-    Append-only by default. Pass ``refetch=True`` to rewrite existing bars,
-    which is required once to backfill ``close_raw`` on a database ingested
-    before this change.
+    Writes are UPSERTS keyed on (company_id, obs_date), so re-running this is
+    always safe and always healing. The previous shape read each company's
+    maximum stored date and skipped everything at or below it, which is only
+    equivalent to "already have it" when the series has no holes — and holes are
+    exactly what this path exists to repair. A name that missed a fortnight in
+    the middle of 2024 and is current today has a maximum date of today, so
+    append-only never looked at the gap again. `refetch` is retained for the
+    caller that wants the whole window rewritten unconditionally; the difference
+    is now only how many bars are downloaded, not whether a gap can be fixed.
     """
     tickers = list(ids)
     inserted = 0
+    report = SeriesReport()
     for i in range(0, len(tickers), chunk):
         batch = tickers[i:i + chunk]
         symbols = [yahoo_symbol(t) for t in batch]
@@ -181,9 +219,6 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
                            group_by="ticker", threads=True)
         for t, sym in zip(batch, symbols):
             cid = ids[t]
-            latest = None if refetch else session.scalar(
-                select(func.max(PriceObservation.obs_date))
-                .where(PriceObservation.company_id == cid))
             try:
                 frame = data[sym] if len(symbols) > 1 else data
                 nominal = frame["Close"].dropna()
@@ -199,47 +234,35 @@ def ingest_prices(session: Session, ids: dict[str, int], years: int = 10,
                 log.warning("no price data for %s", sym)
                 continue
             store_raw(frame, "yahoo", f"history/{sym}", {"years": years}, session=session)
-            existing: dict = {}
-            if refetch:
-                existing = {r.obs_date: r for r in session.scalars(
-                    select(PriceObservation)
-                    .where(PriceObservation.company_id == cid)).all()}
             rows = []
             for d, nom in nominal.items():
-                day = d.date()
-                if latest is not None and day <= latest:
+                adj = _at(total_ret, d)
+                bar = clean_bar(close=nom if adj is None else adj, close_raw=nom,
+                                open_=_at(o_s, d), high=_at(h_s, d),
+                                low=_at(l_s, d), volume=_at(volumes, d),
+                                dividend=_at(divs, d), rejects=report.rejects)
+                if bar is None:
                     continue
-                adj = total_ret.get(d)
-                adj = float(nom) if adj is None or math.isnan(adj) else float(adj)
-                v = volumes.get(d)
-                v = None if v is None or math.isnan(v) else float(v)
-                dv = None
-                if divs is not None:
-                    raw_dv = divs.get(d)
-                    if raw_dv is not None and not math.isnan(raw_dv) and raw_dv > 0:
-                        dv = float(raw_dv)
-                def _px(series):
-                    if series is None:
-                        return None
-                    x = series.get(d)
-                    return None if x is None or math.isnan(x) else float(x)
-
-                op, hi, lo_ = _px(o_s), _px(h_s), _px(l_s)
-                row = existing.get(day)
-                if row is not None:
-                    row.close, row.close_raw, row.volume = adj, float(nom), v
-                    row.dividend = dv
-                    row.open_price, row.high_price, row.low_price = op, hi, lo_
-                    inserted += 1
-                    continue
-                rows.append({"company_id": cid, "obs_date": day,
-                             "close": adj, "close_raw": float(nom),
-                             "volume": v, "dividend": dv,
-                             "open_price": op, "high_price": hi, "low_price": lo_})
+                rows.append({"company_id": cid, "obs_date": d.date(), **bar})
+            report.kept += len(rows)
+            inserted += upsert(session, PriceObservation, rows,
+                               conflict_cols=("company_id", "obs_date"),
+                               update_cols=("close", "source"),
+                               coalesce_cols=_BAR_COALESCE)
+            # Measured prices supersede seeded ones. The synthetic path exists
+            # only so the UI has something to render before any ingestion has
+            # run; once this name has real bars the fabricated ones are strictly
+            # worse than nothing, because they sit on real dates and no
+            # downstream query can tell them apart.
             if rows:
-                session.bulk_insert_mappings(PriceObservation, rows)
-                inserted += len(rows)
+                session.execute(
+                    delete(PriceObservation)
+                    .where(PriceObservation.company_id == cid,
+                           PriceObservation.source == "demo"))
         session.commit()
+    if report.rejects.total():
+        log.warning("price ingest rejected fields on %d bars: %s",
+                    report.rejects.total(), report.rejects.as_dict())
     return inserted
 
 
@@ -271,12 +294,6 @@ def _refresh_period(session: Session, ids: dict[str, int]) -> str:
     return "2y"
 
 
-# Yahoo period string -> calendar days, for sizing the prefetch of existing
-# bars. Generous on purpose: over-fetching by a few days costs one small query,
-# under-fetching silently reintroduces the per-bar SELECT.
-PERIOD_DAYS = {"5d": 12, "1mo": 45, "3mo": 130, "6mo": 260, "1y": 400}
-
-
 def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
     """Near-live price refresh: re-fetch recent daily bars and UPSERT — today's
     running bar updates intraday (Yahoo serves the live running candle,
@@ -285,63 +302,76 @@ def refresh_quotes(session: Session, ids: dict[str, int]) -> dict:
 
     The window is sized to the furthest-behind name rather than fixed, so a name
     that missed a week heals itself instead of acquiring a permanent gap.
+
+    This path writes COMPLETE bars, and that is not a detail. It is the primary
+    inserter of new rows — the cron calls it daily and the browser calls it
+    every few minutes — while `ingest_prices` only ever runs for names with no
+    history at all. It used to fetch and store close, close_raw and volume only,
+    so every bar it created was permanently missing its intraday range and any
+    dividend on that date, and the append-only backfill could never revisit
+    them. Measured on the live database: 3,500 of the current month's 5,000 bars
+    had no open/high/low.
+
+    What that cost is specific. Yang-Zhang volatility needs consecutive valid
+    OHLC and falls back to close-to-close when it cannot get it — a estimator
+    roughly six times less efficient for the same window — and that volatility
+    is the stop distance, which is the position size. The range arrives in the
+    same HTTP response either way; only the storing was missing.
     """
     symbols = [yahoo_symbol(t) for t in ids]
     period = _refresh_period(session, ids)
+    # actions=True carries Dividends in the SAME request. Without it the
+    # money-weighted return understates by roughly the dividend yield, every
+    # year, and the ex-date is unrecoverable later.
     data = yf.download(symbols, period=period, interval="1d", auto_adjust=False,
-                       progress=False, group_by="ticker", threads=True)
-    updated = inserted = 0
+                       actions=True, progress=False, group_by="ticker",
+                       threads=True)
     latest_prices: dict[str, float] = {}
-
-    # Every bar in the window that ALREADY exists, in one round trip keyed by
-    # (company, date). This previously issued a SELECT per bar per name — at 500
-    # names over a five-day window that is ~2,500 queries, each returning a full
-    # entity, on a path that runs in the cron AND every five minutes while a tab
-    # is open. On a database that meters data transfer, a hot loop pulling whole
-    # rows to decide whether to write them is the most expensive way possible to
-    # do nothing: the common case is that the bar is already correct.
-    existing: dict[tuple[int, date], PriceObservation] = {}
-    if ids:
-        cutoff = date.today() - timedelta(days=PERIOD_DAYS.get(period, 400))
-        for row in session.scalars(
-                select(PriceObservation)
-                .where(PriceObservation.company_id.in_(list(ids.values())),
-                       PriceObservation.obs_date >= cutoff)).all():
-            existing[(row.company_id, row.obs_date)] = row
+    report = SeriesReport()
+    rows: list[dict] = []
 
     for t, sym in zip(ids, symbols):
         cid = ids[t]
         try:
             frame = data[sym] if len(symbols) > 1 else data
             nominal = frame["Close"].dropna()
-            total_ret = frame["Adj Close"] if "Adj Close" in frame else frame["Close"]
-            volumes = frame["Volume"]
         except KeyError:
             continue
+        total_ret = frame["Adj Close"] if "Adj Close" in frame else frame["Close"]
+        volumes = frame["Volume"] if "Volume" in frame else None
+        divs = frame["Dividends"] if "Dividends" in frame else None
+        o_s = frame["Open"] if "Open" in frame else None
+        h_s = frame["High"] if "High" in frame else None
+        l_s = frame["Low"] if "Low" in frame else None
         for d, nom in nominal.items():
-            v = volumes.get(d)
-            v = None if v is None or math.isnan(v) else float(v)
-            adj = total_ret.get(d)
-            adj = float(nom) if adj is None or math.isnan(adj) else float(adj)
-            row = existing.get((cid, d.date()))
-            if row is None:
-                session.add(PriceObservation(company_id=cid, obs_date=d.date(),
-                                             close=adj, close_raw=float(nom),
-                                             volume=v))
-                inserted += 1
-            elif (abs(row.close - adj) > 1e-9 or row.close_raw is None
-                  or abs((row.close_raw or 0) - float(nom)) > 1e-9
-                  or (v is not None and row.volume != v)):
-                row.close = adj
-                row.close_raw = float(nom)
-                row.volume = v
-                updated += 1
+            adj = _at(total_ret, d)
+            bar = clean_bar(close=nom if adj is None else adj, close_raw=nom,
+                            open_=_at(o_s, d), high=_at(h_s, d), low=_at(l_s, d),
+                            volume=_at(volumes, d), dividend=_at(divs, d),
+                            rejects=report.rejects)
+            if bar is None:
+                continue
+            rows.append({"company_id": cid, "obs_date": d.date(), **bar})
         # paper fills and displayed quotes must use the NOMINAL traded price
         if len(nominal):
             latest_prices[t] = round(float(nominal.iloc[-1]), 2)
+
+    # One upsert instead of a prefetch-compare-write cycle. The prefetch that
+    # used to sit here read every stored bar in the window as a full ORM entity
+    # purely to decide, in the overwhelmingly common case, that nothing needed
+    # writing — pure metered data transfer spent to do nothing. ON CONFLICT
+    # pushes that decision to the database, which already has the rows, and is
+    # correct when two refreshes overlap where the read-then-write was not.
+    report.kept = len(rows)
+    written = upsert(session, PriceObservation, rows,
+                     conflict_cols=("company_id", "obs_date"),
+                     update_cols=("close",), coalesce_cols=_BAR_COALESCE)
     session.commit()
-    return {"updated": updated, "inserted": inserted, "prices": latest_prices,
-            "window": period,
+    if report.rejects.total():
+        log.warning("quote refresh rejected fields on %d bars: %s",
+                    report.rejects.total(), report.rejects.as_dict())
+    return {"bars_written": written, "prices": latest_prices,
+            "window": period, "quality": report.as_dict(),
             "as_of_utc": datetime.now(timezone.utc).isoformat()}
 
 
@@ -358,22 +388,33 @@ def market_open_ist() -> dict:
 
 
 def ingest_macro(session: Session, years: int = 10) -> int:
+    """Regime inputs (NIFTY, India VIX, USD/INR, Brent).
+
+    Upserted on (symbol, obs_date) rather than appended past the stored maximum.
+    These four series drive the regime description and every conditional base
+    rate; a hole in the middle of one is not visible from its latest date, and
+    the append-only filter guaranteed the hole could never be seen again. They
+    are also small enough — four series, ~2,500 bars each — that rewriting the
+    window costs nothing worth optimising for.
+    """
     inserted = 0
     for symbol, (name, role) in MACRO_SERIES.items():
-        latest = session.scalar(select(func.max(MacroObservation.obs_date))
-                                .where(MacroObservation.symbol == symbol))
         hist = yf.Ticker(symbol).history(period=f"{years}y", interval="1d")
         if hist is None or hist.empty:
             log.warning("no macro data for %s", symbol)
             continue
         store_raw(hist, "yahoo", f"macro/{symbol}", {"years": years}, session=session)
         closes = hist["Close"].dropna()
-        rows = [{"symbol": symbol, "role": role, "obs_date": d.date(), "close": float(c)}
-                for d, c in closes.items()
-                if latest is None or d.date() > latest]
-        if rows:
-            session.bulk_insert_mappings(MacroObservation, rows)
-            inserted += len(rows)
+        rows = []
+        for d, c in closes.items():
+            v = _at(closes, d)
+            if v is None or v <= 0:
+                continue
+            rows.append({"symbol": symbol, "role": role,
+                         "obs_date": d.date(), "close": v})
+        inserted += upsert(session, MacroObservation, rows,
+                           conflict_cols=("symbol", "obs_date"),
+                           update_cols=("close", "role"))
     session.commit()
     return inserted
 

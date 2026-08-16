@@ -10,7 +10,7 @@ Design decisions carried through from the draft:
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (Boolean, Date, DateTime, Float, ForeignKey, Integer,
                         LargeBinary, String, Text)
@@ -114,6 +114,18 @@ class PriceObservation(Base):
     high_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     low_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     volume: Mapped[float | None] = mapped_column(Float, nullable=True)  # shares traded
+    # Provenance. Everything analytical must be able to tell a measured price
+    # from a fabricated one, and until this column existed it could not.
+    #
+    # seed/demo_data.py writes a synthetic annual price path so the UI is
+    # navigable before any ingestion has run. It marks the COMPANY is_demo_data,
+    # but sync_universe then sets that flag False on every name the index
+    # actually contains — and the seeded names are real NIFTY constituents. The
+    # flag cleared, the fabricated bars stayed, and nine live index members were
+    # carrying invented prices that no query could distinguish from market data.
+    # Provenance belongs on the observation, not on the company, because it is
+    # the observation that is or is not a measurement.
+    source: Mapped[str] = mapped_column(String(10), default="yahoo")  # yahoo | demo
     # Cash dividend per share with this EX-date (0/None on ordinary days).
     # Required for money-weighted return: a dividend is a real cash inflow, and
     # omitting it understates XIRR by roughly the yield, every year.
@@ -292,6 +304,28 @@ class AppSnapshot(Base):
     payload: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
                                                  onupdate=datetime.utcnow)
+
+
+class PanelBlob(Base):
+    """The price panel in column-major order, compressed (see panel.py).
+
+    Same bars, same fields, full fidelity — re-encoded, not summarised. This is
+    what lets a metered free tier carry a ten-year 500-name panel: the row store
+    ships ~157 bytes per observation and repeats the company id and date on
+    every one of them, while the panel ships the float grid and the two axes
+    once.
+    """
+    __tablename__ = "panel_blobs"
+    key: Mapped[str] = mapped_column(String(20), primary_key=True)
+    as_of: Mapped[str] = mapped_column(String(20))
+    # Identity of the row store the blob was built from, so a consumer can tell
+    # "current" from "merely present" without recounting a million rows.
+    fingerprint: Mapped[str] = mapped_column(String(40), default="")
+    nbytes: Mapped[int] = mapped_column(Integer, default=0)
+    meta: Mapped[str] = mapped_column(Text, default="{}")
+    blob: Mapped[bytes] = mapped_column(LargeBinary)
+    built_at: Mapped[datetime] = mapped_column(DateTime,
+                                               default=lambda: datetime.now(UTC))
 
 
 class LedgerRecord(Base):
