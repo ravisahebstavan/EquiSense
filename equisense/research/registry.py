@@ -277,15 +277,23 @@ REGISTRY: dict[str, dict] = {
                 "returned by engine.technical.trend_200dma (`above_pct`); the "
                 "21d MA slope it also reports is not the ranked quantity.",
         "status": "computed",
-        "result": "The STRONGEST single signal measured on this universe: IC "
-                  "+0.0340/+0.0654/+0.0945 at 21/63/126d, t=2.24/3.16/3.65, hit "
-                  "rate 74.8% at 126d. Clears Harvey-Liu-Zhu |t|>=3 at 126d. "
-                  "Walk-forward OOS IC +0.071 at 126d — HIGHER than 12-1 "
-                  "momentum's +0.062, on 2 folds. Deliberately NOT promoted "
-                  "above cap 0.25: raising influence on a post-hoc in-sample "
-                  "result is the overfitting failure this registry exists to "
-                  "prevent, and 2 folds is not a track record. Promotion should "
-                  "come from realised forecasts, not from this entry.",
+        "result": "SUPERSEDED — did not replicate on a deeper panel. "
+                  "Originally measured 2026-08-02 on a ~2,485-day panel in which "
+                  "most names carried only a few hundred bars: IC "
+                  "+0.0340/+0.0654/+0.0945 at 21/63/126d, t=2.24/3.16/3.65, "
+                  "recorded as clearing the Harvey-Liu-Zhu |t|>=3 hurdle at "
+                  "126d. Re-measured 2026-08-16 after every one of the 500 names "
+                  "was backfilled to a full ten years (2,798 sessions, 1.02M "
+                  "bars): IC +0.0393/+0.0691/+0.0919, t=1.87/2.33/2.20. The "
+                  "point estimates barely moved; the t-statistics roughly halved "
+                  "at the long horizons and the HLZ claim no longer holds at any "
+                  "horizon. The earlier figure was not wrong for the data it "
+                  "had — it was computed on a panel whose deep history covered a "
+                  "minority of names, which understated the standard error. "
+                  "Retained at cap 0.25 and NOT promoted. The lesson is recorded "
+                  "rather than the number quietly edited: a t-statistic is a "
+                  "statement about a sample, and expanding the sample is a test "
+                  "the original claim can fail.",
     },
     "HYP-023": {
         "name": "relative_strength_vs_index",

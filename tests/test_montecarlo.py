@@ -237,13 +237,33 @@ def test_goal_uses_supplied_history_when_available():
 def test_perfectly_correlated_assets_do_not_break_cholesky():
     """A correlation matrix of exactly 1.0 off-diagonal is positive SEMI-definite
     with a zero eigenvalue; np.linalg.cholesky raises on it. Real cases: an ETF
-    against its own index, dual listings, or a duplicated column."""
+    against its own index, dual listings, or a duplicated column.
+
+    This used to assert that the eigenvalue REPAIR fired. It no longer does, and
+    that is the improvement rather than a regression: Ledoit-Wolf shrinkage is
+    positive definite by construction, so the degenerate matrix never reaches
+    the repair. What the test guards is the property that actually matters — a
+    duplicated column must not crash, and must not make the book look
+    diversified — so it now asserts that directly instead of asserting which
+    internal path produced it.
+    """
     r = _gaussian_returns(500, seed=12)
     res = MC.simulate_portfolio_risk({"A": r, "B": r}, {"A": 3.0, "B": 1.0},
-                                     horizon_days=5, n_paths=2_000, seed=1)
+                                     horizon_days=5, n_paths=4_000, seed=1)
     assert res["computable"] is True
-    assert res["correlation_repaired"] is True
     assert res["models"]["gaussian"]["volatility_pct"] > 0
+
+    # Two copies of one asset carry exactly one asset's risk. The failure this
+    # forbids is silent and expensive: a covariance estimator that treated the
+    # duplicate as a second independent name would report a book that
+    # diversifies away half its variance, and every position size derived from
+    # that number would be too large.
+    truth = float(np.std(r, ddof=1)) * math.sqrt(252) * 100
+    assert res["annualised_vol_pct"] == pytest.approx(truth, rel=0.02), (
+        "duplicated holdings must not be credited with diversification")
+    assert 0.0 <= res["correlation_shrinkage"] < 0.10, (
+        "with 500 observations and 2 assets the sample estimate is well "
+        "determined, so shrinkage should be mild")
 
 
 def test_safe_cholesky_survives_a_singular_matrix():

@@ -422,6 +422,183 @@ def deflated_sharpe_ratio(returns: Sequence[float], n_trials: int,
     }
 
 
+def probabilistic_sharpe_ratio(returns: Sequence[float],
+                               benchmark_sr: float = 0.0) -> dict:
+    """Bailey & López de Prado's PSR: P(true Sharpe > benchmark).
+
+    The companion to the deflated version and the one to reach for when only
+    ONE configuration was tried, where deflating for trials would be a
+    correction for a bias that is not present. Same non-normality denominator:
+    a Sharpe computed on negatively skewed, fat-tailed returns — which is what
+    a trend-following equity book produces — is less certain than the same
+    number computed on Gaussian ones, and the plain t-statistic cannot say so.
+    """
+    x = [float(v) for v in returns if v is not None and v == v]
+    T = len(x)
+    if T < 4:
+        return {"computable": False, "reason": f"need ≥4 periods, have {T}"}
+    m = sum(x) / T
+    var = sum((v - m) ** 2 for v in x) / (T - 1)
+    if var <= 0:
+        return {"computable": False, "reason": "zero return variance"}
+    sr = m / math.sqrt(var)
+    skew, kurt = _skew_kurt(x)
+    denom_sq = 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr
+    if denom_sq <= 0:
+        return {"computable": False, "reason": "non-normality correction degenerate"}
+    z = (sr - benchmark_sr) * math.sqrt(T - 1) / math.sqrt(denom_sq)
+    return {"computable": True, "sharpe_per_period": round(sr, 4),
+            "benchmark_sr": benchmark_sr, "periods": T,
+            "skew": round(skew, 3), "kurtosis": round(kurt, 3),
+            "psr": round(norm_cdf(z), 4),
+            "citation": "Bailey & López de Prado (2012), Journal of Risk"}
+
+
+def lo_annualized_sharpe(returns: Sequence[float], periods_per_year: float,
+                         max_lag: Optional[int] = None) -> dict:
+    """Annualised Sharpe with Lo's (2002) autocorrelation correction.
+
+    The √q rule that turns a monthly Sharpe into an annual one is only valid
+    when returns are serially INDEPENDENT. They are not here, and the direction
+    of the error is not neutral: a trend-following book has positively
+    autocorrelated period returns, √q understates its true multi-period
+    volatility, and the annualised Sharpe is therefore flattered. A
+    mean-reverting book gets the opposite treatment.
+
+    Lo replaces √q with
+
+        η(q) = q / sqrt( q + 2·Σ_{k=1}^{q−1} (q − k)·ρ_k )
+
+    which reduces to √q exactly when every ρ_k is zero, so this never disagrees
+    with the naive figure without cause — it only disagrees when the data says
+    the naive figure was wrong.
+
+    Reported ALONGSIDE the naive number rather than instead of it, because the
+    gap between them is itself the diagnostic.
+    """
+    x = [float(v) for v in returns if v is not None and v == v]
+    T = len(x)
+    q = max(1, int(round(periods_per_year)))
+    if T < max(8, q // 2):
+        return {"computable": False, "reason": f"need ≥{max(8, q // 2)} periods, have {T}"}
+    m = sum(x) / T
+    var = sum((v - m) ** 2 for v in x) / (T - 1)
+    if var <= 0:
+        return {"computable": False, "reason": "zero return variance"}
+    sr = m / math.sqrt(var)
+
+    lag_cap = min(q - 1, T - 2 if max_lag is None else max_lag, T - 2)
+    e = [v - m for v in x]
+    g0 = sum(v * v for v in e) / T
+    rhos = []
+    for k in range(1, max(0, lag_cap) + 1):
+        gk = sum(e[i] * e[i - k] for i in range(k, T)) / T
+        rhos.append(gk / g0 if g0 > 0 else 0.0)
+
+    adj = q + 2.0 * sum((q - (k + 1)) * r for k, r in enumerate(rhos))
+    naive = sr * math.sqrt(q)
+    if adj <= 0:
+        return {"computable": True, "sharpe_per_period": round(sr, 4),
+                "annualized_naive": round(naive, 4), "annualized_lo": None,
+                "eta": None, "autocorrelations": [round(r, 4) for r in rhos],
+                "note": ("the autocorrelation-adjusted multi-period variance is "
+                         "non-positive, which means the series is too short or "
+                         "too strongly negatively autocorrelated to annualise")}
+    eta = q / math.sqrt(adj)
+    return {"computable": True,
+            "sharpe_per_period": round(sr, 4),
+            "annualized_naive": round(naive, 4),
+            "annualized_lo": round(sr * eta, 4),
+            "eta": round(eta, 4), "sqrt_q": round(math.sqrt(q), 4),
+            "autocorrelations": [round(r, 4) for r in rhos],
+            "reading": (
+                "√q overstates the annualised Sharpe here (returns are "
+                "positively autocorrelated)" if eta < math.sqrt(q) - 1e-9 else
+                "√q understates the annualised Sharpe here (returns are "
+                "negatively autocorrelated)" if eta > math.sqrt(q) + 1e-9 else
+                "returns show no usable serial correlation; √q is correct"),
+            "citation": "Lo (2002), Financial Analysts Journal, 'The Statistics of Sharpe Ratios'"}
+
+
+def ledoit_wolf_covariance(observations) -> dict:
+    """Ledoit & Wolf (2004) shrinkage toward a scaled identity.
+
+    The sample covariance of N assets from T observations is a terrible
+    estimator whenever N is not small relative to T, and the failure is
+    systematic rather than noisy: its largest eigenvalues are biased UP and its
+    smallest biased DOWN. Every use in this codebase is exactly the use that
+    punishes that — inverting or factorising it. Cholesky for correlated Monte
+    Carlo paths runs on the small eigenvalues, so understated ones produce
+    simulated portfolios that look far better diversified than the book is, and
+    VaR, CVaR and the position size derived from them all read too kind.
+
+    Shrinkage trades a little bias for a large variance reduction and is
+    guaranteed positive definite, so it also removes the reason the PSD repair
+    exists. The intensity is not a tuning knob: it is the analytically optimal
+    one under Frobenius loss, computed from the data.
+
+        Σ* = δ·μI + (1−δ)·S,   μ = tr(S)/N,   δ = b²/d²
+
+    Returns the intensity as well as the matrix. Read δ carefully rather than as
+    a quality score: a high value does NOT always mean the sample estimate was
+    poor. It is the ratio of estimation error to the distance between the sample
+    matrix and the target, so when the true covariance is genuinely close to a
+    scaled identity — uncorrelated assets of similar volatility — the
+    denominator collapses and δ approaches 1 because shrinking all the way to
+    the target is then the *correct* answer. δ is large either when the sample
+    estimate is noisy or when the target is right.
+    """
+    import numpy as np
+
+    X = np.asarray(observations, dtype=float)
+    if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < 1:
+        return {"computable": False, "reason": "need a 2-D (T x N) array with T ≥ 2"}
+    T, N = X.shape
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = (Xc.T @ Xc) / T                      # MLE, matching the paper
+
+    # Normalised Frobenius inner product <A,B> = tr(A B') / N
+    mu = float(np.trace(S) / N)
+    d2 = float(np.sum((S - mu * np.eye(N)) ** 2) / N)
+    if d2 <= 0:                              # S is already a scaled identity
+        return {"computable": True, "covariance": S, "shrinkage": 0.0,
+                "mu": mu, "n_obs": T, "n_assets": N,
+                "note": "sample covariance is already proportional to the identity"}
+
+    # b̄² = (1/T²) Σ_t ||x_t x_t' − S||²  — computable without forming T outer
+    # products, using ||x x' − S||² = (x'x)²/N − 2 x'Sx/N + ||S||².
+    xx = np.einsum("ij,ij->i", Xc, Xc)               # x_t'x_t
+    xSx = np.einsum("ij,jk,ik->i", Xc, S, Xc)        # x_t' S x_t
+    s_norm2 = float(np.sum(S ** 2) / N)
+    b2_bar = float(np.sum(xx ** 2 / N - 2.0 * xSx / N + s_norm2) / (T * T))
+    b2 = min(b2_bar, d2)                     # Ledoit-Wolf cap: δ ∈ [0, 1]
+    delta = b2 / d2
+    sigma = delta * mu * np.eye(N) + (1.0 - delta) * S
+    return {"computable": True, "covariance": sigma, "shrinkage": round(delta, 4),
+            "mu": mu, "n_obs": T, "n_assets": N,
+            "citation": "Ledoit & Wolf (2004), Journal of Multivariate Analysis"}
+
+
+def shrunk_correlation(observations):
+    """Ledoit-Wolf correlation matrix — the drop-in for np.corrcoef.
+
+    Returns (correlation, shrinkage intensity). Falls back to the sample
+    correlation only when the shrinkage estimator is not computable at all,
+    which needs fewer than two observations.
+    """
+    import numpy as np
+
+    lw = ledoit_wolf_covariance(observations)
+    if not lw.get("computable"):
+        X = np.asarray(observations, dtype=float)
+        return np.corrcoef(X, rowvar=False), 0.0
+    cov = lw["covariance"]
+    sd = np.sqrt(np.clip(np.diag(cov), 1e-300, None))
+    corr = cov / np.outer(sd, sd)
+    np.fill_diagonal(corr, 1.0)
+    return np.clip(corr, -1.0, 1.0), lw["shrinkage"]
+
+
 # ------------------------------------------------------------- bootstrapping
 
 def cluster_block_bootstrap_ci(groups: Sequence[Sequence[float]],
