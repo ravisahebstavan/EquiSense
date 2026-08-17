@@ -2003,6 +2003,38 @@ async function viewLab(section = "hypotheses") {
             <span class="m-value">${fmtN(p.rows, 0)}</span><span class="m-unit">rows</span></div>
           <div class="sub" style="margin:0 0 6px 2px">${esc(p.coverage)} · ${p.companies} companies ·
             null volume ${p.null_volume_pct}% · ${p.staleness_days}d stale</div>
+          ${(() => {
+            /* Completeness is NOT staleness and the difference is the point: a
+               name missing three weeks from the middle of 2024 is current today,
+               so it reads perfectly fresh while every return computed across the
+               gap is wrong. Same for a bar with no intraday range — the bar is
+               there, and Yang-Zhang quietly falls back to a 6x noisier
+               estimator that sets the stop distance. Neither is visible
+               anywhere else on this page. */
+            const c = p.coverage_detail;
+            if (!c || c.error || !c.sessions) return "";
+            return `<div class="metric-row" style="cursor:default"><span class="m-label">Series completeness</span>
+              <span class="m-value">${c.names_with_gaps}</span><span class="m-unit">names with gaps</span></div>
+            <div class="sub" style="margin:0 0 6px 2px">${fmtN(c.missing_sessions, 0)} missing sessions across
+              ${c.names} names · ${c.sessions} exchange sessions · intraday range on
+              ${c.ohlc_complete_pct}% of bars</div>
+            ${(c.worst || []).filter(w => w.missing_sessions > 0 || w.ohlc_pct < 98).slice(0, 5)
+              .map(w => `<div class="sub" style="margin:0 0 2px 10px">${esc(w.ticker)} —
+                ${w.missing_sessions} missing · OHLC ${w.ohlc_pct}%</div>`).join("")}`;
+          })()}
+          ${(() => {
+            const pb = p.panel;
+            if (!pb || pb.error || !pb.blobs) return "";
+            const core = pb.blobs.prices_core || {};
+            if (!core.present) return `<div class="sub" style="margin:0 0 6px 2px">
+              Columnar panel not built — studies read the full price table.</div>`;
+            return `<div class="metric-row" style="cursor:default"><span class="m-label">Columnar panel
+              ${pb.fresh ? "" : "<b>(STALE — studies fall back to the table)</b>"}</span>
+              <span class="m-value">${pb.total_mb}</span><span class="m-unit">MB</span></div>
+            <div class="sub" style="margin:0 0 6px 2px">${core.rows} sessions × ${core.cols} names ·
+              as of ${esc(core.as_of)} · the same bars column-major, which is what keeps every study
+              off the metered path</div>`;
+          })()}
           <div class="metric-row" style="cursor:default"><span class="m-label">Fundamentals (pit_grade: ${esc(f.pit_grade)})</span>
             <span class="m-value">${f.rows}</span><span class="m-unit">filings</span></div>
           <div class="sub" style="margin:0 0 6px 2px">${f.companies_covered} companies · latest FY${f.latest_fy} ·

@@ -11,3 +11,6 @@ dist/
 *.egg-info/
 .vercel/
 .claude/settings.local.json
+
+# vercel-mcp tooling, installed locally — never the repo's business
+node_modules/

@@ -39,6 +39,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+from ..research import stats as _stats
+
 TRADING_DAYS = 252
 DEFAULT_PATHS = 20_000
 
@@ -259,7 +261,19 @@ def simulate_portfolio_risk(returns_by_asset: dict[str, Sequence[float]],
 
     mu = R.mean(axis=0)
     sd = R.std(axis=0, ddof=1)
-    corr = np.corrcoef(R, rowvar=False) if len(names) > 1 else np.array([[1.0]])
+    # Ledoit-Wolf shrinkage rather than the raw sample correlation. The sample
+    # estimate's error is not symmetric noise: its largest eigenvalues are
+    # biased UP and its smallest biased DOWN, and the small ones are exactly
+    # what the Cholesky factorisation below rests on. Understated small
+    # eigenvalues simulate a book that diversifies better than it does, which
+    # makes VaR, CVaR and every position size derived from them read too kind —
+    # an error in the one direction that costs money. Shrinkage is also
+    # guaranteed positive definite, so the PSD repair below now almost never
+    # has to fire; it is kept because a caller can still pass a degenerate pair.
+    if len(names) > 1:
+        corr, shrinkage = _stats.shrunk_correlation(R)
+    else:
+        corr, shrinkage = np.array([[1.0]]), 0.0
     psd_corr, repaired = nearest_psd_correlation(np.atleast_2d(corr))
     rng = np.random.default_rng(seed)
 
@@ -301,6 +315,11 @@ def simulate_portfolio_risk(returns_by_asset: dict[str, Sequence[float]],
                                                   if len(names) > 1 else R.var(ddof=1))
                                           * math.sqrt(TRADING_DAYS) * 100), 2),
         "correlation_repaired": repaired,
+        # Surfaced, not absorbed: an intensity near 1 says the sample
+        # correlation carried almost no usable information and the simulation is
+        # effectively running on an equicorrelated book.
+        "correlation_shrinkage": round(float(shrinkage), 4),
+        "correlation_estimator": "Ledoit-Wolf (2004) shrinkage to scaled identity",
         "models": {k: v.to_dict() for k, v in results.items()},
         "tail_model_gap_99_pct": round(float(understatement), 3),
         "interpretation": (

@@ -234,9 +234,10 @@ def seed(session: Session, include_demo_portfolio: bool = True) -> None:
         for i, (fy, *_rest) in enumerate(reversed(cfg["years"])):
             session.add(PriceObservation(company_id=c.id,
                                          obs_date=date(fy, 3, 31),
-                                         close=round(price / (1.12 ** i), 2)))
+                                         close=round(price / (1.12 ** i), 2),
+                                         source="demo"))
         session.add(PriceObservation(company_id=c.id, obs_date=date(2026, 7, 10),
-                                     close=price))
+                                     close=price, source="demo"))
 
         for name, value, unit in cfg.get("sector_attrs", []):
             session.add(SectorAttribute(company_id=c.id, period="FY2025",

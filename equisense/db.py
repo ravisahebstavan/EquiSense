@@ -97,6 +97,7 @@ _SOFT_MIGRATIONS = [
     ("filing_periods", "net_interest_income", "FLOAT"),
     ("filing_periods", "source", "VARCHAR(20) DEFAULT 'manual'"),
     ("filing_periods", "pit_grade", "VARCHAR(20) DEFAULT 'reconstructed'"),
+    ("price_observations", "source", "VARCHAR(10) DEFAULT 'yahoo'"),
     ("price_observations", "volume", "FLOAT"),
     ("price_observations", "close_raw", "FLOAT"),   # nominal (split-only) close
     ("price_observations", "dividend", "FLOAT"),    # cash dividend on the ex-date
@@ -124,9 +125,179 @@ _SOFT_MIGRATIONS = [
 ]
 
 
+# Natural keys of the time-series tables: (index name, table, key columns).
+#
+# Every one of these is a measurement of one thing on one day, so a second row
+# for the same key is never new information — it is a duplicate, and duplicates
+# here are silent rather than loud. `load_price_panel` pivots with pandas'
+# default aggfunc="mean", so two bars for the same (company, date) are quietly
+# AVERAGED into a price that never traded, and every return, volatility,
+# correlation and base rate computed across it inherits the error with nothing
+# to indicate it happened.
+#
+# Nothing prevented that. The writers deduplicated in application code — read
+# the existing rows, decide, insert the rest — which holds only while exactly
+# one writer runs at a time. On this deployment two do: the daily cron and the
+# browser's own refresh, and the paper-trading loop calls refresh_quotes every
+# few minutes while a tab is open. Two overlapping runs both read "absent" and
+# both insert.
+#
+# A unique index moves that guarantee from convention into the database, and it
+# is also what makes ON CONFLICT upserts (below) legal — so it buys correctness
+# under concurrency and a cheaper write path at the same time.
+_UNIQUE_INDEXES = [
+    ("uq_prices_cid_date", "price_observations", ("company_id", "obs_date")),
+    ("uq_macro_sym_date", "macro_observations", ("symbol", "obs_date")),
+    ("uq_index_obs_name_date", "index_observations", ("index_name", "obs_date")),
+    ("uq_delivery_date_sym", "delivery_stats", ("trade_date", "symbol", "series")),
+    ("uq_volsurf_date_sym_exp", "vol_surface_observations",
+     ("obs_date", "symbol", "expiry")),
+]
+
+# Superseded by the unique indexes above, which serve exactly the same lookups.
+# Carrying both doubles the write cost and the disk for no read benefit.
+_REDUNDANT_INDEXES = ["ix_prices_cid_date", "ix_macro_sym_date"]
+
+
 # Bumped whenever _SOFT_MIGRATIONS or the table set changes, so a deployment
 # running older code cannot mistake a newer schema for "already done".
-SCHEMA_VERSION = "2026-08-03.1"
+SCHEMA_VERSION = "2026-08-16.1"
+
+# Filled by ensure_schema. Read by api/status.py: a uniqueness guarantee that
+# failed to apply must be visible, because everything downstream of it then
+# depends on application-level deduplication that concurrency can defeat.
+SCHEMA_NOTES: dict[str, str] = {}
+
+
+def _apply_unique_keys() -> None:
+    """Deduplicate, then enforce the natural key of each time-series table.
+
+    Each index gets its OWN transaction. On Postgres a failed statement poisons
+    the whole transaction, so sharing one would mean a single table that cannot
+    be deduplicated (a foreign key elsewhere, a permission) silently taking the
+    other four constraints down with it.
+
+    Failures are recorded rather than raised. ensure_schema() runs on the
+    serverless cold-start path, and an exception here would put the app back to
+    failing to boot at all — which is the failure mode this codebase has already
+    paid for twice. The constraint is important; being unable to serve a page
+    that explains why it is missing is worse.
+    """
+    insp = inspect(engine)
+    for name, table, cols in _UNIQUE_INDEXES:
+        if not insp.has_table(table):
+            continue
+        key = ", ".join(cols)
+        try:
+            with engine.begin() as conn:
+                # Keep the earliest row of each key. Ordering by id is arbitrary
+                # between genuine duplicates, which is the point: they are meant
+                # to be identical measurements, and any that are not were
+                # produced by a bug that this index now makes impossible to
+                # repeat.
+                conn.execute(text(
+                    f"DELETE FROM {table} WHERE id IN ("
+                    f"  SELECT id FROM ("
+                    f"    SELECT id, ROW_NUMBER() OVER ("
+                    f"      PARTITION BY {key} ORDER BY id) AS rn FROM {table}"
+                    f"  ) dupes WHERE rn > 1)"))
+                conn.execute(text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table} ({key})"))
+        except Exception as exc:                       # noqa: BLE001
+            SCHEMA_NOTES[name] = f"{type(exc).__name__}: {exc}"[:200]
+            continue
+        SCHEMA_NOTES.pop(name, None)
+
+    # Retroactive provenance. Rows written before price_observations.source
+    # existed all defaulted to 'yahoo', including the fabricated seed path.
+    #
+    # The signature is exact rather than heuristic: seed/demo_data.py writes a
+    # close and nothing else, while every bar Yahoo has ever returned carries a
+    # volume. A row with no nominal price, no volume AND no intraday range is
+    # not something the provider produces — verified against the live database,
+    # where the rows matching this predicate are precisely the 54 seeded ones,
+    # on the six synthetic dates, across the nine seeded names.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE price_observations SET source = 'demo' "
+                "WHERE source = 'yahoo' AND close_raw IS NULL "
+                "AND volume IS NULL AND open_price IS NULL"))
+    except Exception as exc:                           # noqa: BLE001
+        SCHEMA_NOTES["price_source_backfill"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    for name in _REDUNDANT_INDEXES:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP INDEX IF EXISTS {name}"))
+        except Exception:                              # noqa: BLE001
+            pass                                       # disk, never correctness
+
+
+def unique_keys_missing() -> list[str]:
+    """Natural keys that are NOT enforced by the database right now.
+
+    Read from api/status.py rather than trusting SCHEMA_NOTES alone, because the
+    fast path in ensure_schema() means a process can serve an entire deployment
+    without ever having run the migration that populates it.
+    """
+    try:
+        insp = inspect(engine)
+        return [name for name, table, _cols in _UNIQUE_INDEXES
+                if insp.has_table(table)
+                and name not in {ix["name"] for ix in insp.get_indexes(table)}]
+    except Exception as exc:                           # noqa: BLE001
+        return [f"unknown ({type(exc).__name__})"]
+
+
+def upsert(session, model, rows: list[dict], conflict_cols: tuple[str, ...],
+           update_cols: tuple[str, ...] = (),
+           coalesce_cols: tuple[str, ...] = (), chunk: int = 500) -> int:
+    """INSERT ... ON CONFLICT DO UPDATE, portable across SQLite and Postgres.
+
+    This replaces the read-modify-write shape the ingestion paths used to have:
+    SELECT the rows that might already exist, compare in Python, then insert the
+    remainder. That shape has two costs this deployment actually paid. It reads
+    rows purely to decide not to write them, on a database that meters data
+    transfer — and the common case is that the bar is already correct, so it is
+    the most expensive possible way to do nothing. And it is only correct while
+    exactly one writer runs, which stopped being true the moment the browser's
+    refresh loop overlapped the daily cron.
+
+    Chunked because both drivers bind every value in the statement: one 130,000
+    row INSERT exceeds Postgres' 65,535 parameter ceiling outright, and the
+    memory spike is what killed a free-tier connection during an OHLC backfill.
+
+    `coalesce_cols` are updated only when the incoming value is non-null, which
+    is what makes a partial refetch safe. Providers serve different column sets
+    on different endpoints — the near-live quote refresh carries no dividend and
+    historically carried no OHLC — so an unconditional overwrite would let the
+    cheap frequent path erase fields the expensive one had populated. That is
+    not hypothetical: it is how 70% of a month's bars ended up with no intraday
+    range while the estimator that sizes positions quietly fell back to a
+    six-times-noisier one.
+    """
+    if not rows:
+        return 0
+    from sqlalchemy import func as _func
+    if IS_SQLITE:
+        from sqlalchemy.dialects.sqlite import insert as _insert
+    else:
+        from sqlalchemy.dialects.postgresql import insert as _insert
+    table = model.__table__
+    written = 0
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        stmt = _insert(model).values(batch)
+        assignments = {c: getattr(stmt.excluded, c) for c in update_cols}
+        assignments.update({
+            c: _func.coalesce(getattr(stmt.excluded, c), table.c[c])
+            for c in coalesce_cols})
+        stmt = stmt.on_conflict_do_update(
+            index_elements=list(conflict_cols), set_=assignments)
+        session.execute(stmt)
+        written += len(batch)
+    return written
 
 
 def ensure_schema() -> None:
@@ -160,13 +331,13 @@ def ensure_schema() -> None:
             cols = {c["name"] for c in insp.get_columns(table)}
             if col not in cols:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
-        # hot-path composite indexes (IF NOT EXISTS works on SQLite + Postgres)
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_prices_cid_date "
-                          "ON price_observations (company_id, obs_date)"))
+        # hot-path composite index (IF NOT EXISTS works on SQLite + Postgres).
+        # The other two that used to live here are now UNIQUE indexes created
+        # below, which cover the same lookups.
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vol_sym_date "
                           "ON vol_surface_observations (symbol, obs_date)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_macro_sym_date "
-                          "ON macro_observations (symbol, obs_date)"))
+
+    _apply_unique_keys()
 
     # Stamped LAST, so a migration that fails part-way leaves the fast path
     # disarmed and the next boot retries instead of skipping incomplete work.

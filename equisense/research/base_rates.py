@@ -90,13 +90,35 @@ def load_price_panel(session: Session) -> tuple[pd.DataFrame, pd.DataFrame]:
     Deliberately UNFILTERED — the corrected backtests need the delisted and
     departed names, which is the whole point of retaining them (§5.1).
 
+    Served from the columnar panel blob when it matches the row store, and from
+    the table itself otherwise. This is the single largest recurring read in the
+    system — every study, IC run, factor fit and backtest starts here, over the
+    UNFILTERED table because the survivorship correction needs the delisted
+    names — and it is what exhausted a metered free tier's data transfer. The
+    blob carries the identical bars in column-major order at roughly a tenth of
+    the bytes (§5.3, panel.py).
+
+    Falling back is silent by design: the two paths return the same numbers, so
+    a stale or missing blob is a cost question, not a correctness one. The
+    freshness check that decides between them is two index probes.
+
     Read straight into pandas rather than through ``.all()``: materialising a
     million rows as Python Row objects first, only to rebuild them as a frame,
     dominated this call on the real deployment. Same rows, same order, without
     the intermediate objects.
     """
-    stmt = select(PriceObservation.company_id, PriceObservation.obs_date,
-                  PriceObservation.close, PriceObservation.volume)
+    from ..panel import load_core_panel
+    cached = load_core_panel(session)
+    if cached is not None:
+        return cached
+
+    # Measured bars only. Seeded prices (§5.4 provenance) sit on real dates
+    # under real tickers, so without this filter a fabricated annual price path
+    # enters the cross-section and every percentile rank, hit rate and base rate
+    # computed from it is partly a statistic about invented numbers.
+    stmt = (select(PriceObservation.company_id, PriceObservation.obs_date,
+                   PriceObservation.close, PriceObservation.volume)
+            .where(PriceObservation.source != "demo"))
     try:
         df = pd.read_sql(stmt, session.connection())
         df.columns = ["cid", "date", "close", "volume"]

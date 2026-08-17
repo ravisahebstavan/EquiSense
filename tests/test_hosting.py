@@ -980,18 +980,21 @@ def test_quote_refresh_prefetches_instead_of_querying_per_bar():
     On a database that meters DATA TRANSFER, a hot loop pulling whole rows to
     discover that the common case needs no write at all is the most expensive
     way possible to do nothing.
+
+    The prefetched map that first fixed this is now gone too, and the assertion
+    has tightened rather than relaxed: the decision moved into the database as
+    an ON CONFLICT upsert, so the path reads NO existing bars at all. That is
+    also what makes it correct when the cron and an open browser tab refresh
+    concurrently, which read-then-write never was.
     """
     import inspect
 
     from equisense.ingestion import yahoo
 
     src = inspect.getsource(yahoo.refresh_quotes)
-    body = src[src.find("for t, sym in zip"):]
-    assert "select(PriceObservation)" not in body, (
-        "the per-bar SELECT is back inside the loop")
-    assert "existing.get((cid, d.date()))" in body, (
-        "existing bars must come from a single prefetched map")
-    assert "PERIOD_DAYS" in src, "the prefetch must be bounded by the window"
+    assert "select(PriceObservation)" not in src, (
+        "refresh_quotes must not read stored bars to decide whether to write")
+    assert "upsert(" in src, "writes must go through the ON CONFLICT upsert"
 
 
 def test_dashboard_reads_the_snapshot_not_raw_price_history():

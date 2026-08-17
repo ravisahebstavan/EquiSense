@@ -76,6 +76,11 @@ CLASSIFICATION: dict[str, tuple[str, str]] = {
         ACCUMULATED,
         "index close file is one per day; the percentile-vs-own-history IS the "
         "value, so the long series is the asset"),
+    "panel_blobs": (
+        DERIVED,
+        "the price panel in column-major order (panel.py). Rebuilt from "
+        "price_observations by the daily cron, or on demand — it holds the same "
+        "bars re-encoded, so losing it costs one rebuild and no information"),
     "base_rates": (DERIVED, "POST /api/live/studies/run recomputes from prices"),
     "app_snapshots": (DERIVED, "rebuilt on the next refresh"),
     "sector_attributes": (DERIVED, "re-derived from filings"),
