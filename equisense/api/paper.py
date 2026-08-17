@@ -357,21 +357,39 @@ def _nifty_counterfactual(session: Session, trades: list[PaperTrade],
         # the two differ by roughly the size premium.
         closes = load("^NSEI")
         used = "^NSEI"
-    if not closes:
-        return None
-    dates = sorted(closes)
 
-    def px_on(d: date) -> float | None:
-        # last close on/before d
-        lo, hi = 0, len(dates) - 1
-        best = None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if dates[mid] <= d:
-                best = dates[mid]; lo = mid + 1
-            else:
-                hi = mid - 1
-        return closes[best] if best else None
+    # Live mode stores no macro series either, so the benchmark leg reads the
+    # index live. Without this the paper account's alpha — the honest 'am I
+    # beating the index' number that is the whole point of the paper book — would
+    # silently vanish the moment nothing was stored.
+    live_index = None
+    if not closes:
+        from ..ingestion import live_provider
+        used = "^NSEI"
+        p_last, d_last = live_provider.index_latest(used)
+        if p_last is None:
+            return None
+        live_index = used
+
+        def px_on(d: date) -> float | None:
+            return live_provider.index_price_on(used, d)
+        p_now = p_last
+        as_of_date = d_last
+    else:
+        dates = sorted(closes)
+
+        def px_on(d: date) -> float | None:
+            lo, hi = 0, len(dates) - 1
+            best = None
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if dates[mid] <= d:
+                    best = dates[mid]; lo = mid + 1
+                else:
+                    hi = mid - 1
+            return closes[best] if best else None
+        p_now = closes[dates[-1]]
+        as_of_date = dates[-1]
 
     cash = starting_cash
     units = 0.0
@@ -386,11 +404,11 @@ def _nifty_counterfactual(session: Session, trades: list[PaperTrade],
         else:
             cash += amount
             units -= amount / p
-    p_now = closes[dates[-1]]
     equity = cash + units * p_now
     label = {"^CRSLDX": "NIFTY 500", "^NSEI": "NIFTY 50"}.get(used, used)
     return {"equity": round(equity, 2),
             "total_return_pct": round((equity / starting_cash - 1) * 100, 2),
             "index": label, "symbol": used,
             "fell_back": used != symbol,
-            "as_of": str(dates[-1])}
+            "source": "live" if live_index else "stored",
+            "as_of": str(as_of_date)}

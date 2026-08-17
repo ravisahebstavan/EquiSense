@@ -225,26 +225,58 @@ def get_universe_prices(tickers: list[str], years: int = DEFAULT_YEARS,
     return series, status
 
 
-def get_index_series(symbol: str = "^NSEI", years: int = DEFAULT_YEARS) -> list[float]:
-    """Total-return-ish close series for a macro index (NIFTY), live + cached.
-    Used for relative strength and the benchmark counterfactual."""
+def _index_series(symbol: str, years: int) -> tuple[list, list]:
+    """(dates, closes) for a macro index, live + cached. The dated form is what
+    the benchmark counterfactual needs (align trades to index prices by date);
+    callers wanting just closes use get_index_series."""
     now = time.time()
     c = _INDEX_CACHE.get(symbol)
     if c and now - c["fetched_at"] < _ttl_now():
-        return c["closes"]
-    closes: list[float] = []
+        return c["dates"], c["closes"]
+    dates: list = []
+    closes: list = []
     try:
-        data = _download([symbol], years)
-        frame = data
-        s = _frame_to_series(frame)
+        s = _frame_to_series(_download([symbol], years))
         if s is not None:
-            closes = s[1]                              # total-return closes
+            dates, closes = s[0], s[1]                 # total-return closes
     except Exception as exc:                           # noqa: BLE001
         log.warning("index fetch failed for %s: %s", symbol, exc)
         if c:
-            return c["closes"]
-    _INDEX_CACHE[symbol] = {"closes": closes, "fetched_at": now}
-    return closes
+            return c["dates"], c["closes"]
+    _INDEX_CACHE[symbol] = {"dates": dates, "closes": closes, "fetched_at": now}
+    return dates, closes
+
+
+def get_index_series(symbol: str = "^NSEI", years: int = DEFAULT_YEARS) -> list[float]:
+    """Total-return-ish close series for a macro index (NIFTY), live + cached.
+    Used for relative strength."""
+    return _index_series(symbol, years)[1]
+
+
+def index_price_on(symbol: str, on_date, years: int = DEFAULT_YEARS) -> Optional[float]:
+    """Last index close on or before `on_date`, from the live cache — the
+    benchmark leg of the paper account's alpha measurement in live mode."""
+    dates, closes = _index_series(symbol, years)
+    if not dates:
+        return None
+    target = on_date.date() if hasattr(on_date, "date") else on_date
+    lo, hi, best = 0, len(dates) - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if dates[mid] <= target:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return closes[best] if best is not None else None
+
+
+def index_latest(symbol: str, years: int = DEFAULT_YEARS) -> tuple[Optional[float], Optional[object]]:
+    """(latest close, its date) for a macro index from the live cache."""
+    dates, closes = _index_series(symbol, years)
+    if not dates:
+        return None, None
+    return closes[-1], dates[-1]
 
 
 def latest_price(ticker: str) -> Optional[float]:
