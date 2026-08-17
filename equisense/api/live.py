@@ -30,13 +30,33 @@ from ..research.base_rates import get_base_rate
 from . import services
 
 
+def _live_series(session: Session, cid: int):
+    """The warm live 7-tuple for a company, by cid → ticker, or None. Shared by
+    the two per-company readers so a dossier's evidence builds from live prices
+    in live mode instead of an empty stored table."""
+    try:
+        from .snapshot import live_data_enabled
+        if not live_data_enabled():
+            return None
+        from ..ingestion import live_provider
+        c = session.get(Company, cid)
+        return live_provider.get_series(c.ticker) if c else None
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
 def _series(session: Session, cid: int):
     """(dates, total_return_closes, volumes) — the return-computation basis."""
     rows = session.execute(
         select(PriceObservation.obs_date, PriceObservation.close, PriceObservation.volume)
         .where(PriceObservation.company_id == cid)
         .order_by(PriceObservation.obs_date)).all()
-    return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows])
+    if rows:
+        return ([r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows])
+    s = _live_series(session, cid)
+    if s is not None:
+        return (list(s[0]), list(s[1]), list(s[2]))    # dates, close, volume
+    return ([], [], [])
 
 
 def _nominal_closes(session: Session, cid: int) -> list[float] | None:
@@ -48,9 +68,13 @@ def _nominal_closes(session: Session, cid: int) -> list[float] | None:
         .where(PriceObservation.company_id == cid)
         .order_by(PriceObservation.obs_date)).all()
     vals = [r[0] for r in rows]
-    if not vals or any(v is None for v in vals):
-        return None
-    return vals
+    if vals and not any(v is None for v in vals):
+        return vals
+    if not vals:
+        s = _live_series(session, cid)                 # live nominal series (idx 3)
+        if s is not None and s[3] and not any(v is None for v in s[3]):
+            return list(s[3])
+    return None
 
 
 def _macro(session: Session, symbol: str, limit: int | None = None) -> list[float]:

@@ -338,6 +338,14 @@ def index_latest(symbol: str, years: int = DEFAULT_YEARS) -> tuple[Optional[floa
     return closes[-1], dates[-1]
 
 
+def get_series(ticker: str) -> Optional[tuple]:
+    """The warm 7-tuple series for one ticker from the snapshot cache, or None.
+    Lets per-company consumers (dossier evidence) read the live series a dict
+    lookup at a time, without their own fetch — the snapshot already warmed it."""
+    series = _CACHE.get("series") or {}
+    return series.get((ticker or "").upper()) or series.get(ticker)
+
+
 def latest_price(ticker: str) -> Optional[float]:
     """Most recent live close for one ticker, from the warm cache if present.
     Lets price consumers (paper marks) work without a stored bar."""

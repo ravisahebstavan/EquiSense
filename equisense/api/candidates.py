@@ -162,6 +162,22 @@ def _fetch_return_series(session: Session, company_ids: list[int],
     closes: dict[int, list[float]] = {}
     for cid, _d, c in rows:
         closes.setdefault(cid, []).append(c)
+    # Live mode: no stored bars, so the concentration gate would measure nothing
+    # and quietly let correlated picks through. Read the closes from the warm live
+    # cache instead so 'these two are one bet twice-sized' still binds.
+    if not closes:
+        try:
+            from .snapshot import live_data_enabled
+            if live_data_enabled():
+                from ..models import Company
+                from ..ingestion import live_provider
+                for cid in company_ids:
+                    c = session.get(Company, cid)
+                    s = live_provider.get_series(c.ticker) if c else None
+                    if s and s[1]:
+                        closes[cid] = list(s[1])
+        except Exception:                              # noqa: BLE001
+            pass
     out: dict[int, list[float]] = {}
     for cid, cl in closes.items():
         cl = cl[-days:]
