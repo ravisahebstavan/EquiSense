@@ -394,9 +394,11 @@ def deflated_sharpe_ratio(returns: Sequence[float], n_trials: int,
                 "reason": f"need ≥4 periods, have {T}"}
     m = sum(x) / T
     var = sum((v - m) ** 2 for v in x) / (T - 1)
-    if var <= 0:
-        return {"computable": False, "reason": "zero return variance"}
-    sr = m / math.sqrt(var)
+    sd = math.sqrt(var) if var > 0 else 0.0
+    scale = max(abs(m), max((abs(v) for v in x), default=0.0))
+    if sd <= 1e-9 * (scale + 1e-12):   # effectively-constant → float noise, not variance
+        return {"computable": False, "reason": "zero (or negligible) return variance"}
+    sr = m / sd
     skew, kurt = _skew_kurt(x)
     srv = sr_variance if sr_variance is not None else 1.0 / (T - 1)
     sr_star = expected_max_sharpe(n_trials, srv)
@@ -439,9 +441,15 @@ def probabilistic_sharpe_ratio(returns: Sequence[float],
         return {"computable": False, "reason": f"need ≥4 periods, have {T}"}
     m = sum(x) / T
     var = sum((v - m) ** 2 for v in x) / (T - 1)
-    if var <= 0:
-        return {"computable": False, "reason": "zero return variance"}
-    sr = m / math.sqrt(var)
+    # Effectively-constant input carries only floating-point noise for variance
+    # (fifty identical 0.01s give var ~1e-35, not exact zero), which sails past a
+    # `var <= 0` guard and yields a garbage Sharpe. Treat dispersion negligible
+    # relative to the values' own scale as zero variance.
+    sd = math.sqrt(var) if var > 0 else 0.0
+    scale = max(abs(m), max((abs(v) for v in x), default=0.0))
+    if sd <= 1e-9 * (scale + 1e-12):
+        return {"computable": False, "reason": "zero (or negligible) return variance"}
+    sr = m / sd
     skew, kurt = _skew_kurt(x)
     denom_sq = 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr
     if denom_sq <= 0:
@@ -483,9 +491,11 @@ def lo_annualized_sharpe(returns: Sequence[float], periods_per_year: float,
         return {"computable": False, "reason": f"need ≥{max(8, q // 2)} periods, have {T}"}
     m = sum(x) / T
     var = sum((v - m) ** 2 for v in x) / (T - 1)
-    if var <= 0:
-        return {"computable": False, "reason": "zero return variance"}
-    sr = m / math.sqrt(var)
+    sd = math.sqrt(var) if var > 0 else 0.0
+    scale = max(abs(m), max((abs(v) for v in x), default=0.0))
+    if sd <= 1e-9 * (scale + 1e-12):   # effectively-constant → float noise, not variance
+        return {"computable": False, "reason": "zero (or negligible) return variance"}
+    sr = m / sd
 
     lag_cap = min(q - 1, T - 2 if max_lag is None else max_lag, T - 2)
     e = [v - m for v in x]
