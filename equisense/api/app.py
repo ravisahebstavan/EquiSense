@@ -482,13 +482,27 @@ def backtest_strategy(refresh: bool = False, s: Session = Depends(db)):
 @app.get("/api/companies/{company_id}/prices")
 def company_prices(company_id: int, days: int = 1250, s: Session = Depends(db)):
     """Daily close history for the interactive chart."""
-    _get_company(s, company_id)
+    company = _get_company(s, company_id)
     from ..models import PriceObservation
     rows = s.execute(
         select(PriceObservation.obs_date, PriceObservation.close)
         .where(PriceObservation.company_id == company_id)
         .order_by(PriceObservation.obs_date.desc()).limit(days)).all()
-    return [{"time": str(d), "value": round(c, 2)} for d, c in reversed(rows)]
+    if rows:
+        return [{"time": str(d), "value": round(c, 2)} for d, c in reversed(rows)]
+    # Live mode: no stored bars, so the chart reads the warm live series (the
+    # snapshot already fetched it) rather than rendering an empty panel.
+    try:
+        from .snapshot import live_data_enabled
+        if live_data_enabled():
+            from ..ingestion import live_provider
+            series = live_provider.get_series(company.ticker)
+            if series and series[0]:
+                d_c = list(zip(series[0], series[1]))[-days:]
+                return [{"time": str(d), "value": round(c, 2)} for d, c in d_c]
+    except Exception:                                  # noqa: BLE001
+        pass
+    return []
 
 
 # ------------------------------------------------------------------- theses

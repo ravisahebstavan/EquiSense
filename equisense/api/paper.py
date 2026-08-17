@@ -321,6 +321,26 @@ def account(session: Session, include_curve: bool = True) -> dict:
     return out
 
 
+def _live_curve_rows(session: Session, held_ids: list[int], start):
+    """(cid, date, close) rows for held names from the warm live series, on/after
+    `start`. Same shape the stored query returns, so the curve builder is
+    unchanged."""
+    out = []
+    try:
+        from ..ingestion import live_provider
+        for cid in held_ids:
+            c = session.get(Company, cid)
+            s = live_provider.get_series(c.ticker) if c else None
+            if not s:
+                continue
+            for d, close in zip(s[0], s[1]):
+                if d >= start:
+                    out.append((cid, d, close))
+    except Exception:                                  # noqa: BLE001
+        return []
+    return out
+
+
 def _equity_curve(session: Session, trades: list[PaperTrade],
                   starting_cash: float) -> list[dict]:
     """Daily account equity since the first trade (cash + marked positions)."""
@@ -332,6 +352,12 @@ def _equity_curve(session: Session, trades: list[PaperTrade],
         .where(PriceObservation.company_id.in_(held_ids),
                PriceObservation.obs_date >= start)
         .order_by(PriceObservation.obs_date)).all()
+    if not rows:
+        # Live mode stores no bars, so the P&L curve — the tangible 'am I making
+        # money over time' view — would be blank. Rebuild it from the warm live
+        # series of the held names (a dict lookup; the snapshot already fetched
+        # them), so the account still charts.
+        rows = _live_curve_rows(session, held_ids, start)
     by_date: dict = {}
     for cid, d, c in rows:
         by_date.setdefault(d, {})[cid] = c
