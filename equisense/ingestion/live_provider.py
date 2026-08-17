@@ -144,13 +144,21 @@ def _frame_to_series(frame) -> Optional[tuple]:
     return (dates, closes, volumes, nominal, opens, highs, lows)
 
 
+# Hard per-request network timeout. A serverless function has a fixed budget and
+# a hung fetch that never returns will burn the whole of it and 5xx the request
+# — worse than a reported partial fetch. yfinance passes this to the underlying
+# HTTP session, so a throttling or unreachable Yahoo fails fast and the caller's
+# degrade-and-report path takes over instead of the platform's timeout.
+FETCH_TIMEOUT_S = 20
+
+
 def _download(symbols: list[str], years: int):
     """Isolated so tests can monkeypatch it. Imports yfinance lazily so importing
     this module never requires the network dependency to be resolvable."""
     import yfinance as yf
     return yf.download(symbols, period=f"{years}y", interval="1d",
                        auto_adjust=False, actions=False, progress=False,
-                       group_by="ticker", threads=True)
+                       group_by="ticker", threads=True, timeout=FETCH_TIMEOUT_S)
 
 
 def _yahoo_symbol(ticker: str) -> str:
