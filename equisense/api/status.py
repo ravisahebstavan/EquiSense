@@ -375,8 +375,8 @@ def refresh_stream(session: Session):
                   checkpoints_scored=checkpointed["checkpointed"])
 
         yield sse("publishing", "running")
-        from .snapshot import build_universe_snapshot
-        snap = build_universe_snapshot(session)  # views become single-row reads
+        from .snapshot import rebuild_universe_snapshot
+        snap = rebuild_universe_snapshot(session)  # views become single-row reads
         yield sse("publishing", "done", companies=len(snap["companies"]),
                   quality_score=data_status(session)["quality_score"])
 

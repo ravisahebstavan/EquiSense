@@ -100,7 +100,21 @@ def latest_close(session: Session, company_id: int) -> tuple[float, date] | None
         select(PriceObservation.close, PriceObservation.obs_date)
         .where(PriceObservation.company_id == company_id)
         .order_by(PriceObservation.obs_date.desc()).limit(1)).first()
-    return (row[0], row[1]) if row else None
+    if row:
+        return (row[0], row[1])
+    # Live mode stores no price panel, so a fill must mark against the live cache.
+    # The warm provider already holds the universe it fetched for the snapshot, so
+    # this is a dict lookup, not a network call — and it is what lets the paper
+    # book (and its marks) work with nothing bulk persisted.
+    try:
+        from ..ingestion import live_provider
+        c = session.get(Company, company_id)
+        px = live_provider.latest_price(c.ticker) if c else None
+        if px is not None:
+            return (px, date.today())
+    except Exception:                                  # noqa: BLE001
+        pass
+    return None
 
 
 def place_trade(session: Session, company_id: int, side: str, quantity: float,

@@ -1,0 +1,160 @@
+"""Live-data plane — free data, no bulk storage (§5 rearchitecture).
+
+Yahoo is not reachable from CI, so these exercise the PURE logic: the yfinance
+frame → series transform, and that the snapshot builds from INJECTED live series
+with the price panel never read from the DB. That is the whole point of the
+rearchitecture — the bars come from the source, not a metered store — so the
+build path must not depend on stored prices at all.
+"""
+import datetime as dt
+
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from equisense.db import Base
+from equisense.ingestion import live_provider as lp
+
+
+@pytest.fixture
+def db():
+    import equisense.models  # noqa: F401 - registers tables
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    return sessionmaker(bind=eng, expire_on_commit=False)()
+
+
+class _FakeFrame:
+    """Minimal stand-in for a yfinance per-ticker DataFrame."""
+    def __init__(self, index, cols):
+        self.index = index
+        self._cols = cols
+        self.columns = list(cols)
+
+    def __getitem__(self, k):
+        return _FakeSeries(self.index, self._cols[k])
+
+
+class _FakeSeries:
+    def __init__(self, index, values):
+        self.index = index
+        self._v = list(values)
+
+    def dropna(self):
+        idx = [i for i, v in zip(self.index, self._v) if v is not None]
+        vals = [v for v in self._v if v is not None]
+        return _FakeSeries(idx, vals)
+
+    def __len__(self):
+        return len(self._v)
+
+    def items(self):
+        return zip(self.index, self._v)
+
+    @property
+    def loc(self):
+        m = {i: v for i, v in zip(self.index, self._v)}
+        return _Loc(m)
+
+
+class _Loc:
+    def __init__(self, m):
+        self._m = m
+
+    def __getitem__(self, k):
+        return self._m[k]
+
+
+def _synth_frame(n=300, start=100.0):
+    idx = [dt.datetime(2025, 1, 1) + dt.timedelta(days=i) for i in range(n)]
+    close = [start + i * 0.1 for i in range(n)]
+    return _FakeFrame(idx, {
+        "Close": close,
+        "Adj Close": [c * 0.99 for c in close],   # total-return diverges from nominal
+        "Volume": [100000 + i for i in range(n)],
+        "Open": [c - 0.05 for c in close],
+        "High": [c + 0.2 for c in close],
+        "Low": [c - 0.2 for c in close],
+    })
+
+
+def test_frame_to_series_splits_the_two_price_conventions():
+    s = lp._frame_to_series(_synth_frame(120))
+    assert s is not None
+    dates, closes, volumes, nominal, opens, highs, lows = s
+    assert len(dates) == 120
+    # total-return close (Adj) must differ from nominal (Close) — the distinction
+    # that a naive single-series fetch would silently collapse
+    assert closes[-1] != nominal[-1]
+    assert abs(closes[-1] - nominal[-1] * 0.99) < 1e-6
+    assert volumes[-1] is not None and highs[-1] > closes[-1] * 0  # present
+
+
+def test_empty_frame_returns_none():
+    assert lp._frame_to_series(_FakeFrame([], {"Close": []})) is None
+
+
+def test_snapshot_builds_from_live_series_without_reading_stored_prices(db, monkeypatch):
+    import equisense.models as M
+    from equisense.api import snapshot as snap
+
+    # Two index members, NO PriceObservation rows anywhere.
+    for i, tk in enumerate(["AAA", "BBB"]):
+        db.add(M.Company(ticker=tk, name=tk, sector="IT", cap_band="large",
+                         is_index_member=True))
+    db.commit()
+
+    # The provider hands back live series; the DB has no bars to fall back on, so
+    # a green build here proves the panel is not on the build path.
+    series = {"AAA": lp._frame_to_series(_synth_frame(300, 100.0)),
+              "BBB": lp._frame_to_series(_synth_frame(300, 250.0))}
+    monkeypatch.setattr(lp, "get_universe_prices",
+                        lambda tickers, **k: (series, {"provider": "yahoo_live",
+                                                        "returned": len(series),
+                                                        "requested": len(tickers),
+                                                        "coverage_pct": 100.0}))
+    monkeypatch.setattr(lp, "get_index_series", lambda *a, **k: [100.0 + i for i in range(300)])
+
+    out = snap.build_universe_snapshot_live(db)
+    assert out["data_source"]["provider"] == "yahoo_live"
+    assert len(out["companies"]) == 2
+    tickers = {c["ticker"] for c in out["companies"]}
+    assert tickers == {"AAA", "BBB"}
+    # every company priced from the live series
+    assert all(c["price"] > 0 for c in out["companies"])
+
+
+def test_thin_live_fetch_refuses_to_publish(db, monkeypatch):
+    import equisense.models as M
+    from equisense.api import snapshot as snap
+    for tk in ["AAA", "BBB", "CCC"]:
+        db.add(M.Company(ticker=tk, name=tk, sector="IT", is_index_member=True))
+    db.commit()
+    monkeypatch.setattr(lp, "get_universe_prices",
+                        lambda tickers, **k: ({}, {"returned": 0,
+                                                   "requested": len(tickers),
+                                                   "coverage_pct": 0.0, "errors": ["throttled"]}))
+    with pytest.raises(RuntimeError):
+        snap.build_universe_snapshot_live(db)
+
+
+def test_rebuild_falls_back_to_stored_and_reports(db, monkeypatch):
+    """A failed live fetch must serve the stored panel and STAMP why, never fail
+    the whole refresh or hide the degradation."""
+    import equisense.models as M
+    from equisense.api import snapshot as snap
+    # stored data present
+    cal = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(120)]
+    c = M.Company(ticker="AAA", name="AAA", sector="IT", is_index_member=True)
+    db.add(c); db.flush()
+    for i, d in enumerate(cal):
+        db.add(M.PriceObservation(company_id=c.id, obs_date=d, close=100 + i,
+                                  close_raw=100 + i, volume=100000))
+    db.commit()
+    monkeypatch.setattr(snap, "build_universe_snapshot_live",
+                        lambda s: (_ for _ in ()).throw(RuntimeError("throttled")))
+    out = snap.rebuild_universe_snapshot(db, prefer_live=True)
+    assert out["data_source"]["provider"] == "stored_db_fallback"
+    assert "throttled" in out["data_source"]["live_error"]

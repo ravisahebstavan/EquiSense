@@ -327,19 +327,44 @@ def test_status_still_verifies_when_asked():
     assert "LEDGER CHAIN BROKEN" in src
 
 
-def test_a_hosted_deployment_never_seeds_demo_data():
-    """A hosted app that falls back to SQLite has lost its database. Seeding
-    demo rows on top makes the failure INVISIBLE — the site renders, charts
-    draw, and 9 fake companies read as real signals. That is worse than an error
-    page. Observed live: the Vercel deployment served 54 rows across 9 companies
-    while the real database held 1,005,145 bars across 501."""
+def test_no_surface_ever_seeds_demo_data():
+    """Seeding is disabled ENTIRELY — real data only, everywhere. The old guard
+    merely refused to seed a hosted fallback; the standing instruction is stronger
+    (no synthetic data on any surface, hosted or local), so the guarantee is now
+    that seed() is a no-op and startup never calls it. Observed live once: a
+    Vercel fallback served 54 fabricated rows across 9 companies that read as real
+    signals — that class of failure is now structurally impossible."""
     import inspect
 
     from equisense.api import app as A
-    src = inspect.getsource(A)
-    assert "IS_HOSTED_ENV" in src
+    from equisense.seed import seed
+
+    # startup must not invoke seeding at all
     boot = inspect.getsource(A._startup_boot)
-    assert "not IS_HOSTED_ENV" in boot, "a hosted fallback would still be seeded"
+    assert "seed(" not in boot, "startup must not seed under any condition"
+
+    # and seed() itself must write nothing, even if called directly
+    calls = {"n": 0}
+
+    class _Spy:
+        def add(self, *a, **k):
+            calls["n"] += 1
+
+        def add_all(self, *a, **k):
+            calls["n"] += 1
+
+        def commit(self, *a, **k):
+            pass
+
+        def scalars(self, *a, **k):
+            calls["n"] += 1
+            return self
+
+        def first(self):
+            return None
+
+    seed(_Spy())
+    assert calls["n"] == 0, "seed() must be a no-op — nothing synthetic is written"
 
 
 def test_startup_failure_cannot_take_down_the_site():

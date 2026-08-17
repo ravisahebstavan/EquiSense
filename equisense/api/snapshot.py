@@ -10,6 +10,7 @@ rebuild it explicitly.
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -192,8 +193,20 @@ def _max5_21d(closes: list[float]) -> Optional[float]:
     return sum(sorted(daily)[-5:]) / 5
 
 
-def build_universe_snapshot(session: Session) -> dict:
-    """The one heavy pass: 3 bulk queries + pure CPU. Runs at refresh time."""
+def build_universe_snapshot(session: Session,
+                            prices: Optional[dict] = None,
+                            nifty: Optional[list] = None,
+                            source_meta: Optional[dict] = None) -> dict:
+    """The one heavy pass: signals for the whole universe + pure CPU. Runs at
+    refresh time.
+
+    `prices` (and `nifty`) can be INJECTED — the live provider passes bars it
+    fetched from Yahoo so the panel never has to be read back out of Postgres.
+    Passed as None, it reads the stored panel as before, so the DB path and every
+    existing test are unchanged. `source_meta` records where the bars came from
+    and rides along in the stored snapshot, so a live-fetched view is labelled as
+    such and a degraded fetch is visible.
+    """
     # Live analytical universe = CURRENT index members only. Departed names keep
     # their history in the database (deleting it would manufacture survivorship
     # bias) but must not sit in the cross-section: xsec_strength ranks each
@@ -201,10 +214,10 @@ def build_universe_snapshot(session: Session) -> dict:
     # percentile in the universe.
     companies = session.scalars(
         select(Company).where(Company.is_index_member == True)).all()   # noqa: E712
-    prices = _bulk_prices(session)
+    prices = _bulk_prices(session) if prices is None else prices
     delivery = _bulk_delivery(session)
     statements = _bulk_statements(session)
-    nifty = _nifty(session)
+    nifty = _nifty(session) if nifty is None else nifty
 
     # The universe's own trading calendar, so staleness is measured against the
     # sessions that actually happened rather than the wall clock.
@@ -360,10 +373,12 @@ def build_universe_snapshot(session: Session) -> dict:
         if r is not None and avg is not None:
             item["signals"]["sector_rel_mom"] = round((r - avg) * 100, 2)
 
-    as_of = max((prices[cid][0][-1] for cid in prices), default=None)
+    as_of = max((prices[cid][0][-1] for cid in prices if prices[cid][0]),
+                default=None)
     snap = {"as_of": str(as_of), "version": SNAP_VERSION,
             "built_at": datetime.utcnow().isoformat(),
             "companies": items,
+            "data_source": source_meta or {"provider": "stored_db"},
             "stale_names": dict(sorted(stale.items(), key=lambda kv: -kv[1]))}
     row = session.get(AppSnapshot, UNIVERSE_KEY)
     if row is None:
@@ -378,6 +393,95 @@ def build_universe_snapshot(session: Session) -> dict:
     _UNIVERSE_CACHE.update(key=(snap["as_of"], SNAP_VERSION), snap=snap,
                            checked_at=_time.time())
     return snap
+
+
+def live_data_enabled() -> bool:
+    """Whether the snapshot is built from live Yahoo prices (no stored panel).
+
+    Explicit EQUISENSE_LIVE_DATA wins. Otherwise ON in a hosted serverless
+    environment — where the free-tier transfer wall and the staleness live — and
+    OFF locally, so development and the test suite stay fully offline.
+    """
+    v = os.environ.get("EQUISENSE_LIVE_DATA")
+    if v is not None:
+        return v == "1"
+    return bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV")
+                or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+
+def rebuild_universe_snapshot(session: Session,
+                              prefer_live: Optional[bool] = None) -> dict:
+    """Rebuild the snapshot, live-first when enabled, with a REPORTED fallback.
+
+    The single entry point every refresh path uses, so 'where do the bars come
+    from' is decided in exactly one place. A live fetch that comes back too thin
+    to trust falls back to the stored panel and stamps the reason into the
+    snapshot rather than publishing a hollow universe or failing the whole run.
+    """
+    prefer_live = live_data_enabled() if prefer_live is None else prefer_live
+    if not prefer_live:
+        return build_universe_snapshot(session)
+    try:
+        return build_universe_snapshot_live(session)
+    except Exception as exc:                           # noqa: BLE001
+        return build_universe_snapshot(session, source_meta={
+            "provider": "stored_db_fallback",
+            "live_error": f"{type(exc).__name__}: {exc}"[:200],
+            "note": ("Live Yahoo fetch failed or was too thin; served the stored "
+                     "panel instead. Reported, not silent — a fallback that hid "
+                     "itself is how staleness went unnoticed before."),
+        })
+
+
+def _snapshot_time_stale(snap: dict) -> bool:
+    """Is a live-built snapshot old enough on the market clock to re-fetch?
+    Eager while NSE is open (prices move), relaxed after the close (EOD is final).
+    Only consulted in live mode; the stored path keys freshness off price dates."""
+    from ..ingestion.live_provider import (TTL_CLOSED_S, TTL_OPEN_S,
+                                           _nse_open_now)
+    built = snap.get("built_at")
+    if not built:
+        return True
+    try:
+        age = (datetime.utcnow() - datetime.fromisoformat(built)).total_seconds()
+    except Exception:                                  # noqa: BLE001
+        return True
+    return age > (TTL_OPEN_S if _nse_open_now() else TTL_CLOSED_S)
+
+
+def build_universe_snapshot_live(session: Session) -> dict:
+    """Build the snapshot from LIVE Yahoo prices — free data, no stored panel.
+
+    This is the freshness fix and the transfer fix at once. Instead of reading a
+    decade of bars back out of a metered Postgres, it fetches recent OHLCV live,
+    computes every signal in process, and persists only the few-hundred-KB result.
+    The bulk panel is never read or written, so the egress that exhausted the free
+    tier — and the broken-cron staleness that followed — simply do not arise.
+
+    Company metadata, fundamentals and delivery stats still come from the DB: they
+    are small, quarterly, and not what goes stale daily. Prices are what move, and
+    prices now come from the source every time.
+
+    Degrades honestly: if the live fetch comes back materially empty (Yahoo
+    throttling a cloud IP is a real event), it raises so the caller can fall back
+    to the stored path and REPORT it, rather than publishing a hollow universe.
+    """
+    from ..ingestion import live_provider
+    companies = session.scalars(
+        select(Company).where(Company.is_index_member == True)).all()   # noqa: E712
+    id_by_ticker = {c.ticker: c.id for c in companies}
+    tickers = list(id_by_ticker)
+    series_by_ticker, status = live_provider.get_universe_prices(tickers)
+    if not series_by_ticker or status.get("coverage_pct", 0) < 30.0:
+        raise RuntimeError(
+            f"live price fetch too thin to publish "
+            f"({status.get('returned', 0)}/{status.get('requested', 0)} names) — "
+            f"errors: {status.get('errors')}")
+    prices = {id_by_ticker[t]: s for t, s in series_by_ticker.items()
+              if t in id_by_ticker}
+    nifty = live_provider.get_index_series("^NSEI") or None
+    return build_universe_snapshot(session, prices=prices, nifty=nifty,
+                                   source_meta=status)
 
 
 # The snapshot payload is a few hundred KB of JSON and several callers want it
@@ -405,11 +509,39 @@ def invalidate_universe_cache() -> None:
 
 
 def get_universe(session: Session, allow_rebuild: bool = True) -> dict:
-    """Single-row read; rebuilds only when prices are newer than the snapshot."""
+    """Single-row read; rebuilds when the data behind it has moved.
+
+    In LIVE mode there is no stored price panel to compare dates against, so
+    freshness is judged on the market clock: a snapshot older than the live TTL is
+    rebuilt from Yahoo on the next request that touches it. That is what makes the
+    views self-refresh without a cron and without a stored panel — the exact thing
+    the store-and-read model failed to do once its writes stopped landing. In
+    stored mode the original price-date gating is unchanged.
+    """
     import time as _time
+    live = live_data_enabled()
     if (_UNIVERSE_CACHE["snap"] is not None
             and _time.time() - _UNIVERSE_CACHE["checked_at"] < FRESHNESS_PROBE_TTL_S):
         return _UNIVERSE_CACHE["snap"]
+
+    if live:
+        row = session.get(AppSnapshot, UNIVERSE_KEY)
+        snap = None
+        if row is not None:
+            try:
+                cand = json.loads(row.payload)
+                if cand.get("version") == SNAP_VERSION and not _snapshot_time_stale(cand):
+                    snap = cand
+            except Exception:                          # noqa: BLE001
+                snap = None
+        if snap is None and allow_rebuild:
+            snap = rebuild_universe_snapshot(session, prefer_live=True)
+        elif snap is None:
+            snap = json.loads(row.payload) if row else {"as_of": None, "companies": []}
+        _UNIVERSE_CACHE.update(key=(snap.get("as_of"), SNAP_VERSION), snap=snap,
+                               checked_at=_time.time())
+        return snap
+
     latest = session.scalar(select(func.max(PriceObservation.obs_date)))
     ckey = (str(latest), SNAP_VERSION)
     if _UNIVERSE_CACHE["key"] == ckey and _UNIVERSE_CACHE["snap"] is not None:

@@ -23,7 +23,6 @@ from ..db import Base, engine, get_session
 from ..engine import valuation
 from ..models import (Company, InvestorProfileRow, JournalEntry, Thesis,
                       TransactionRow, WatchlistItem)
-from ..seed import seed
 from . import services
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
@@ -80,12 +79,10 @@ def _startup_boot() -> None:
     from ..db import IS_SQLITE, ensure_schema
     ensure_schema()
     with get_session() as s:
-        # A hosted deployment that falls back to SQLite has lost its database,
-        # and seeding demo rows on top makes the failure INVISIBLE: the site
-        # renders, the charts draw, and 9 fake companies read as real signals.
-        # That is worse than an error page. Detect the host and refuse to seed.
-        if IS_SQLITE and not IS_HOSTED_ENV and os.environ.get("EQUISENSE_AUTO_INGEST") != "1":
-            seed(s)  # demo data only for local SQLite dev — never into a hosted DB
+        # Seeding is disabled entirely — real data only, everywhere (owner's
+        # standing instruction). A fresh database stays empty until live data is
+        # fetched; nothing synthetic is ever written, so no fabricated number can
+        # be mistaken for a real signal on any surface.
         if not s.scalars(select(InvestorProfileRow)).first():
             s.add(InvestorProfileRow(name="default", is_active=True))
             s.commit()
@@ -782,10 +779,10 @@ def live_realign(s: Session = Depends(db)):
     _reject_if_ephemeral()
     from .. import ledger as L
     from .autopilot import get_config, register_daily_forecasts, run_autopilot
-    from .snapshot import build_universe_snapshot
+    from .snapshot import rebuild_universe_snapshot
 
     out: dict = {}
-    snap = build_universe_snapshot(s)
+    snap = rebuild_universe_snapshot(s)
     s.commit()
     out["snapshot_companies"] = len(snap["companies"])
     try:
@@ -941,7 +938,7 @@ def cron_refresh(s: Session = Depends(db)):
     from ..ingestion.nse_archive import backfill as nse_backfill, prune
     from .autopilot import get_config, register_daily_forecasts, run_autopilot
     from .markets import capture_vol_surface
-    from .snapshot import build_universe_snapshot
+    from .snapshot import rebuild_universe_snapshot
 
     t0 = _time.monotonic()
     out: dict = {}
@@ -1043,7 +1040,7 @@ def cron_refresh(s: Session = Depends(db)):
     stage("checkpoints_scored", lambda: L.score_interim_checkpoints(s)["checkpointed"])
 
     # 5. The snapshot, which everything below reads.
-    snap = stage("snapshot", lambda: build_universe_snapshot(s))
+    snap = stage("snapshot", lambda: rebuild_universe_snapshot(s))
     if isinstance(snap, dict) and "companies" in snap:
         out["snapshot"] = {"companies": len(snap["companies"])}
 

@@ -1,0 +1,273 @@
+"""Live market-data provider — free data, no bulk storage (§5 rearchitecture).
+
+The original data plane STORED a decade of daily bars for the whole universe in
+Postgres and read them back to build every view. On a free tier that meters data
+transfer, reading the price panel is the single largest recurring egress in the
+system — it is what exhausted the quota and, once the writes could no longer land,
+what left every page STALE. Storing bulk market data you can re-fetch for free is
+paying rent, in the one currency the tier actually rations, for a copy of
+something the source gives away.
+
+This module removes that. It fetches the universe's recent OHLCV **live** from
+Yahoo (keyless, free) and caches it IN PROCESS for the life of a warm serverless
+instance. Nothing bulk is persisted: the only thing that survives a cold start is
+the few-hundred-KB computed snapshot and the KB-scale ledger. The consequence the
+user asked for falls straight out — the data cannot go stale, because it is
+re-fetched from the source rather than read from a store that a broken cron stopped
+updating.
+
+Design constraints honoured:
+  * ONE batch request per chunk (yf.download group_by ticker), never per-name.
+  * In-process TTL cache, tighter while NSE is open, loose after the close — a
+    final EOD bar does not change, so re-fetching it is pure waste.
+  * Failure is REPORTED, never silent: a partial fetch returns what it got plus a
+    status naming what it missed, so a thin universe is visible instead of being
+    read as "the market moved".
+  * Two price conventions per bar, exactly as the stored path did (total-return
+    `close` for returns/vol, nominal `close_raw` where a price meets a per-share
+    figure) — the distinction is not optional and re-deriving it wrong would
+    reintroduce the historical-P/E bias the stored path was careful to avoid.
+
+The returned series shape is IDENTICAL to snapshot._bulk_prices' value tuple —
+(dates, closes, volumes, nominal, opens, highs, lows) — so the snapshot builder
+consumes it with no knowledge of where the bars came from.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import date, datetime, timezone
+from typing import Optional
+
+log = logging.getLogger("equisense.live_provider")
+
+# Recent-history window fetched live. Two years covers every signal the snapshot
+# computes — 12-1 momentum needs ~13 months, the 200-day trend and 252-day spark
+# less — with headroom for holidays and gaps. It is deliberately NOT ten years:
+# the daily view needs recency, not depth, and depth is what made the stored panel
+# expensive. Deep history for base-rate studies is a separate, occasional job.
+DEFAULT_YEARS = 2
+
+# Cache freshness. During the NSE session prices move, so a short TTL keeps the
+# view live; after the close the EOD bar is final and a long TTL avoids re-paying
+# for identical numbers (the same clock the client's poll loop already respects).
+TTL_OPEN_S = 300.0        # 5 min while the exchange is open
+TTL_CLOSED_S = 3600.0     # 1 h once it has closed
+
+# Batch size for yf.download. Yahoo throttles large single requests and cloud IPs
+# both; 40 keeps each request modest while staying far below a per-name loop.
+CHUNK = 40
+
+# {(-frozenset key not used-) } — cache is keyed by the ticker tuple + years.
+_CACHE: dict = {"key": None, "series": None, "status": None, "fetched_at": 0.0}
+_INDEX_CACHE: dict = {}
+
+
+def _nse_open_now() -> bool:
+    """NSE cash session in IST, weekday 09:15–15:30. Holidays are not modelled
+    here — treating a holiday as 'open' only shortens the cache TTL, never
+    corrupts data, so the conservative direction is cheap."""
+    ist = datetime.now(timezone.utc).astimezone(
+        timezone(_ist_offset()))
+    if ist.weekday() >= 5:
+        return False
+    hm = ist.hour * 60 + ist.minute
+    return 9 * 60 + 15 <= hm <= 15 * 60 + 30
+
+
+def _ist_offset():
+    from datetime import timedelta
+    return timedelta(hours=5, minutes=30)
+
+
+def _ttl_now() -> float:
+    return TTL_OPEN_S if _nse_open_now() else TTL_CLOSED_S
+
+
+def _frame_to_series(frame) -> Optional[tuple]:
+    """One yfinance per-ticker frame → the snapshot's 7-tuple, or None if empty.
+
+    Pure and dependency-light so it is unit-testable without a network: hand it a
+    DataFrame shaped like yfinance's (Close / Adj Close / Volume / Open / High /
+    Low, DatetimeIndex) and it returns exactly what the stored loader produced.
+    """
+    try:
+        nominal_s = frame["Close"].dropna()
+    except Exception:                                  # noqa: BLE001
+        return None
+    if len(nominal_s) == 0:
+        return None
+    has_adj = "Adj Close" in frame.columns
+    dates: list[date] = []
+    closes: list[float] = []
+    volumes: list = []
+    nominal: list = []
+    opens: list = []
+    highs: list = []
+    lows: list = []
+    o_s = frame["Open"] if "Open" in frame.columns else None
+    h_s = frame["High"] if "High" in frame.columns else None
+    l_s = frame["Low"] if "Low" in frame.columns else None
+    v_s = frame["Volume"] if "Volume" in frame.columns else None
+    adj_s = frame["Adj Close"] if has_adj else None
+
+    def val(series, idx):
+        if series is None:
+            return None
+        try:
+            x = series.loc[idx]
+        except Exception:                              # noqa: BLE001
+            return None
+        try:
+            import math
+            fx = float(x)
+            return None if math.isnan(fx) else fx
+        except Exception:                              # noqa: BLE001
+            return None
+
+    for idx, nom in nominal_s.items():
+        try:
+            nom_f = float(nom)
+        except Exception:                              # noqa: BLE001
+            continue
+        d = idx.date() if hasattr(idx, "date") else idx
+        adj = val(adj_s, idx)
+        dates.append(d)
+        closes.append(nom_f if adj is None else adj)   # total-return basis
+        nominal.append(nom_f)                          # nominal (split-only)
+        volumes.append(val(v_s, idx))
+        opens.append(val(o_s, idx))
+        highs.append(val(h_s, idx))
+        lows.append(val(l_s, idx))
+    if not dates:
+        return None
+    return (dates, closes, volumes, nominal, opens, highs, lows)
+
+
+def _download(symbols: list[str], years: int):
+    """Isolated so tests can monkeypatch it. Imports yfinance lazily so importing
+    this module never requires the network dependency to be resolvable."""
+    import yfinance as yf
+    return yf.download(symbols, period=f"{years}y", interval="1d",
+                       auto_adjust=False, actions=False, progress=False,
+                       group_by="ticker", threads=True)
+
+
+def _yahoo_symbol(ticker: str) -> str:
+    from .universe import yahoo_symbol
+    return yahoo_symbol(ticker)
+
+
+def get_universe_prices(tickers: list[str], years: int = DEFAULT_YEARS,
+                        force: bool = False) -> tuple[dict[str, tuple], dict]:
+    """{ticker: 7-tuple series} fetched live from Yahoo, in-process TTL-cached.
+
+    Returns (series_by_ticker, status). `status` reports coverage and any names
+    that came back empty, so a degraded fetch is visible rather than silently
+    thinning the cross-section (which would move every percentile rank).
+    """
+    key = (tuple(sorted(tickers)), years)
+    now = time.time()
+    if (not force and _CACHE["key"] == key and _CACHE["series"] is not None
+            and now - _CACHE["fetched_at"] < _ttl_now()):
+        return _CACHE["series"], _CACHE["status"]
+
+    series: dict[str, tuple] = {}
+    missing: list[str] = []
+    errors: list[str] = []
+    for i in range(0, len(tickers), CHUNK):
+        batch = tickers[i:i + CHUNK]
+        symbols = [_yahoo_symbol(t) for t in batch]
+        try:
+            data = _download(symbols, years)
+        except Exception as exc:                       # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {str(exc)[:80]}")
+            missing.extend(batch)
+            continue
+        for t, sym in zip(batch, symbols):
+            try:
+                frame = data[sym] if len(symbols) > 1 else data
+            except Exception:                          # noqa: BLE001
+                missing.append(t)
+                continue
+            s = _frame_to_series(frame)
+            if s is None:
+                missing.append(t)
+            else:
+                series[t] = s
+
+    status = {
+        "provider": "yahoo_live",
+        "requested": len(tickers),
+        "returned": len(series),
+        "coverage_pct": round(100 * len(series) / len(tickers), 1) if tickers else 0.0,
+        "missing": missing[:50],
+        "missing_count": len(missing),
+        "errors": errors[:10],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "window_years": years,
+        "note": ("Prices fetched live from Yahoo Finance (free, keyless) and cached "
+                 "in-process; nothing bulk is stored. A partial fetch is reported "
+                 "here rather than read as market movement."),
+    }
+    # Only overwrite the cache on a materially complete fetch. A transient Yahoo
+    # failure returning almost nothing must not evict a good recent snapshot and
+    # replace every view with holes — the stale-but-real prior is better than a
+    # freshly-fetched near-empty cross-section.
+    if series and (status["coverage_pct"] >= 50.0 or _CACHE["series"] is None):
+        _CACHE.update(key=key, series=series, status=status, fetched_at=now)
+        return series, status
+    if _CACHE["series"] is not None:
+        degraded = dict(_CACHE["status"] or {})
+        degraded["stale_served"] = True
+        degraded["last_fetch_attempt"] = status
+        return _CACHE["series"], degraded
+    return series, status
+
+
+def get_index_series(symbol: str = "^NSEI", years: int = DEFAULT_YEARS) -> list[float]:
+    """Total-return-ish close series for a macro index (NIFTY), live + cached.
+    Used for relative strength and the benchmark counterfactual."""
+    now = time.time()
+    c = _INDEX_CACHE.get(symbol)
+    if c and now - c["fetched_at"] < _ttl_now():
+        return c["closes"]
+    closes: list[float] = []
+    try:
+        data = _download([symbol], years)
+        frame = data
+        s = _frame_to_series(frame)
+        if s is not None:
+            closes = s[1]                              # total-return closes
+    except Exception as exc:                           # noqa: BLE001
+        log.warning("index fetch failed for %s: %s", symbol, exc)
+        if c:
+            return c["closes"]
+    _INDEX_CACHE[symbol] = {"closes": closes, "fetched_at": now}
+    return closes
+
+
+def latest_price(ticker: str) -> Optional[float]:
+    """Most recent live close for one ticker, from the warm cache if present.
+    Lets price consumers (paper marks) work without a stored bar."""
+    series = _CACHE.get("series") or {}
+    s = series.get((ticker or "").upper()) or series.get(ticker)
+    if s and s[1]:
+        return s[1][-1]
+    return None
+
+
+def cache_state() -> dict:
+    """Introspection for the data-health surface: is the live cache warm, how old,
+    how much coverage. Never touches the network."""
+    st = _CACHE.get("status") or {}
+    return {
+        "warm": _CACHE.get("series") is not None,
+        "age_seconds": round(time.time() - _CACHE["fetched_at"], 1)
+        if _CACHE.get("fetched_at") else None,
+        "ttl_seconds": _ttl_now(),
+        "nse_open": _nse_open_now(),
+        "coverage_pct": st.get("coverage_pct"),
+        "returned": st.get("returned"),
+        "requested": st.get("requested"),
+    }
