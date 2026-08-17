@@ -226,6 +226,36 @@ def _trend_frame(n, start, slope):
     })
 
 
+def test_studies_get_a_deep_panel_from_live_when_nothing_is_stored(db, monkeypatch):
+    """The evidence tier (base-rate/IC/factor studies) needs deep cross-section.
+    In live mode there is no stored panel, so it must come from the deep live
+    fetch — otherwise the whole tier goes dark and the system over-abstains."""
+    import equisense.models as M
+    from equisense.research import base_rates as br
+    from equisense.api import snapshot as snap
+
+    for tk in ["AAA", "BBB"]:
+        db.add(M.Company(ticker=tk, name=tk, sector="IT", is_index_member=True))
+    db.commit()
+
+    dates = [dt.date(2020, 1, 1) + dt.timedelta(days=i) for i in range(500)]
+
+    def mkseries(base):
+        c = [base + i * 0.1 for i in range(500)]
+        return (dates, c, [1000 + i for i in range(500)], c, c, c, c)
+
+    monkeypatch.setattr(snap, "live_data_enabled", lambda: True)
+    monkeypatch.setattr(lp, "get_deep_panel",
+                        lambda tickers, **k: {"AAA": mkseries(100), "BBB": mkseries(200)})
+
+    closes, volumes = br.load_price_panel(db)
+    assert list(closes.columns) == ["AAA", "BBB"]
+    assert closes.shape == (500, 2)
+    assert abs(closes["BBB"].iloc[-1] - 249.9) < 1e-6
+    assert volumes.shape == (500, 2)
+    lp._DEEP_CACHE.update(key=None, series=None, fetched_at=0.0)
+
+
 def test_rebuild_falls_back_to_stored_and_reports(db, monkeypatch):
     """A failed live fetch must serve the stored panel and STAMP why, never fail
     the whole refresh or hide the degradation."""

@@ -255,6 +255,57 @@ def _index_series(symbol: str, years: int) -> tuple[list, list]:
     return dates, closes
 
 
+# Deep-history cache, separate from the 2-year snapshot cache so an occasional
+# 10-year study fetch does not evict the warm series that latest_price/price_on
+# read. Ten-year daily history barely moves within a day, so a long TTL is right.
+_DEEP_CACHE: dict = {"key": None, "series": None, "fetched_at": 0.0}
+DEEP_TTL_S = 6 * 3600
+DEEP_YEARS = 10
+
+
+def get_deep_panel(tickers: list[str], years: int = DEEP_YEARS,
+                   force: bool = False) -> dict[str, tuple]:
+    """{ticker: 7-tuple series} over a DEEP window, for the evidence studies.
+
+    This is what keeps the analytical stack at full strength in live mode: the
+    base-rate, IC and factor studies need years of cross-section, not the recency
+    the daily view uses. It is an occasional, on-demand fetch (studies are not a
+    per-request cost) cached separately and for hours, so it neither disturbs the
+    hot path nor re-pays for history that has not changed.
+
+    KNOWN LIMITATION, stated so it is not mistaken for the stored path: this
+    fetches the CURRENT universe only. The stored studies read delisted and
+    departed names too, and dropping them reintroduces exactly the survivorship
+    bias the retained history existed to avoid. Live-mode study output is
+    therefore current-members-only and must be caveated as such by its callers.
+    """
+    key = (tuple(sorted(tickers)), years)
+    now = time.time()
+    if (not force and _DEEP_CACHE["key"] == key and _DEEP_CACHE["series"] is not None
+            and now - _DEEP_CACHE["fetched_at"] < DEEP_TTL_S):
+        return _DEEP_CACHE["series"]
+    series: dict[str, tuple] = {}
+    for i in range(0, len(tickers), CHUNK):
+        batch = tickers[i:i + CHUNK]
+        symbols = [_yahoo_symbol(t) for t in batch]
+        try:
+            data = _download(symbols, years)
+        except Exception as exc:                       # noqa: BLE001
+            log.warning("deep panel chunk failed: %s", exc)
+            continue
+        for t, sym in zip(batch, symbols):
+            try:
+                frame = data[sym] if len(symbols) > 1 else data
+            except Exception:                          # noqa: BLE001
+                continue
+            s = _frame_to_series(frame)
+            if s is not None:
+                series[t] = s
+    if series:
+        _DEEP_CACHE.update(key=key, series=series, fetched_at=now)
+    return series
+
+
 def get_index_series(symbol: str = "^NSEI", years: int = DEFAULT_YEARS) -> list[float]:
     """Total-return-ish close series for a macro index (NIFTY), live + cached.
     Used for relative strength."""

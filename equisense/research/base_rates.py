@@ -109,8 +109,16 @@ def load_price_panel(session: Session) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     from ..panel import load_core_panel
     cached = load_core_panel(session)
-    if cached is not None:
+    if cached is not None and not cached[0].empty:
         return cached
+
+    # Live mode: no stored panel exists, so the deep cross-section the studies
+    # need is fetched on demand from the live provider (current members only —
+    # survivorship-caveated by callers). Without this the entire evidence tier
+    # goes dark in live mode and the system abstains for lack of base rates.
+    live = _live_price_panel(session)
+    if live is not None:
+        return live
 
     # Measured bars only. Seeded prices (§5.4 provenance) sit on real dates
     # under real tickers, so without this filter a fabricated annual price path
@@ -134,12 +142,51 @@ def load_price_panel(session: Session) -> tuple[pd.DataFrame, pd.DataFrame]:
     return closes, volumes
 
 
+def _live_price_panel(session: Session):
+    """(closes, volumes) DataFrames from a deep live fetch, or None if not live
+    / nothing returned. Same shape as the stored path so studies are unchanged."""
+    try:
+        from ..api.snapshot import live_data_enabled
+        if not live_data_enabled():
+            return None
+        from ..ingestion import live_provider
+        companies = session.scalars(
+            select(Company).where(Company.is_index_member == True)).all()  # noqa: E712
+        tickers = [c.ticker for c in companies]
+        series = live_provider.get_deep_panel(tickers)
+        if not series:
+            return None
+        close_cols, vol_cols = {}, {}
+        for tk, s in series.items():
+            dates = pd.Index(s[0])
+            close_cols[tk] = pd.Series(s[1], index=dates)   # total-return close
+            vol_cols[tk] = pd.Series(s[2], index=dates)     # volume
+        closes = pd.DataFrame(close_cols).sort_index()
+        volumes = pd.DataFrame(vol_cols).sort_index()
+        return closes, volumes
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
 def load_nifty(session: Session) -> pd.Series:
     rows = session.execute(
         select(MacroObservation.obs_date, MacroObservation.close)
         .where(MacroObservation.symbol == "^NSEI")
         .order_by(MacroObservation.obs_date)).all()
-    return pd.Series({d: c for d, c in rows}).sort_index()
+    if rows:
+        return pd.Series({d: c for d, c in rows}).sort_index()
+    # Live mode: no stored macro; fetch the index deep from the live provider so
+    # relative-strength and index-joined studies keep working.
+    try:
+        from ..api.snapshot import live_data_enabled
+        if live_data_enabled():
+            from ..ingestion import live_provider
+            dates, closes = live_provider._index_series("^NSEI", live_provider.DEEP_YEARS)
+            if dates:
+                return pd.Series({d: c for d, c in zip(dates, closes)}).sort_index()
+    except Exception:                                       # noqa: BLE001
+        pass
+    return pd.Series(dtype=float).sort_index()
 
 
 def load_sector_map(session: Session) -> dict[str, str]:
