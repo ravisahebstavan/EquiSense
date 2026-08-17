@@ -938,10 +938,11 @@ def cron_refresh(s: Session = Depends(db)):
     from ..ingestion.nse_archive import backfill as nse_backfill, prune
     from .autopilot import get_config, register_daily_forecasts, run_autopilot
     from .markets import capture_vol_surface
-    from .snapshot import rebuild_universe_snapshot
+    from .snapshot import live_data_enabled, rebuild_universe_snapshot
 
     t0 = _time.monotonic()
     out: dict = {}
+    live = live_data_enabled()
 
     def stage(name: str, fn):
         """Run one stage, commit it, and never let it take down the rest.
@@ -975,14 +976,26 @@ def cron_refresh(s: Session = Depends(db)):
             out[name] = {"error": f"{type(exc).__name__}: {exc}"[:160]}
             return None
 
+    def dstage(name: str, fn):
+        """A bulk-DATA stage. In live mode the market is fetched from Yahoo on
+        demand and nothing bulk is stored, so these stages — price/OHLC/macro
+        ingestion, archives, the columnar panel — are not just unnecessary but
+        actively harmful: every write spends the metered transfer this whole
+        rearchitecture exists to stop. Skipped and reported, never silent."""
+        if live:
+            out[name] = {"skipped": "live mode — market data is fetched live, "
+                                    "not stored (no Neon writes)"}
+            return None
+        return stage(name, fn)
+
     # 1. Universe first: everything downstream needs the ids, and it is cheap.
     ids = stage("universe", lambda: sync_universe(s)) or {}
     out["universe"] = {"companies": len(ids)}
 
     # 2. NON-BACKFILLABLE captures, before anything that merely refetches.
-    stage("vol_surface", lambda: capture_vol_surface(s))
+    dstage("vol_surface", lambda: capture_vol_surface(s))
     if ids:
-        stage("nse_archives", lambda: nse_backfill(s, days=4, symbols=list(ids)))
+        dstage("nse_archives", lambda: nse_backfill(s, days=4, symbols=list(ids)))
 
     # 3. Prices and macro — recoverable, but the learning loop below needs them.
     #
@@ -998,11 +1011,11 @@ def cron_refresh(s: Session = Depends(db)):
     # a universe switch can introduce hundreds at once, and none of them are
     # worth losing the rest of the pipeline over.
     if ids:
-        stage("price_rows", lambda: refresh_quotes(s, ids))
+        dstage("price_rows", lambda: refresh_quotes(s, ids))
         missing = [t for t, cid in ids.items() if cid not in _priced_ids(s)]
         if missing:
             chunk = dict(list({t: ids[t] for t in missing}.items())[:BACKFILL_PER_RUN])
-            stage("backfilled_names", lambda: {
+            dstage("backfilled_names", lambda: {
                 "names": len(chunk), "remaining": len(missing) - len(chunk),
                 "rows": ingest_prices(s, chunk, years=10)})
         else:
@@ -1017,18 +1030,18 @@ def cron_refresh(s: Session = Depends(db)):
             from ..ingestion.coverage import names_needing_repair
             hurt = names_needing_repair(s, limit=REPAIR_PER_RUN)
             if hurt:
-                stage("repaired_names", lambda: {
+                dstage("repaired_names", lambda: {
                     "names": hurt,
                     "rows": ingest_prices(s, {t: ids[t] for t in hurt if t in ids},
                                           years=10)})
-    stage("macro_rows", lambda: ingest_macro(s, years=1))
+    dstage("macro_rows", lambda: ingest_macro(s, years=1))
 
     # The columnar panel, rebuilt once here so that every study, IC run, factor
     # fit and backtest below reads one compressed blob instead of the whole
     # price table. That read is the largest recurring data transfer in the
     # system and is what exhausted the tier's quota (§5.3).
     from ..panel import build_panels
-    stage("panel", lambda: build_panels(s))
+    dstage("panel", lambda: build_panels(s))
 
     # 4. The learning loop. Every gated capability unlocks from realised
     #    forecasts, and a forecast only exists once a dossier is registered.
@@ -1055,7 +1068,7 @@ def cron_refresh(s: Session = Depends(db)):
         if isinstance(auto, dict):
             out["autopilot"] = {"entries": len(auto["entries"]),
                                 "exits": len(auto["exits"])}
-    stage("pruned", lambda: prune(s))
+    dstage("pruned", lambda: prune(s))
 
     # 7. The most expensive stage and the most recomputable one, so it is both
     #    the correct thing to sacrifice on a heavy day AND the wrong thing to
@@ -1064,20 +1077,33 @@ def cron_refresh(s: Session = Depends(db)):
     #    that meters data transfer is the single largest recurring cost in the
     #    system, roughly 60 MB a run. Base rates are ten-year statistics: doing
     #    that every day bought a number that had not moved.
+    #
+    #    In live mode there is no stored panel to reload at all: the deep,
+    #    survivorship-corrected history these studies need is precisely the bulk
+    #    data the rearchitecture stopped keeping. So the daily cron does not run
+    #    them — the last computed records (small JSON, persisted) are served, and
+    #    a refresh is an explicit on-demand job (/api/live/studies/run) that pays
+    #    the one-off deep fetch when the user asks for it.
     from ..models import BaseRateRecord
     from .status import STALE_STUDY_DAYS
-    _computed = s.scalar(select(func.max(BaseRateRecord.computed_at)))
-    _due = (_computed is None
-            or (date.today() - _computed.date()).days >= STALE_STUDY_DAYS)
-    if _due:
-        stage("base_rate_records", lambda: run_all_studies(s)["records"])
-    else:
-        age = (date.today() - _computed.date()).days
+    if live:
         out["base_rate_records"] = {
-            "skipped": f"studies are {age}d old; recomputed every "
-                       f"{STALE_STUDY_DAYS}d. Ten-year statistics do not move "
-                       "on one session, and the full-panel reload is the "
-                       "largest recurring data transfer in the system."}
+            "skipped": "live mode — base-rate studies need a deep, survivorship-"
+                       "corrected historical panel that is not stored. Last "
+                       "computed records are served; refresh on demand."}
+    else:
+        _computed = s.scalar(select(func.max(BaseRateRecord.computed_at)))
+        _due = (_computed is None
+                or (date.today() - _computed.date()).days >= STALE_STUDY_DAYS)
+        if _due:
+            stage("base_rate_records", lambda: run_all_studies(s)["records"])
+        else:
+            age = (date.today() - _computed.date()).days
+            out["base_rate_records"] = {
+                "skipped": f"studies are {age}d old; recomputed every "
+                           f"{STALE_STUDY_DAYS}d. Ten-year statistics do not move "
+                           "on one session, and the full-panel reload is the "
+                           "largest recurring data transfer in the system."}
 
     out["elapsed_s"] = round(_time.monotonic() - t0, 1)
     out["budget_s"] = CRON_BUDGET_S
