@@ -498,6 +498,21 @@ def run_all_studies(session: Session, panel=None) -> dict:
     closes, volumes = load_price_panel(session) if panel is None else panel
     _slog.info("studies: panel %s x %s loaded in %.1fs",
                closes.shape[0], closes.shape[1], _time.monotonic() - _t)
+    # In live mode the deep panel is current-members-only, so these base rates
+    # carry survivorship bias the stored (delisted-inclusive) panel avoided —
+    # winners that were dropped from the index are absent, which flatters every
+    # long-side rate. Flagged on the result so it is never mistaken for the
+    # survivorship-corrected numbers the README leads with.
+    _survivorship = None
+    try:
+        from ..api.snapshot import live_data_enabled
+        if panel is None and live_data_enabled():
+            _survivorship = ("live current-members-only panel: results are "
+                             "survivorship-biased (delisted/departed names absent, "
+                             "which flatters long-side rates). The stored panel "
+                             "retains dead names precisely to correct this.")
+    except Exception:                                  # noqa: BLE001
+        pass
     nifty = load_nifty(session)
     regimes = pd.Series(regime_series(nifty.tolist()), index=nifty.index)
     regimes = regimes.reindex(closes.index, method="ffill").fillna("unknown")
@@ -555,6 +570,8 @@ def run_all_studies(session: Session, panel=None) -> dict:
             "universe": closes.shape[1],
             "history_days": closes.shape[0],
             "caveat": SURVIVORSHIP_CAVEAT,
+            "live_survivorship_bias": _survivorship,
+            "panel_source": "live_current_members" if _survivorship else "stored",
             "multiplicity_note": (
                 f"{len(records)} study cells computed; FDR controlled at "
                 f"{FDR_ALPHA:.0%} (Benjamini–Hochberg) across the whole run, and "
