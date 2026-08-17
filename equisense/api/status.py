@@ -262,9 +262,35 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
     }
     quality = round(sum(comp.values()) / len(comp) * 100)
 
+    # Live-data observability. The user's recurring complaint was not seeing the
+    # data refresh; in live mode there is no stored panel whose age answers that,
+    # so freshness is the in-process cache's age on the market clock. Surfaced
+    # here alongside the F&O executability provenance so both the no-storage mode
+    # and the pinned short-eligibility list are visible, never assumed.
+    from .snapshot import live_data_enabled
+    _live = live_data_enabled()
+    live_data = {
+        "mode": "live_no_storage" if _live else "stored_db",
+        "explanation": ("Market data is fetched live from Yahoo and cached in "
+                        "process; nothing bulk is stored, so it cannot go stale "
+                        "behind a broken cron." if _live else
+                        "Market data is read from the stored panel; the cron "
+                        "keeps it current."),
+    }
+    try:
+        from ..engine.india_market import eligibility_provenance
+        live_data["fno_executability"] = eligibility_provenance()
+        if _live:
+            from ..ingestion import live_provider
+            live_data["cache"] = live_provider.cache_state()
+    except Exception as exc:                           # noqa: BLE001
+        live_data["error"] = f"{type(exc).__name__}: {exc}"[:120]
+
     return {
         "as_of_utc": datetime.now(timezone.utc).isoformat(),
-        "provider": "yahoo (bootstrap tier — exchange sources planned, §5.2)",
+        "provider": ("yahoo (live, no bulk storage)" if _live else
+                     "yahoo (stored panel — bootstrap tier, §5.2)"),
+        "live_data": live_data,
         "quality_score": quality,
         "quality_components": {k: round(v, 3) for k, v in comp.items()},
         "warnings": warnings,
