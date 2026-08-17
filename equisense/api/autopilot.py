@@ -259,8 +259,20 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
     # forecast of direction. It is refusing to add NEW exposure while the price
     # of risk says diversification is about to stop working.
     max_open = cfg["max_open_positions"]
-    vix_pct = next((c.get("value") for c in current_regime(session)["components"]
+    _regime_components = current_regime(session)["components"]
+    vix_pct = next((c.get("value") for c in _regime_components
                     if c.get("key") == "vix_percentile"), None)
+    # Market-trend filter (Faber 2007): the single most robust drawdown-reduction
+    # rule in tactical allocation is to stand aside from LONG exposure while the
+    # index sits below its own 200-day average. It is not a price forecast — the
+    # book is not being told where NIFTY goes next — it is the observation that
+    # the large, persistent equity drawdowns happen almost entirely in the
+    # below-200DMA regime, so initiating fresh longs into it is buying the part of
+    # the distribution with the worst risk-adjusted payoff. Shorts (F&O) are the
+    # correct side there and are deliberately left unaffected.
+    nifty_trend = next((c.get("value") for c in _regime_components
+                        if c.get("key") == "nifty_trend"), None)
+    market_downtrend = nifty_trend is not None and nifty_trend < 0
     if vix_pct is not None and vix_pct >= VIX_HALT_PCTILE:
         max_open = len(open_names)          # hold what is held; add nothing
         report["skipped"].append(
@@ -287,6 +299,14 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
             continue
         if c["ticker"] in open_names:
             report["skipped"].append(f"{c['ticker']}: already held — no pyramiding")
+            continue
+        if market_downtrend and c.get("direction") == "long":
+            report["skipped"].append(
+                f"{c['ticker']}: market-trend filter — NIFTY is {nifty_trend:.1f}% "
+                "below its 200DMA (downtrend), where the large equity drawdowns "
+                "concentrate; not initiating new longs into a falling market "
+                "(Faber 2007). Held positions still exit on their own rules; "
+                "shorts are unaffected.")
             continue
         if not c["tradable"]:
             report["skipped"].append(f"{c['ticker']}: failed gates — "

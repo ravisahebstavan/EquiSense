@@ -563,3 +563,56 @@ def test_forecast_density_is_configurable_and_bounded(world, monkeypatch):
     set_config(s, {"daily_forecasts": 3})
     out = register_daily_forecasts(s)
     assert len(out["registered"]) == 3
+
+
+def _regime(monkeypatch, nifty_trend, vix=40.0):
+    import equisense.api.live as live
+    monkeypatch.setattr(live, "current_regime", lambda s_: {
+        "label": "t", "conditioning_key": "all", "flags": [],
+        "components": [{"key": "nifty_trend", "value": nifty_trend},
+                       {"key": "vix_percentile", "value": vix}]})
+
+
+def _force_long_directional(monkeypatch, tickers):
+    import equisense.api.candidates as C
+    def fake(session, top_n=8, book_value=None, cash=None):
+        return {"as_of": "t", "regime": "t", "scanned": 2,
+                "verdict_counts": {"long": len(tickers), "avoid": 0, "abstain": 0},
+                "weights_status": "uniform",
+                "candidates": [{"id": i + 1, "ticker": t, "name": t, "sector": "IT",
+                                "price": 100.0, "net_score": 0.2, "direction": "long",
+                                "conviction_band": "low", "dispersion": 0.1,
+                                "drivers": ["momentum +10%"], "dissent": [],
+                                "sizing": {"shares": 5, "value": 500.0,
+                                           "stop_distance_pct": 3.0, "binding": "risk_budget"},
+                                "round_trip_cost_pct": 0.25, "breakeven_move_pct": 0.25,
+                                "gates": [], "tradable": True}
+                               for i, t in enumerate(tickers)],
+                "discipline_note": ""}
+    monkeypatch.setattr(C, "qualified_candidates", fake)
+
+
+def test_market_trend_filter_blocks_new_longs_in_downtrend(world, monkeypatch):
+    """Faber 2007: no new longs while NIFTY is below its 200DMA — the regime
+    where the large equity drawdowns concentrate."""
+    s, a, b = world
+    _regime(monkeypatch, nifty_trend=-8.0)
+    _force_long_directional(monkeypatch, ["AAA"])
+    from equisense.api.autopilot import run_autopilot, set_config
+    set_config(s, {"enabled": True, "max_new_per_run": 2})
+    rep = run_autopilot(s)
+    assert not rep["entries"]
+    assert any("market-trend filter" in x for x in rep["skipped"])
+
+
+def test_market_trend_filter_allows_longs_in_uptrend(world, monkeypatch):
+    """Control: the identical long IS taken when NIFTY is above its 200DMA, so the
+    filter is a regime gate, not a blanket refusal."""
+    s, a, b = world
+    _regime(monkeypatch, nifty_trend=+5.0)
+    _force_long_directional(monkeypatch, ["AAA"])
+    from equisense.api.autopilot import run_autopilot, set_config
+    set_config(s, {"enabled": True, "max_new_per_run": 2})
+    rep = run_autopilot(s)
+    assert len(rep["entries"]) == 1
+    assert not any("market-trend filter" in x for x in rep["skipped"])
