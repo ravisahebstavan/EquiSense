@@ -14,8 +14,9 @@ from sqlalchemy.orm import Session
 
 from ..engine.evidence import Evidence, ev, xsec_strength
 from ..engine.india_market import round_to_lot, short_executability
-from ..engine.sizing import (SizingInputs, cost_tax_breakeven,
-                             futures_cost_breakeven, recommend_size)
+from ..engine.sizing import (SizingInputs, capital_feasibility,
+                             cost_tax_breakeven, futures_cost_breakeven,
+                             recommend_size)
 from ..engine.synthesis import synthesize
 from ..models import PriceObservation
 from ..research.base_rates import get_base_rate
@@ -425,10 +426,20 @@ def qualified_candidates(session: Session, top_n: int = 8,
     _apply_diversification_gate(session, candidates)
     candidates.sort(key=lambda c: (-c["tradable"], -abs(c["net_score"])))  # re-sort post-gate
 
+    # Can this book actually EXECUTE the strategy, or would the ranking keep
+    # picking names it cannot afford a whole share of? Indian equity has no
+    # fractional shares, so below a threshold capital the book silently drifts
+    # into a cheap-stock tilt that carries none of this system's evidence. This
+    # binds before alpha and was computed nowhere — now it rides on every scan so
+    # the small-capital reality is stated, not discovered by underperformance.
+    prices = [it["price"] for it in universe["companies"] if it.get("price")]
+    feasibility = capital_feasibility(book_value or 1_000_000.0, prices, top_n=15)
+
     return {
         "as_of": universe.get("as_of"),
         "regime": regime["label"],
         "scanned": scanned,
+        "capital_feasibility": feasibility,
         "verdict_counts": verdicts,
         "weights_status": weights_status,
         "governance_filter": {
