@@ -49,6 +49,8 @@ def per_company_staleness(session: Session, max_lag_days: int = STALE_PRICE_DAYS
 def data_status(session: Session, verify_ledger: bool = False) -> dict:
     today = date.today()
     warnings: list[str] = []
+    from .snapshot import live_data_enabled
+    _live = live_data_enabled()
 
     # ONE round trip for five aggregates. Each of these was a separate query,
     # and this endpoint issued 19 in total — none individually slow, but a
@@ -76,7 +78,17 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
         )).one()
     price_stale = (today - latest_price).days if latest_price else None
     if price_stale is None:
-        warnings.append("no price data ingested")
+        if _live:
+            # Live mode stores no panel, so an empty table is expected, not a
+            # fault. Freshness is the live snapshot's age; warn only if it has not
+            # been built yet.
+            from .snapshot import get_universe
+            _snap_live = get_universe(session, allow_rebuild=False)
+            if not _snap_live.get("companies"):
+                warnings.append("live snapshot not built yet — the next request "
+                                "will fetch prices from Yahoo and build it")
+        else:
+            warnings.append("no price data ingested")
     elif price_stale > STALE_PRICE_DAYS:
         warnings.append(f"prices are {price_stale} days old — refresh recommended")
 
@@ -260,6 +272,29 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
         "studies_current": 0.0 if br_count == 0 else (0.6 if studies_stale else 1.0),
         "ledger_integrity": 1.0 if chain.get("intact", True) else 0.0,
     }
+
+    # Live mode: the price-derived components above read an empty stored table by
+    # design and would drag the quality score to a false near-zero. Recompute them
+    # from the live snapshot instead — its coverage and freshness ARE the data
+    # quality when nothing is stored. Continuity and intraday coverage come free
+    # with the live fetch (contiguous recent window, OHLC in the same request), so
+    # they track coverage rather than a stored-gap ratio that no longer exists.
+    if _live:
+        from .snapshot import _snapshot_time_stale, get_universe
+        _snap_q = get_universe(session, allow_rebuild=False)
+        _snap_companies = _snap_q.get("companies", [])
+        _n = len(_snap_companies)
+        _ds = _snap_q.get("data_source", {}) or {}
+        _cov = (_ds.get("coverage_pct") if _ds.get("coverage_pct") is not None
+                else (100.0 if _n else 0.0)) / 100.0
+        _stale_ct = len(_snap_q.get("stale_names", {}))
+        _breadth = 1 - min(1.0, _stale_ct / max(1, _n)) if _n else 0.0
+        _fresh = 0.0 if not _n else (0.6 if _snapshot_time_stale(_snap_q) else 1.0)
+        comp["price_freshness"] = round(_fresh * _breadth, 4)
+        comp["volume_completeness"] = round(_cov, 4)
+        comp["series_continuity"] = round(_cov, 4)
+        comp["intraday_range_coverage"] = round(_cov, 4)
+
     quality = round(sum(comp.values()) / len(comp) * 100)
 
     # Live-data observability. The user's recurring complaint was not seeing the
