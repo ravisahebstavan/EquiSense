@@ -233,6 +233,27 @@ def account(session: Session, include_curve: bool = True) -> dict:
     # measure is total return on starting capital since open.
     total_return_pct = (equity / starting_cash - 1) * 100 if starting_cash else None
 
+    # Transaction-cost drag. Fills are booked at the close with no friction, so
+    # the return above is GROSS — and a system this careful about modelling costs
+    # at the sizing stage cannot then quote a paper record that pretends trading
+    # is free. Each fill is one leg, so it bears one side of the statutory stack
+    # plus its flat fee (a short leg is a futures order; a delivery sell also pays
+    # the DP charge). Reported alongside the gross figure, not silently netted, so
+    # both the raw result and the honest after-cost result are visible — and the
+    # benchmark deliberately bears no such drag, because buying the index once is
+    # the near-frictionless alternative the strategy must beat NET of its own costs.
+    from ..engine.sizing import (ROUND_TRIP_STATUTORY, DP_CHARGE_PER_SELL,
+                                 FNO_BROKERAGE_PER_ORDER)
+    est_costs = 0.0
+    for t in trades:
+        leg_value = t.quantity * t.price
+        est_costs += leg_value * (ROUND_TRIP_STATUTORY / 2.0)   # one side of the round trip
+        est_costs += (FNO_BROKERAGE_PER_ORDER if t.side == "sell"
+                      else 0.0) + (DP_CHARGE_PER_SELL if t.side == "sell" else 0.0)
+    cost_drag_pct = (est_costs / starting_cash * 100) if starting_cash else None
+    net_of_cost_return_pct = (None if total_return_pct is None or cost_drag_pct is None
+                              else round(total_return_pct - cost_drag_pct, 2))
+
     out = {
         "opened": cfg.get("opened"),
         "starting_cash": starting_cash,
@@ -240,6 +261,14 @@ def account(session: Session, include_curve: bool = True) -> dict:
         "positions_value": round(invested_value, 2),
         "equity": round(equity, 2),
         "total_return_pct": None if total_return_pct is None else round(total_return_pct, 2),
+        "estimated_cost_drag_pct": None if cost_drag_pct is None else round(cost_drag_pct, 3),
+        "net_of_cost_return_pct": net_of_cost_return_pct,
+        "cost_note": ("Fills are booked gross (at the close, no friction). "
+                      "estimated_cost_drag_pct is the modelled statutory + flat "
+                      "cost of every leg traded; net_of_cost_return_pct is the "
+                      "honest after-cost figure. The benchmark bears no such drag "
+                      "by design — the strategy must beat passive NET of its own "
+                      "trading costs."),
         "realized_pnl": round(sum(r["realized_pnl"] for r in pos_rows)
                               + sum(p.realized_pnl for cid, p in positions.items()
                                     if p.quantity <= 1e-9), 2),
