@@ -157,6 +157,75 @@ def test_thin_live_fetch_refuses_to_publish(db, monkeypatch):
         snap.build_universe_snapshot_live(db)
 
 
+def test_full_live_money_making_path(db, monkeypatch):
+    """End-to-end in the no-storage world: live snapshot → candidate screen →
+    executability → paper fill, with NO stored prices anywhere. This is the whole
+    product working on live free data, so if it holds together here it holds.
+    """
+    import equisense.models as M
+    from equisense.api import snapshot as snap
+    from equisense.api.candidates import qualified_candidates
+    from equisense.api import paper
+
+    monkeypatch.setenv("EQUISENSE_LIVE_DATA", "1")
+
+    # A handful of index members, F&O-eligible names among them, no price rows.
+    names = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ITC"]
+    for tk in names:
+        db.add(M.Company(ticker=tk, name=tk, sector="IT", cap_band="large",
+                         is_index_member=True))
+    db.commit()
+
+    # Distinct trending series so the cross-section is not degenerate.
+    def series(start, slope):
+        return lp._frame_to_series(_trend_frame(400, start, slope))
+    live = {tk: series(100 + i * 40, 0.1 + 0.02 * i) for i, tk in enumerate(names)}
+
+    def fake_fetch(tickers, **k):
+        got = {t: live[t] for t in tickers if t in live}
+        status = {"provider": "yahoo_live", "returned": len(got),
+                  "requested": len(tickers), "coverage_pct": 100.0}
+        # Mirror the real provider: a successful fetch warms the in-process cache,
+        # which is what latest_price (paper marks) reads.
+        lp._CACHE.update(key="test", series=got, status=status, fetched_at=1e12)
+        return got, status
+    monkeypatch.setattr(lp, "get_universe_prices", fake_fetch)
+    monkeypatch.setattr(lp, "get_index_series",
+                        lambda *a, **k: [100.0 + i * 0.5 for i in range(400)])
+
+    snap.invalidate_universe_cache()
+    universe = snap.get_universe(db)               # live-mode self-refresh
+    assert universe["data_source"]["provider"] == "yahoo_live"
+    assert len(universe["companies"]) == len(names)
+
+    # The candidate screen runs the full evidence→synthesis→gates pipeline off the
+    # live snapshot and must return a coherent structure (not necessarily any
+    # tradable name — abstention is the modal correct output).
+    result = qualified_candidates(db, top_n=5)
+    assert result["scanned"] == len(names)
+    assert "candidates" in result and "reviewed" in result
+
+    # A paper fill marks against the live cache (no stored bar exists).
+    cid = db.query(M.Company).filter_by(ticker="RELIANCE").one().id
+    fill = paper.place_trade(db, cid, "buy", 1)
+    assert fill["fill_price"] > 0
+    acct = paper.account(db, include_curve=False)
+    assert acct["positions"] and acct["positions"][0]["price"] > 0
+    snap.invalidate_universe_cache()
+    lp._CACHE.update(key=None, series=None, status=None, fetched_at=0.0)
+
+
+def _trend_frame(n, start, slope):
+    idx = [dt.datetime(2024, 1, 1) + dt.timedelta(days=i) for i in range(n)]
+    close = [start + i * slope for i in range(n)]
+    return _FakeFrame(idx, {
+        "Close": close, "Adj Close": [c * 0.99 for c in close],
+        "Volume": [500000 + i for i in range(n)],
+        "Open": [c - 0.1 for c in close], "High": [c + 0.3 for c in close],
+        "Low": [c - 0.3 for c in close],
+    })
+
+
 def test_rebuild_falls_back_to_stored_and_reports(db, monkeypatch):
     """A failed live fetch must serve the stored panel and STAMP why, never fail
     the whole refresh or hide the degradation."""
