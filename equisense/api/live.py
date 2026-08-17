@@ -578,6 +578,16 @@ def build_dossier(session: Session, company: Company, book_value: float = 1_000_
         costs = cost_tax_breakeven(sizing["recommended_value"] or 1.0,
                                    ctx["adv_cr"], expected_hold_months)
 
+    # Short-side executability travels WITH the forecast record, not just the
+    # live candidate screen. A bearish verdict on a name with no listed future is
+    # a real epistemic output — the system did see downside — but it is not a
+    # trade a retail cash account can hold, and the dossier must say so or the
+    # calibration ledger scores a position that could never have been opened.
+    execution = None
+    if synth.verdict == "avoid_short_candidate":
+        from ..engine.india_market import short_executability
+        execution = short_executability(company.ticker).to_dict()
+
     shadow_count = sum(1 for e in evidence if e.direction == "shadow")
     missing = {
         "coverage": synth.coverage,
@@ -607,6 +617,7 @@ def build_dossier(session: Session, company: Company, book_value: float = 1_000_
                               "open_heat_pct": book["open_heat_pct"]},
         "sizing": sizing,
         "costs_taxes": costs,
+        "short_execution": execution,
         "missing_information": missing,
         "claim_horizon_days": 126,
         "epistemics": {

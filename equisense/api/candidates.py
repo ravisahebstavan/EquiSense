@@ -13,7 +13,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..engine.evidence import Evidence, ev, xsec_strength
-from ..engine.sizing import SizingInputs, cost_tax_breakeven, recommend_size
+from ..engine.india_market import round_to_lot, short_executability
+from ..engine.sizing import (SizingInputs, cost_tax_breakeven,
+                             futures_cost_breakeven, recommend_size)
 from ..engine.synthesis import synthesize
 from ..models import PriceObservation
 from ..research.base_rates import get_base_rate
@@ -301,8 +303,50 @@ def qualified_candidates(session: Session, top_n: int = 8,
             # negative score would come back at or below zero shares.
             net_score=abs(synth.net_score), adv_cr=item.get("adv_cr"),
             max_position_pct=10.0))
-        costs = cost_tax_breakeven(max(sizing["recommended_value"], 1.0),
-                                   item.get("adv_cr"), expected_hold_months=6)
+
+        # ---- executability layer: can this account actually PUT ON this trade?
+        # A long is ordinary delivery. A short is only holdable for this horizon
+        # as a single-stock future, which exists for ~180 names, trades in whole
+        # lots, and — post-SEBI's ₹15-lakh minimum contract value — often costs
+        # more per lot than a personal book can commit. So the short side is
+        # re-sized in whole futures lots and costed on the futures stack, and a
+        # name with no listed future is failed outright: there is no instrument a
+        # retail account can carry the bearish view in.
+        execu = None
+        if direction < 0:
+            execu = short_executability(t)
+            if not execu.executable:
+                gates.append(f"failed: {execu.reason}")
+                sizing["recommended_shares"] = 0
+                sizing["recommended_value"] = 0.0
+            else:
+                lot = execu.lot_size
+                lots = (sizing["recommended_shares"] // lot) if lot else 0
+                lot_shares = round_to_lot(sizing["recommended_shares"], lot)
+                if lot and lot_shares <= 0:
+                    one_lot_notional = lot * item["price"]
+                    gates.append(
+                        f"failed: below one futures lot — a single {t} lot is "
+                        f"{lot} sh ≈ ₹{one_lot_notional:,.0f} notional, more than the "
+                        "risk budget sizes here (SEBI's ~₹15L minimum contract "
+                        "value makes single-stock futures shorts inaccessible to a "
+                        "small book)")
+                sizing["recommended_shares"] = lot_shares
+                sizing["recommended_value"] = round(lot_shares * item["price"], 2)
+                sizing["lots"] = int(lots)
+                sizing["lot_size"] = lot
+                sizing["instrument"] = "single_stock_future"
+                sizing["margin_required"] = round(
+                    sizing["recommended_value"] * execu.margin_fraction, 2)
+
+        # Cost stack matches the instrument: delivery hurdle for longs, the
+        # lighter (but flat-fee-bearing) futures hurdle for shorts.
+        if direction < 0 and execu and execu.executable:
+            costs = futures_cost_breakeven(max(sizing["recommended_value"], 1.0),
+                                           item.get("adv_cr"))
+        else:
+            costs = cost_tax_breakeven(max(sizing["recommended_value"], 1.0),
+                                       item.get("adv_cr"), expected_hold_months=6)
         # gate 1: liquidity — must be able to exit
         if (item.get("adv_cr") or 0) < 1.0:
             gates.append("failed: liquidity below ₹1 cr/day traded value")
@@ -345,7 +389,15 @@ def qualified_candidates(session: Session, top_n: int = 8,
             "sizing": {"shares": sizing["recommended_shares"],
                        "value": sizing["recommended_value"],
                        "stop_distance_pct": sizing["stop_distance_pct"],
-                       "binding": sizing["binding_constraint"]},
+                       "binding": sizing["binding_constraint"],
+                       **({"instrument": sizing["instrument"],
+                           "lots": sizing.get("lots"),
+                           "lot_size": sizing.get("lot_size"),
+                           "margin_required": sizing.get("margin_required")}
+                          if sizing.get("instrument") else {})},
+            "instrument": ("single_stock_future" if direction < 0
+                           and execu and execu.executable else "delivery_equity"),
+            "executability": execu.to_dict() if execu else None,
             "round_trip_cost_pct": costs["round_trip_cost_pct"],
             "breakeven_move_pct": costs["breakeven_gross_move_pct"],
             "gates": gates,
