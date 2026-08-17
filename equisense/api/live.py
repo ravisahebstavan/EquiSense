@@ -60,7 +60,22 @@ def _macro(session: Session, symbol: str, limit: int | None = None) -> list[floa
     if limit:
         q = q.limit(limit)
     rows = [r[0] for r in session.execute(q).all()]
-    return rows[::-1]
+    if rows:
+        return rows[::-1]
+    # Live mode stores no macro, so the REGIME would come back blank — and with it
+    # the VIX de-risk and the 200DMA trend filter that protect the book would
+    # silently stop firing. Fetch the index/VIX/FX/crude live so risk management
+    # keeps working with nothing stored. Cached in the provider; a failed fetch
+    # returns an empty series and the regime degrades to 'unknown', as before.
+    try:
+        from .snapshot import live_data_enabled
+        if live_data_enabled():
+            from ..ingestion import live_provider
+            series = live_provider.get_index_series(symbol, years=3)
+            return series[-limit:] if (limit and series) else series
+    except Exception:                                  # noqa: BLE001
+        pass
+    return []
 
 
 def current_regime(session: Session) -> dict:
