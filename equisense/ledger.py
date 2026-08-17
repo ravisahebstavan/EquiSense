@@ -298,7 +298,18 @@ def _excess_return(session: Session, cid: int, start: date, end: date,
                               .where(PriceObservation.company_id == company_id,
                                      PriceObservation.obs_date <= on)
                               .order_by(PriceObservation.obs_date.desc())).first()
-        return row.close if row else None
+        if row:
+            return row.close
+        # Live mode stores no price panel, so scoring reads the realized price
+        # from the warm live series instead. Without this the calibration loop —
+        # the whole point of the ledger — would silently stop the moment the
+        # stored panel went away, and every weight would stay provisional forever.
+        try:
+            from .ingestion import live_provider
+            c = session.get(Company, company_id)
+            return live_provider.price_on(c.ticker, on) if c else None
+        except Exception:                              # noqa: BLE001
+            return None
 
     p0, p1 = px(cid, start), px(cid, end)
     if not p0 or not p1:

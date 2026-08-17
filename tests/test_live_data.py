@@ -126,6 +126,23 @@ def test_snapshot_builds_from_live_series_without_reading_stored_prices(db, monk
     assert all(c["price"] > 0 for c in out["companies"])
 
 
+def test_price_on_reads_realized_price_from_the_live_cache():
+    """The self-improving loop scores a claim by comparing the price when it was
+    made against the price at its horizon. In live mode both come from the cached
+    series, not a stored table — so price_on must find the last close on/before a
+    date, exactly as the stored path did."""
+    dates = [dt.date(2025, 1, 1) + dt.timedelta(days=i) for i in range(400)]
+    closes = [100.0 + i for i in range(400)]
+    lp._CACHE.update(key="x", fetched_at=1e12, status={},
+                     series={"AAA": (dates, closes, [0] * 400, closes,
+                                     [0] * 400, [0] * 400, [0] * 400)})
+    assert lp.price_on("AAA", dt.date(2025, 3, 1)) == 159.0     # day index 59
+    assert lp.price_on("AAA", dt.date(2026, 6, 1)) == 499.0     # clamps to last
+    assert lp.price_on("AAA", dt.date(2024, 1, 1)) is None      # before the series
+    assert lp.price_on("MISSING", dt.date(2025, 3, 1)) is None
+    lp._CACHE.update(key=None, series=None, status=None, fetched_at=0.0)  # reset
+
+
 def test_thin_live_fetch_refuses_to_publish(db, monkeypatch):
     import equisense.models as M
     from equisense.api import snapshot as snap

@@ -257,6 +257,33 @@ def latest_price(ticker: str) -> Optional[float]:
     return None
 
 
+def price_on(ticker: str, on_date, series_key: int = 1) -> Optional[float]:
+    """Total-return close on or before `on_date` from the warm live cache.
+
+    This is what lets the SELF-IMPROVING LOOP keep working with nothing stored:
+    scoring a claim means comparing the price when it was made against the price
+    at its horizon, and in live mode both live in the cached 2-year series rather
+    than a price table. Binary search over the (ascending) dates for the last bar
+    at or before the target date — the same 'last close on/before d' rule the
+    stored path used. `series_key` selects total-return (1) vs nominal (3).
+    """
+    series = _CACHE.get("series") or {}
+    s = series.get((ticker or "").upper()) or series.get(ticker)
+    if not s or not s[0]:
+        return None
+    dates, vals = s[0], s[series_key]
+    target = on_date.date() if hasattr(on_date, "date") else on_date
+    lo, hi, best = 0, len(dates) - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if dates[mid] <= target:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return vals[best] if best is not None else None
+
+
 def cache_state() -> dict:
     """Introspection for the data-health surface: is the live cache warm, how old,
     how much coverage. Never touches the network."""
