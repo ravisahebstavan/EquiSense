@@ -563,7 +563,28 @@ def run_all_studies(session: Session, panel=None) -> dict:
     session.commit()
     admissible = [r for r in records if r["admissible"]]
     survivors = [r for r in admissible if r.get("survives_multiplicity")]
+
+    # Risk-managed momentum (Barroso & Santa-Clara 2015): the panel is already
+    # loaded here, so the momentum sleeve's realized-vol scalar and crash flag are
+    # computed and cached in one small row for the decision layer to read cheaply
+    # (the autopilot de-risks on the crash flag without reloading the panel).
+    try:
+        from .momentum_risk import risk_managed_momentum
+        mom_risk = risk_managed_momentum(closes)
+        import json as _json
+        from ..models import AppSnapshot
+        row = session.get(AppSnapshot, "momentum_risk")
+        if row is None:
+            row = AppSnapshot(key="momentum_risk", as_of=str(now.date()), payload="")
+            session.add(row)
+        row.payload = _json.dumps(mom_risk)
+        row.as_of = str(now.date())
+        session.commit()
+    except Exception as exc:                               # noqa: BLE001 - never block studies
+        mom_risk = {"computable": False, "reason": f"{type(exc).__name__}"}
+
     return {"records": len(records),
+            "momentum_risk": mom_risk,
             "admissible": len(admissible),
             "survive_multiplicity": len(survivors),
             "tests_in_family": sum(1 for r in records if r.get("p_value") is not None),

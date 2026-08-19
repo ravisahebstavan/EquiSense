@@ -285,6 +285,27 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
         report["skipped"].append(
             f"regime de-risk: India VIX at the {vix_pct:.0f}th percentile "
             f"(≥{VIX_DERISK_PCTILE}) — open-position cap halved to {max_open}.")
+
+    # Momentum crash regime (Barroso & Santa-Clara 2015). When momentum's OWN
+    # realized volatility is in its top decile, its rare catastrophic crash is
+    # most likely — the losers this book is not short rip up and the winners it
+    # holds stall. It is the one regime that specifically threatens the momentum
+    # sleeve, distinct from broad VIX stress, so it halves the add-cap on its own.
+    # Read from the cheap cached row the studies wrote; absent → no effect.
+    mom_row = session.get(AppSnapshot, "momentum_risk")
+    if mom_row is not None:
+        try:
+            mr = json.loads(mom_row.payload)
+            if mr.get("computable") and mr.get("crash_prone"):
+                max_open = max(len(open_names), max_open // 2)
+                report["skipped"].append(
+                    "momentum crash-risk de-risk: momentum's own realized vol is "
+                    f"at the {mr.get('vol_percentile', 0) * 100:.0f}th percentile "
+                    "of its history (Barroso & Santa-Clara danger zone) — add-cap "
+                    f"halved to {max_open}; the exposure scalar is "
+                    f"{mr.get('exposure_scalar')}×.")
+        except Exception:                              # noqa: BLE001
+            pass
     cands = qualified_candidates(session, top_n=10,
                                  book_value=acct["equity"], cash=cash)
     new_count = 0
