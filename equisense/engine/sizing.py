@@ -86,6 +86,11 @@ class SizingInputs:
     adv_cr: float | None          # avg daily traded value, ₹ crore
     max_position_pct: float       # from investor profile
     open_heat_pct: float = 0.0    # existing portfolio heat, %
+    # Risk-managed-momentum exposure scalar (Barroso & Santa-Clara 2015), ≤1 in
+    # practice: shrinks the position when momentum's own realized volatility is
+    # elevated (crash-prone), so the crash protection is in the SIZE, not only the
+    # count. 1.0 = no effect. See research/momentum_risk.py.
+    momentum_scalar: float = 1.0
 
 
 def recommend_size(i: SizingInputs) -> dict:
@@ -94,7 +99,9 @@ def recommend_size(i: SizingInputs) -> dict:
     conviction_mult = {"low": 0.5, "moderate": 1.0, "high": 1.25}.get(i.conviction_band, 0.0)
     provisional_haircut = 0.5     # weights uncalibrated (§17 Gate 4) → half size, always shown
 
-    risk_budget = i.book_value * RISK_PER_TRADE * conviction_mult * provisional_haircut
+    mom_scalar = max(0.0, min(1.0, i.momentum_scalar))   # de-lever only, never lever up
+    risk_budget = (i.book_value * RISK_PER_TRADE * conviction_mult
+                   * provisional_haircut * mom_scalar)
     raw_value = risk_budget / (stop_dist_pct / 100) if stop_dist_pct > 0 else 0.0
 
     cap_position = i.book_value * i.max_position_pct / 100
@@ -130,6 +137,7 @@ def recommend_size(i: SizingInputs) -> dict:
             "risk_per_trade_pct": RISK_PER_TRADE * 100,
             "conviction_multiplier": conviction_mult,
             "provisional_haircut": provisional_haircut,
+            "momentum_scalar": round(mom_scalar, 3),
             "risk_budget": round(risk_budget, 2),
             "raw_value_from_risk": round(raw_value, 2),
             "position_cap": round(cap_position, 2),

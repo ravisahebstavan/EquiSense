@@ -244,6 +244,22 @@ def qualified_candidates(session: Session, top_n: int = 8,
         "max_effect": get_base_rate(session, "low_max_effect_top_quintile", 63, rk),
     }
     weights, weights_status = cluster_weights()
+    # Risk-managed-momentum scalar (Barroso & Santa-Clara 2015), read ONCE from
+    # the cached row the studies wrote. Applied to LONG sizing so an elevated
+    # momentum-crash regime shrinks the position itself, not just the count.
+    # Capped at 1.0 (de-lever only) — no leverage while weights are provisional.
+    mom_scalar_long = 1.0
+    try:
+        import json as _json
+
+        from ..models import AppSnapshot
+        _mr_row = session.get(AppSnapshot, "momentum_risk")
+        if _mr_row is not None:
+            _mr = _json.loads(_mr_row.payload)
+            if _mr.get("computable"):
+                mom_scalar_long = max(0.0, min(1.0, float(_mr.get("exposure_scalar") or 1.0)))
+    except Exception:                                  # noqa: BLE001
+        mom_scalar_long = 1.0
     # Scored-claim count, read ONCE. synthesize() otherwise reads the entire
     # ledger per name: 396 full reads on a 395-name scan, 361 of this
     # endpoint's 668 seconds.
@@ -319,7 +335,10 @@ def qualified_candidates(session: Session, top_n: int = 8,
             # Magnitude of conviction, not its sign — a short sized off a
             # negative score would come back at or below zero shares.
             net_score=abs(synth.net_score), adv_cr=item.get("adv_cr"),
-            max_position_pct=10.0))
+            max_position_pct=10.0,
+            # Momentum crash-scaling applies to the LONG sleeve; a short future is
+            # not the momentum long book, so it is not shrunk by this scalar.
+            momentum_scalar=mom_scalar_long if direction > 0 else 1.0))
 
         # ---- executability layer: can this account actually PUT ON this trade?
         # A long is ordinary delivery. A short is only holdable for this horizon

@@ -91,3 +91,23 @@ def test_long_short_construction_on_a_known_panel():
 def test_end_to_end_refuses_a_thin_universe():
     closes = pd.DataFrame({"AAA": [1, 2, 3], "BBB": [1, 2, 3]})
     assert mr.risk_managed_momentum(closes)["computable"] is False
+
+
+def test_sizing_shrinks_under_the_momentum_scalar_and_never_levers():
+    """The crash protection must be in the SIZE: a scalar < 1 shrinks the
+    position proportionally through the risk budget, and a scalar > 1 is capped so
+    it never levers up while weights are provisional."""
+    from equisense.engine.sizing import recommend_size, SizingInputs
+    base = dict(book_value=1_000_000.0, price=1000.0, daily_vol_pct=1.5,
+                conviction_band="moderate", net_score=0.4, adv_cr=50.0,
+                max_position_pct=10.0)
+    full = recommend_size(SizingInputs(**base, momentum_scalar=1.0))
+    half = recommend_size(SizingInputs(**base, momentum_scalar=0.5))
+    over = recommend_size(SizingInputs(**base, momentum_scalar=1.8))
+    # 0.5 scalar → ~half the risk-budgeted value (binding constraint is risk here)
+    assert abs(half["recommended_value"] - 0.5 * full["recommended_value"]) \
+        < full["recommended_value"] * 0.02
+    # scalar > 1 is capped at 1.0 — no leverage
+    assert over["recommended_value"] == full["recommended_value"]
+    assert over["working"]["momentum_scalar"] == 1.0
+    assert half["working"]["momentum_scalar"] == 0.5
