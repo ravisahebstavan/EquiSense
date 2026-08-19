@@ -274,3 +274,34 @@ def test_rebuild_falls_back_to_stored_and_reports(db, monkeypatch):
     out = snap.rebuild_universe_snapshot(db, prefer_live=True)
     assert out["data_source"]["provider"] == "stored_db_fallback"
     assert "throttled" in out["data_source"]["live_error"]
+
+
+def test_effective_breadth_discounts_correlated_positions(db):
+    """The book's real breadth is independent bets, not position count: two names
+    that move together are one bet held twice. This is the honest denominator
+    under the √breadth the momentum edge rests on."""
+    import datetime as dt2
+    import equisense.models as M
+    from equisense.api.paper import effective_breadth, PaperPosition
+
+    cal = [dt2.date(2024, 1, 1) + dt2.timedelta(days=i) for i in range(120)]
+    ids = {}
+    import math
+    for tk, gen in [("AAA", lambda i: 100 + i),
+                    ("BBB", lambda i: 200 + 2 * i),           # perfectly corr with AAA
+                    ("CCC", lambda i: 150 + 10 * math.sin(i))]:  # independent-ish
+        c = M.Company(ticker=tk, name=tk, sector="IT", is_index_member=True)
+        db.add(c); db.flush(); ids[tk] = c.id
+        for i, d in enumerate(cal):
+            db.add(M.PriceObservation(company_id=c.id, obs_date=d, close=float(gen(i)),
+                                      close_raw=float(gen(i)), volume=1e6))
+    db.commit()
+
+    positions = {cid: PaperPosition() for cid in ids.values()}
+    for p in positions.values():
+        p.quantity, p.avg_cost = 10.0, 100.0
+    out = effective_breadth(db, positions)
+    assert out["nominal_positions"] == 3
+    # three names, but two are collinear → strictly fewer than three real bets
+    assert out["effective_bets"] < 3.0
+    assert 0 < out["breadth_efficiency"] < 1.0

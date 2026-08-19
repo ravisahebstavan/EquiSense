@@ -273,6 +273,7 @@ def account(session: Session, include_curve: bool = True) -> dict:
                               + sum(p.realized_pnl for cid, p in positions.items()
                                     if p.quantity <= 1e-9), 2),
         "positions": sorted(pos_rows, key=lambda r: -r["value"]),
+        "effective_breadth": effective_breadth(session, positions) if pos_rows else None,
         # place_trade() rejects an oversell, so this should always be clean.
         # That is exactly why it is worth reporting: if it ever fires, the
         # validation was bypassed and the cash balance above is wrong too —
@@ -319,6 +320,61 @@ def account(session: Session, include_curve: bool = True) -> dict:
                 "premium. Statistically meaningful only after many independent "
                 "decisions; until then it is weather, not climate.")
     return out
+
+
+def effective_breadth(session: Session, positions: dict) -> dict:
+    """How many INDEPENDENT bets the book actually holds.
+
+    The system's own central finding is that the momentum edge is real only with
+    breadth (§1) — Grinold's IR ≈ IC·√breadth. But breadth is not the position
+    COUNT: eight names that all rise and fall together are one bet held eight
+    times, and in an Indian equity drawdown cross-sectional correlation converges
+    toward one, so a book that looks diversified in calm markets can collapse to a
+    single index bet exactly when it matters.
+
+    Measured as the participation ratio of the holdings' return-correlation matrix,
+    PR = (Σλ)² / Σλ² over its eigenvalues: n when the names are uncorrelated, 1
+    when they move as one. It is the honest denominator under the √breadth the
+    whole thesis rests on, and it was computed nowhere.
+    """
+    from .live import _series
+    cids = [cid for cid, p in positions.items() if abs(p.quantity) > 1e-9]
+    if len(cids) < 2:
+        return {"nominal_positions": len(cids), "effective_bets": float(len(cids)),
+                "note": "Fewer than two open positions — breadth is not yet a "
+                        "meaningful measure."}
+    series = {}
+    for cid in cids:
+        _d, closes, _v = _series(session, cid)
+        closes = [c for c in closes if c][-260:]
+        if len(closes) >= 30:
+            series[cid] = [closes[i] / closes[i - 1] - 1
+                           for i in range(1, len(closes)) if closes[i - 1]]
+    if len(series) < 2:
+        return {"nominal_positions": len(cids), "effective_bets": None,
+                "note": "Not enough return history on the held names to measure "
+                        "correlation."}
+    try:
+        import numpy as np
+        n = min(len(v) for v in series.values())
+        mat = np.array([v[-n:] for v in series.values()])
+        corr = np.corrcoef(mat)
+        eig = np.linalg.eigvalsh(corr)
+        eig = eig[eig > 1e-10]
+        pr = float((eig.sum() ** 2) / np.sum(eig ** 2))
+    except Exception as exc:                           # noqa: BLE001
+        return {"nominal_positions": len(series), "effective_bets": None,
+                "note": f"breadth uncomputable: {type(exc).__name__}"}
+    nominal = len(series)
+    return {
+        "nominal_positions": nominal,
+        "effective_bets": round(pr, 2),
+        "breadth_efficiency": round(pr / nominal, 2),
+        "note": (f"{nominal} positions behave like {pr:.1f} independent bets "
+                 f"({pr / nominal:.0%} breadth efficiency). The momentum edge scales "
+                 "with √(effective bets), not position count — correlated picks add "
+                 "conviction, not diversification, and converge further in stress."),
+    }
 
 
 def _live_curve_rows(session: Session, held_ids: list[int], start):
