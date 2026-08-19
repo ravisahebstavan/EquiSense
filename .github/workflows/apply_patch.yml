@@ -1,0 +1,19 @@
+name: Apply patch to main
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git am equisense-changes.patch
+          git rm equisense-changes.patch
+          git commit -m "Remove applied patch file"
+          git push
