@@ -527,20 +527,31 @@ def get_universe(session: Session, allow_rebuild: bool = True) -> dict:
     if live:
         row = session.get(AppSnapshot, UNIVERSE_KEY)
         snap = None
+        cand = None
         if row is not None:
             try:
                 cand = json.loads(row.payload)
                 if cand.get("version") == SNAP_VERSION and not _snapshot_time_stale(cand):
                     snap = cand
             except Exception:                          # noqa: BLE001
-                snap = None
+                snap, cand = None, None
         if snap is None and allow_rebuild:
             snap = rebuild_universe_snapshot(session, prefer_live=True)
-        elif snap is None:
-            snap = json.loads(row.payload) if row else {"as_of": None, "companies": []}
-        _UNIVERSE_CACHE.update(key=(snap.get("as_of"), SNAP_VERSION), snap=snap,
-                               checked_at=_time.time())
-        return snap
+            # Only a real rebuild is worth caching. A stale-but-parseable stored
+            # snapshot (cand) is served but NOT promoted into the probe cache, so
+            # the next request still re-evaluates freshness.
+            _UNIVERSE_CACHE.update(key=(snap.get("as_of"), SNAP_VERSION), snap=snap,
+                                   checked_at=_time.time())
+            return snap
+        if snap is not None:
+            _UNIVERSE_CACHE.update(key=(snap.get("as_of"), SNAP_VERSION), snap=snap,
+                                   checked_at=_time.time())
+            return snap
+        # No fresh snapshot and rebuild not allowed (a read-only status probe):
+        # serve the last stored snapshot if it parsed, else empty — but do NOT
+        # write this into the probe cache, or a 15s window would serve an empty
+        # universe to real requests that could have rebuilt.
+        return cand if cand is not None else {"as_of": None, "companies": []}
 
     latest = session.scalar(select(func.max(PriceObservation.obs_date)))
     ckey = (str(latest), SNAP_VERSION)

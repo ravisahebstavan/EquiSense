@@ -236,20 +236,21 @@ def account(session: Session, include_curve: bool = True) -> dict:
     # Transaction-cost drag. Fills are booked at the close with no friction, so
     # the return above is GROSS — and a system this careful about modelling costs
     # at the sizing stage cannot then quote a paper record that pretends trading
-    # is free. Each fill is one leg, so it bears one side of the statutory stack
-    # plus its flat fee (a short leg is a futures order; a delivery sell also pays
-    # the DP charge). Reported alongside the gross figure, not silently netted, so
-    # both the raw result and the honest after-cost result are visible — and the
-    # benchmark deliberately bears no such drag, because buying the index once is
-    # the near-frictionless alternative the strategy must beat NET of its own costs.
-    from ..engine.sizing import (ROUND_TRIP_STATUTORY, DP_CHARGE_PER_SELL,
-                                 FNO_BROKERAGE_PER_ORDER)
+    # is free. Estimated on the DELIVERY basis (a paper fill records only side, not
+    # instrument, and the book is predominantly long delivery): each leg bears one
+    # side of the delivery statutory stack, and a sell additionally bears the flat
+    # DP charge. This is a deliberately simple, conservative-leaning estimate —
+    # futures shorts actually cost less statutorily — reported ALONGSIDE the gross
+    # figure, never silently netted, so both the raw and after-cost results are
+    # visible. The benchmark bears no drag by design: buying the index once is the
+    # near-frictionless alternative the strategy must beat NET of its own costs.
+    from ..engine.sizing import ROUND_TRIP_STATUTORY, DP_CHARGE_PER_SELL
     est_costs = 0.0
     for t in trades:
         leg_value = t.quantity * t.price
         est_costs += leg_value * (ROUND_TRIP_STATUTORY / 2.0)   # one side of the round trip
-        est_costs += (FNO_BROKERAGE_PER_ORDER if t.side == "sell"
-                      else 0.0) + (DP_CHARGE_PER_SELL if t.side == "sell" else 0.0)
+        if t.side == "sell":
+            est_costs += DP_CHARGE_PER_SELL                     # flat, delivery sell
     cost_drag_pct = (est_costs / starting_cash * 100) if starting_cash else None
     net_of_cost_return_pct = (None if total_return_pct is None or cost_drag_pct is None
                               else round(total_return_pct - cost_drag_pct, 2))
@@ -363,17 +364,24 @@ def effective_breadth(session: Session, positions: dict) -> dict:
         eig = eig[eig > 1e-10]
         pr = float((eig.sum() ** 2) / np.sum(eig ** 2))
     except Exception as exc:                           # noqa: BLE001
-        return {"nominal_positions": len(series), "effective_bets": None,
+        return {"nominal_positions": len(cids), "effective_bets": None,
                 "note": f"breadth uncomputable: {type(exc).__name__}"}
-    nominal = len(series)
+    nominal = len(cids)                                # TRUE position count
+    measured = len(series)                             # names with enough history
+    dropped = nominal - measured
+    note = (f"{measured} of {nominal} positions behave like {pr:.1f} independent "
+            f"bets ({pr / measured:.0%} breadth efficiency). The momentum edge "
+            "scales with √(effective bets), not position count — correlated picks "
+            "add conviction, not diversification, and converge further in stress.")
+    if dropped:
+        note += (f" {dropped} held name(s) lack enough return history to include; "
+                 "the true breadth is at most this.")
     return {
         "nominal_positions": nominal,
+        "measured_positions": measured,
         "effective_bets": round(pr, 2),
-        "breadth_efficiency": round(pr / nominal, 2),
-        "note": (f"{nominal} positions behave like {pr:.1f} independent bets "
-                 f"({pr / nominal:.0%} breadth efficiency). The momentum edge scales "
-                 "with √(effective bets), not position count — correlated picks add "
-                 "conviction, not diversification, and converge further in stress."),
+        "breadth_efficiency": round(pr / measured, 2),
+        "note": note,
     }
 
 

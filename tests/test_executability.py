@@ -60,3 +60,67 @@ def test_eligibility_provenance_is_reported_not_silent():
     assert prov["source"] == "pinned_snapshot"
     assert prov["snapshot_date"]
     assert prov["count"] == len(im.FNO_ELIGIBLE)
+
+
+def _short_world():
+    """A stored universe snapshot with two names — one F&O-eligible, one not —
+    so the short path (which the long-only fixtures never exercised) can be driven."""
+    import json, datetime as dt
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    import equisense.models as M
+    from equisense.db import Base
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    s = sessionmaker(bind=eng, expire_on_commit=False)()
+    for tk in ["RELIANCE", "TINYCAPXYZ"]:               # F&O vs non-F&O
+        s.add(M.Company(ticker=tk, name=tk, sector="IT", cap_band="large",
+                        is_index_member=True))
+    s.flush()
+    def item(cid, tk):
+        return {"id": cid, "ticker": tk, "name": tk, "sector": "IT",
+                "cap_band": "large", "is_financial": False, "price": 1500.0,
+                "chg_1d_pct": 0.0, "adv_cr": 50.0, "spark": [1500.0] * 10,
+                "stale_sessions": 0, "data_suspect": False,
+                "signals": {k: 1.0 for k in
+                            ["momentum", "dist_52w", "trend", "rel_strength", "mqi",
+                             "vol", "heat", "f_score", "z_score", "ccs", "fragility",
+                             "exp_gap", "pe_pctile", "sector_rel_mom", "max_effect"]}}
+    rows = [(c.id, c.ticker) for c in s.query(M.Company).all()]
+    snap = {"as_of": str(dt.date.today()), "version": 5, "built_at": "t",
+            "companies": [item(cid, tk) for cid, tk in rows], "stale_names": {},
+            "data_source": {"provider": "stored_db"}}
+    s.add(M.AppSnapshot(key="universe", as_of=snap["as_of"], payload=json.dumps(snap)))
+    s.commit()
+    return s
+
+
+def test_short_verdict_does_not_crash_and_is_gated_by_executability(monkeypatch):
+    """Regression: qualified_candidates referenced an undefined `t` in the short
+    block, so ANY bearish verdict raised NameError and 500'd the whole scan. The
+    long-only fixtures never hit it. This forces a short verdict through."""
+    from equisense.api import candidates as C
+    from equisense.engine.synthesis import Synthesis
+
+    s = _short_world()
+    # Force every name to a strong short verdict.
+    monkeypatch.setattr(C, "synthesize", lambda *a, **k: Synthesis(
+        verdict="avoid_short_candidate", net_score=-0.5, conviction_band="low",
+        net_z=-3.0))
+    # No network in CI: stub the live event/governance fetches to empty.
+    monkeypatch.setattr("equisense.ingestion.nse_events.fetch_event_calendar",
+                        lambda *a, **k: {"available": False, "events": {}})
+
+    result = C.qualified_candidates(s, top_n=5)          # must not raise
+    assert result["scanned"] == 2
+    by_ticker = {c["ticker"]: c for c in result["candidates"]}
+    # non-F&O short is refused with the executability reason
+    tiny = by_ticker.get("TINYCAPXYZ")
+    assert tiny is not None and tiny["direction"] == "short"
+    assert tiny["tradable"] is False
+    assert any("not shortable" in g for g in tiny["gates"])
+    # F&O short is an actionable single-stock-future instrument
+    rel = by_ticker.get("RELIANCE")
+    assert rel is not None and rel["instrument"] == "single_stock_future"

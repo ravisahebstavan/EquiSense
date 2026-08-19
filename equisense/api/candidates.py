@@ -331,6 +331,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
         # retail account can carry the bearish view in.
         execu = None
         if direction < 0:
+            t = item["ticker"]
             execu = short_executability(t)
             if not execu.executable:
                 gates.append(f"failed: {execu.reason}")
