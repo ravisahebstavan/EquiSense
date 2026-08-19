@@ -130,10 +130,47 @@ Two external services, both free tier:
 ```
 
 Vercel's filesystem is ephemeral and read-only, but EquiSense's substance is
-persistent state — the market database, the hash-chained ledger, the raw vault.
-With `DATABASE_URL` set, all of it lives in Neon (`EQUISENSE_STORAGE=db` engages
-automatically) and the Vercel side is stateless and disposable. Local
-development is unchanged (SQLite + files).
+persistent state — the hash-chained ledger, the raw vault, and (in the classic
+mode) the market database. With `DATABASE_URL` set, all of it lives in Neon
+(`EQUISENSE_STORAGE=db` engages automatically) and the Vercel side is stateless
+and disposable. Local development is unchanged (SQLite + files).
+
+### 3.1a Live-data mode — free data, no bulk storage (recommended)
+
+The classic mode above *stores* a decade of daily bars for the whole universe in
+Neon and reads the panel back for every study and snapshot. That panel read is
+the single largest recurring egress in the system — on the free tier's METERED
+data-transfer allowance it is what exhausted the quota and took the deployment
+down, and once the writes stopped landing every page went stale.
+
+**Set `EQUISENSE_LIVE_DATA=1`** to invert this. Market prices are then fetched
+**live from Yahoo** (free, keyless), cached in-process for the life of a warm
+serverless instance, and the universe snapshot, dossiers, claim scoring,
+base-rate/IC/factor studies, regime, paper marks and cross-asset views are all
+built from those live bars. **Nothing bulk is written to Neon.** What persists is
+only the tiny, hard-won state: the few-hundred-KB computed snapshot and the
+KB-scale calibration ledger. The data cannot go stale because it comes from the
+source, not a store a broken cron stopped updating, and the transfer wall simply
+does not arise.
+
+Behaviour in live mode:
+
+- Views **self-refresh on the market clock** (tight cache TTL while NSE is open,
+  loose after the close) — no cron required to stay fresh.
+- The daily cron, if used, **writes nothing**: every bulk-ingestion stage is
+  skipped and reported; only the learning loop (forecasts → scoring → snapshot →
+  autopilot) runs.
+- Deep-history studies fetch a 10-year panel **on demand** (cached for hours) and
+  are flagged **survivorship-biased** (current members only) — the stored panel's
+  delisted-inclusive correction is not available without the store.
+- A thin or failed live fetch **falls back to the stored panel (if any) and
+  reports it** on Data Health, never publishing a hollow universe.
+- Fundamentals stay stored (they are small and quarterly, not the transfer
+  problem), so the value/quality factors keep working.
+
+Default: **ON** in a hosted serverless environment, **OFF** locally (so dev and
+the test suite stay fully offline). `EQUISENSE_LIVE_DATA=0` forces the classic
+stored mode even when hosted.
 
 ### 3.2 One-time setup
 
@@ -145,7 +182,8 @@ development is unchanged (SQLite + files).
 
    | Name | Value |
    |---|---|
-   | `DATABASE_URL` | the Neon connection string |
+   | `DATABASE_URL` | the Neon connection string (holds only the ledger + tiny state in live mode) |
+   | `EQUISENSE_LIVE_DATA` | **`1`** — fetch market data live from Yahoo, store nothing bulk (§3.1a). The mode that keeps you inside the free-tier transfer allowance. |
    | `EQUISENSE_ACCESS_TOKEN` | a strong secret — this is your login |
    | `CRON_SECRET` | **the same value**, so Vercel Cron passes the auth gate |
    | `ANTHROPIC_API_KEY` | *optional*, enables AI narration |
