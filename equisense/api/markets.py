@@ -345,15 +345,14 @@ def portfolio_simulation(session: Session, horizon_days: int = 21,
     if not weights:
         return {"available": False, "reason": "no positions and no universe"}
 
+    from .live import _series               # stored-or-live closes (no-storage safe)
     returns: dict[str, list[float]] = {}
     for t in list(weights):
         cid = session.scalar(select(Company.id).where(Company.ticker == t))
         if cid is None:
             continue
-        closes = [r[0] for r in session.execute(
-            select(PriceObservation.close)
-            .where(PriceObservation.company_id == cid)
-            .order_by(PriceObservation.obs_date)).all()]
+        _d, closes, _v = _series(session, cid)
+        closes = [c for c in closes if c is not None]
         if len(closes) < 260:
             continue
         closes = closes[-1000:]
@@ -568,7 +567,21 @@ def relationships(session: Session, lookback: int = 900,
         bucket = macro_rows.setdefault(sym, [])
         if len(bucket) < lookback:
             bucket.append((d, c))
-    dated = {label: CA.returns_from_dated_closes(macro_rows.get(sym, []))
+    def _live_dated_index(sym: str) -> list:
+        """Most-recent `lookback` (date, close) for a macro symbol from the live
+        provider, or [] — so the cross-asset map works with nothing stored."""
+        try:
+            from .snapshot import live_data_enabled
+            if not live_data_enabled():
+                return []
+            from ..ingestion import live_provider
+            d, c = live_provider._index_series(sym, 3)
+            return list(zip(d, c))[-lookback:]
+        except Exception:                              # noqa: BLE001
+            return []
+
+    dated = {label: CA.returns_from_dated_closes(
+                 macro_rows.get(sym) or _live_dated_index(sym))
              for label, sym in MACRO.items()}
 
     def equity_returns_batch(tickers: list[str]) -> dict[str, dict]:
@@ -589,6 +602,20 @@ def relationships(session: Session, lookback: int = 900,
             bucket = by_cid.setdefault(cid, [])
             if len(bucket) < lookback:
                 bucket.append((d, c))
+        # Live mode: no stored equity bars, so fill each name's dated closes from
+        # the warm live series (a dict lookup) — else the cross-asset betas that
+        # decide 'what stops diversifying under stress' would have no equity legs.
+        if not by_cid:
+            try:
+                from .snapshot import live_data_enabled
+                if live_data_enabled():
+                    from ..ingestion import live_provider
+                    for t, cid in ids.items():
+                        s = live_provider.get_series(t)
+                        if s and s[0]:
+                            by_cid[cid] = list(zip(s[0], s[1]))[-lookback:]
+            except Exception:                          # noqa: BLE001
+                pass
         return {t: CA.returns_from_dated_closes(by_cid.get(cid, []))
                 for t, cid in ids.items()}
     held = [t for t in (extra_tickers or []) if t]
