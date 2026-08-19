@@ -103,7 +103,11 @@ def test_short_verdict_does_not_crash_and_is_gated_by_executability(monkeypatch)
     long-only fixtures never hit it. This forces a short verdict through."""
     from equisense.api import candidates as C
     from equisense.engine.synthesis import Synthesis
+    from equisense.api.snapshot import invalidate_universe_cache
 
+    # Isolate from module-global state other tests may have left warm.
+    monkeypatch.setenv("EQUISENSE_LIVE_DATA", "0")     # stored snapshot, no live fetch
+    invalidate_universe_cache()
     s = _short_world()
     # Force every name to a strong short verdict.
     monkeypatch.setattr(C, "synthesize", lambda *a, **k: Synthesis(
