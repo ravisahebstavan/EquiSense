@@ -249,6 +249,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
     # momentum-crash regime shrinks the position itself, not just the count.
     # Capped at 1.0 (de-lever only) — no leverage while weights are provisional.
     mom_scalar_long = 1.0
+    mom_risk_state: dict = {"computable": False}
     try:
         import json as _json
 
@@ -256,6 +257,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
         _mr_row = session.get(AppSnapshot, "momentum_risk")
         if _mr_row is not None:
             _mr = _json.loads(_mr_row.payload)
+            mom_risk_state = _mr
             if _mr.get("computable"):
                 mom_scalar_long = max(0.0, min(1.0, float(_mr.get("exposure_scalar") or 1.0)))
     except Exception:                                  # noqa: BLE001
@@ -476,6 +478,7 @@ def qualified_candidates(session: Session, top_n: int = 8,
         "regime": regime["label"],
         "scanned": scanned,
         "capital_feasibility": feasibility,
+        "momentum_risk": mom_risk_state,
         "verdict_counts": verdicts,
         "weights_status": weights_status,
         "governance_filter": {
