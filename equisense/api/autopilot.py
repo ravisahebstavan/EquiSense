@@ -295,15 +295,19 @@ def run_autopilot(session: Session, force: bool = False) -> dict:
     mom_row = session.get(AppSnapshot, "momentum_risk")
     if mom_row is not None:
         try:
+            from ..research.momentum_risk import is_actionable
             mr = json.loads(mom_row.payload)
-            if mr.get("computable") and mr.get("crash_prone"):
+            # Only a FRESH crash flag de-risks; a weeks-old one describes a regime
+            # that may have passed.
+            if is_actionable(mr) and mr.get("crash_prone"):
                 max_open = max(len(open_names), max_open // 2)
+                _sc = mr.get("exposure_scalar")
                 report["skipped"].append(
                     "momentum crash-risk de-risk: momentum's own realized vol is "
                     f"at the {mr.get('vol_percentile', 0) * 100:.0f}th percentile "
                     "of its history (Barroso & Santa-Clara danger zone) — add-cap "
-                    f"halved to {max_open}; the exposure scalar is "
-                    f"{mr.get('exposure_scalar')}×.")
+                    f"halved to {max_open}"
+                    + (f"; exposure scalar {_sc}×." if _sc is not None else "."))
         except Exception:                              # noqa: BLE001
             pass
     cands = qualified_candidates(session, top_n=10,

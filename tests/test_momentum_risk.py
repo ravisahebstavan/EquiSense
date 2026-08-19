@@ -111,3 +111,31 @@ def test_sizing_shrinks_under_the_momentum_scalar_and_never_levers():
     assert over["recommended_value"] == full["recommended_value"]
     assert over["working"]["momentum_scalar"] == 1.0
     assert half["working"]["momentum_scalar"] == 0.5
+
+
+def test_is_actionable_freshness_guard():
+    from datetime import datetime, timedelta
+    from equisense.research.momentum_risk import is_actionable
+    now = datetime.utcnow()
+    assert is_actionable({"computable": True, "computed_at": now.isoformat()}) is True
+    assert is_actionable({"computable": True,
+                          "computed_at": (now - timedelta(days=30)).isoformat()}) is False
+    assert is_actionable({"computable": False}) is False
+    assert is_actionable(None) is False
+    assert is_actionable({"computable": True}) is True   # legacy row, no timestamp
+
+
+def test_scalar_shrinks_a_position_bound_by_the_cap_not_just_risk_budget():
+    """The review's finding: the scalar must de-lever even when position_cap or
+    heat binds, else a fully-capped winner is left un-shrunk in a crash."""
+    from equisense.engine.sizing import recommend_size, SizingInputs
+    # very low vol → raw risk value is huge → position_cap (10%) binds
+    base = dict(book_value=1_000_000.0, price=1000.0, daily_vol_pct=0.2,
+                conviction_band="high", net_score=0.9, adv_cr=500.0,
+                max_position_pct=10.0)
+    full = recommend_size(SizingInputs(**base, momentum_scalar=1.0))
+    half = recommend_size(SizingInputs(**base, momentum_scalar=0.5))
+    assert full["binding_constraint"] == "position_cap"    # cap binds, not risk
+    # the scalar still halves it — crash protection reaches the capped winner
+    assert abs(half["recommended_value"] - 0.5 * full["recommended_value"]) \
+        < full["recommended_value"] * 0.02

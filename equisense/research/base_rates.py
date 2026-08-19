@@ -48,7 +48,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..engine.regime import regime_series
-from ..models import BaseRateRecord, Company, MacroObservation, PriceObservation
+from ..models import (AppSnapshot, BaseRateRecord, Company, MacroObservation,
+                      PriceObservation)
 from .registry import REGISTRY
 from .stats import (HLZ_T_HURDLE, benjamini_hochberg, block_observations,
                     cluster_block_bootstrap_ci, cluster_robust_mean,
@@ -571,17 +572,29 @@ def run_all_studies(session: Session, panel=None) -> dict:
     try:
         from .momentum_risk import risk_managed_momentum
         mom_risk = risk_managed_momentum(closes)
-        import json as _json
-        from ..models import AppSnapshot
-        row = session.get(AppSnapshot, "momentum_risk")
-        if row is None:
-            row = AppSnapshot(key="momentum_risk", as_of=str(now.date()), payload="")
-            session.add(row)
-        row.payload = _json.dumps(mom_risk)
-        row.as_of = str(now.date())
-        session.commit()
     except Exception as exc:                               # noqa: BLE001 - never block studies
         mom_risk = {"computable": False, "reason": f"{type(exc).__name__}"}
+    # Freshness travels WITH the payload so consumers can refuse a stale flag.
+    # as_of is the panel's latest date (the model's freshness convention), not the
+    # wall-clock run date; computed_at is the run timestamp for the age check.
+    try:
+        panel_asof = str(closes.index[-1].date()) if len(closes.index) else str(now.date())
+    except Exception:                                      # noqa: BLE001
+        panel_asof = str(now.date())
+    mom_risk["as_of"] = panel_asof
+    mom_risk["computed_at"] = now.isoformat()
+    # The cache write is isolated: a DB hiccup here must not clobber a result that
+    # WAS computed (the run report still carries it), only fail to persist it.
+    try:
+        row = session.get(AppSnapshot, "momentum_risk")
+        if row is None:
+            row = AppSnapshot(key="momentum_risk", as_of=panel_asof, payload="")
+            session.add(row)
+        row.payload = json.dumps(mom_risk)
+        row.as_of = panel_asof
+        session.commit()
+    except Exception:                                      # noqa: BLE001
+        session.rollback()
 
     return {"records": len(records),
             "momentum_risk": mom_risk,

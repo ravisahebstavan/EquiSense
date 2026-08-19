@@ -26,10 +26,37 @@ hand-computed values (§15).
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 
 from .base_rates import feat_momentum_12_1
+
+# A cached momentum-risk row older than this is describing a regime that may have
+# passed; the studies recompute on roughly a weekly cadence, so ~10 days is a
+# generous freshness bound before the decision layer stops acting on it.
+MAX_ACTIONABLE_AGE_DAYS = 10
+
+
+def is_actionable(mom_risk: dict | None,
+                  max_age_days: int = MAX_ACTIONABLE_AGE_DAYS) -> bool:
+    """True if a cached momentum-risk payload is computable AND recent enough to
+    act on. A stale crash flag (or a computable:false left by a failed run) must
+    not shrink live positions off a regime that no longer holds."""
+    if not mom_risk or not mom_risk.get("computable"):
+        return False
+    ts = mom_risk.get("computed_at")
+    if not ts:
+        return True                                    # legacy row, no timestamp
+    try:
+        ts_dt = datetime.fromisoformat(ts)
+        if ts_dt.tzinfo is not None:
+            ts_dt = ts_dt.replace(tzinfo=None)
+        age_days = (datetime.utcnow() - ts_dt).total_seconds() / 86400.0
+        return age_days <= max_age_days
+    except Exception:                                  # noqa: BLE001
+        return True
 
 # The momentum sleeve's target annualised volatility. 12% is a deliberately
 # moderate risk budget for a single factor; the scalar scales exposure toward it.

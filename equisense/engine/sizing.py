@@ -100,8 +100,7 @@ def recommend_size(i: SizingInputs) -> dict:
     provisional_haircut = 0.5     # weights uncalibrated (§17 Gate 4) → half size, always shown
 
     mom_scalar = max(0.0, min(1.0, i.momentum_scalar))   # de-lever only, never lever up
-    risk_budget = (i.book_value * RISK_PER_TRADE * conviction_mult
-                   * provisional_haircut * mom_scalar)
+    risk_budget = i.book_value * RISK_PER_TRADE * conviction_mult * provisional_haircut
     raw_value = risk_budget / (stop_dist_pct / 100) if stop_dist_pct > 0 else 0.0
 
     cap_position = i.book_value * i.max_position_pct / 100
@@ -118,7 +117,11 @@ def recommend_size(i: SizingInputs) -> dict:
     else:
         cap_liquidity = raw_value * 0.5
 
-    value = max(0.0, min(raw_value, cap_position, heat_room, cap_liquidity))
+    # The momentum-crash scalar de-levers the FINAL exposure, applied after every
+    # constraint — so a position pinned at the 10% cap or by portfolio heat is
+    # shrunk by the full scalar too, not left near-full. That is the whole point:
+    # in a crash regime the large, capped winners are exactly what must come down.
+    value = max(0.0, min(raw_value, cap_position, heat_room, cap_liquidity)) * mom_scalar
     shares = int(value / i.price) if i.price > 0 else 0
     binding = min(
         [("risk_budget", raw_value), ("position_cap", cap_position),
