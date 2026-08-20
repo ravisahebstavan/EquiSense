@@ -45,10 +45,17 @@ ENGINE_ERROR: dict = {"detail": None}
 
 
 def _build_engine(url: str, sqlite: bool):
+    if sqlite:
+        connect_args: dict = {"check_same_thread": False, "timeout": 30}
+    else:
+        # Supabase/pgBouncer transaction pooler rejects server-side prepared
+        # statements (psycopg3 uses them by default). Disable auto-prepare so a
+        # pooled URL works in session OR transaction mode.
+        connect_args = {"prepare_threshold": None}
     return create_engine(
         url,
-        connect_args={"check_same_thread": False, "timeout": 30} if sqlite else {},
-        pool_pre_ping=not sqlite,  # free Postgres tiers suspend when idle
+        connect_args=connect_args,
+        pool_pre_ping=not sqlite,
     )
 
 
