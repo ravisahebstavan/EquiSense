@@ -6,8 +6,7 @@ is exactly the "fake numbers that read as real signals" this product is built to
 never show, and the owner's standing instruction is that no demo or synthetic
 data appear anywhere. So `seed` is now a no-op: a fresh database stays empty until
 live data is fetched (which, in live mode, happens on the first request). The
-legacy generator survives in `demo_data.py` for reference only and is never
-called from the application.
+legacy fake-data generator has been deleted outright — real data only.
 """
 from __future__ import annotations
 
