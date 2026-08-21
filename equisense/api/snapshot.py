@@ -525,32 +525,30 @@ def get_universe(session: Session, allow_rebuild: bool = True) -> dict:
         return _UNIVERSE_CACHE["snap"]
 
     if live:
+        # SERVE-STALE-INSTANTLY. A page load must NEVER block on a 226-name Yahoo
+        # pull (15-40s). Any existing snapshot — fresh OR stale — is returned in
+        # <1s; staleness is repaired OUT OF BAND by /api/live/refresh (the ⟳
+        # button, the frontend auto-refresh, and the daily cron), never on the
+        # read path. This is the whole latency fix: reads are cheap, the one
+        # expensive live fetch happens where the user is not waiting on a render.
+        # Only a cold, never-built database (no snapshot at all) pays a one-time
+        # inline build, because there is nothing to serve.
         row = session.get(AppSnapshot, UNIVERSE_KEY)
-        snap = None
         cand = None
         if row is not None:
             try:
                 cand = json.loads(row.payload)
-                if cand.get("version") == SNAP_VERSION and not _snapshot_time_stale(cand):
-                    snap = cand
             except Exception:                          # noqa: BLE001
-                snap, cand = None, None
-        if snap is None and allow_rebuild:
+                cand = None
+        if cand is not None and cand.get("version") == SNAP_VERSION:
+            _UNIVERSE_CACHE.update(key=(cand.get("as_of"), SNAP_VERSION), snap=cand,
+                                   checked_at=_time.time())
+            return cand
+        if allow_rebuild:                              # first boot only — nothing to serve
             snap = rebuild_universe_snapshot(session, prefer_live=True)
-            # Only a real rebuild is worth caching. A stale-but-parseable stored
-            # snapshot (cand) is served but NOT promoted into the probe cache, so
-            # the next request still re-evaluates freshness.
             _UNIVERSE_CACHE.update(key=(snap.get("as_of"), SNAP_VERSION), snap=snap,
                                    checked_at=_time.time())
             return snap
-        if snap is not None:
-            _UNIVERSE_CACHE.update(key=(snap.get("as_of"), SNAP_VERSION), snap=snap,
-                                   checked_at=_time.time())
-            return snap
-        # No fresh snapshot and rebuild not allowed (a read-only status probe):
-        # serve the last stored snapshot if it parsed, else empty — but do NOT
-        # write this into the probe cache, or a 15s window would serve an empty
-        # universe to real requests that could have rebuilt.
         return cand if cand is not None else {"as_of": None, "companies": []}
 
     latest = session.scalar(select(func.max(PriceObservation.obs_date)))

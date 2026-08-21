@@ -170,6 +170,10 @@ _REDUNDANT_INDEXES = ["ix_prices_cid_date", "ix_macro_sym_date"]
 # running older code cannot mistake a newer schema for "already done".
 SCHEMA_VERSION = "2026-08-16.1"
 
+# Arbitrary constant key for the Postgres advisory lock that serializes schema
+# builds across concurrent cold starts (see ensure_schema).
+SCHEMA_LOCK_KEY = 4273190001
+
 # Filled by ensure_schema. Read by api/status.py: a uniqueness guarantee that
 # failed to apply must be visible, because everything downstream of it then
 # depends on application-level deduplication that concurrency can defeat.
@@ -320,44 +324,78 @@ def ensure_schema() -> None:
     FUNCTION_INVOCATION_FAILED. One SELECT replaces all of it.
     """
     from . import models  # noqa: F401 — registers all tables on Base.metadata
-    try:
-        with engine.connect() as conn:
-            got = conn.execute(text(
-                "SELECT payload FROM app_snapshots WHERE key = 'schema_version'"
-            )).scalar()
-        if got == SCHEMA_VERSION:
-            return
-    except Exception:                              # noqa: BLE001
-        pass                                       # table absent on a fresh database
-    Base.metadata.create_all(engine)
-    insp = inspect(engine)
-    with engine.begin() as conn:
-        for table, col, ddl in _SOFT_MIGRATIONS:
-            if not insp.has_table(table):
-                continue
-            cols = {c["name"] for c in insp.get_columns(table)}
-            if col not in cols:
-                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
-        # hot-path composite index (IF NOT EXISTS works on SQLite + Postgres).
-        # The other two that used to live here are now UNIQUE indexes created
-        # below, which cover the same lookups.
-        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vol_sym_date "
-                          "ON vol_surface_observations (symbol, obs_date)"))
 
-    _apply_unique_keys()
+    def _stamped() -> bool:
+        try:
+            with engine.connect() as conn:
+                return conn.execute(text(
+                    "SELECT payload FROM app_snapshots WHERE key = 'schema_version'"
+                )).scalar() == SCHEMA_VERSION
+        except Exception:                          # noqa: BLE001
+            return False                           # table absent on a fresh database
 
-    # Stamped LAST, so a migration that fails part-way leaves the fast path
-    # disarmed and the next boot retries instead of skipping incomplete work.
+    if _stamped():
+        return
+
+    # Serialize the build across concurrent cold starts. On Postgres two parallel
+    # first-request create_all() calls collide on the internal pg_type unique
+    # index with a UniqueViolation — the exact IntegrityError this deployment hit
+    # on the fresh Supabase DB. A session-level advisory lock lets exactly one
+    # instance build at a time; the rest block briefly, then re-check and skip.
+    # SQLite (single writer) needs none of this.
+    lock_conn = None
+    if not IS_SQLITE:
+        try:
+            lock_conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+            lock_conn.execute(text("SELECT pg_advisory_lock(:k)"),
+                              {"k": SCHEMA_LOCK_KEY})
+            if _stamped():                         # a peer finished while we waited
+                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"),
+                                  {"k": SCHEMA_LOCK_KEY})
+                lock_conn.close()
+                return
+        except Exception:                          # noqa: BLE001 — lock is best-effort
+            if lock_conn is not None:
+                try:
+                    lock_conn.close()
+                except Exception:                  # noqa: BLE001
+                    pass
+                lock_conn = None
     try:
+        Base.metadata.create_all(engine)
+        insp = inspect(engine)
         with engine.begin() as conn:
-            conn.execute(text(
-                "DELETE FROM app_snapshots WHERE key = 'schema_version'"))
-            conn.execute(text(
-                "INSERT INTO app_snapshots (key, as_of, payload) "
-                "VALUES ('schema_version', :d, :v)"), {"d": SCHEMA_VERSION,
-                                                       "v": SCHEMA_VERSION})
-    except Exception:                              # noqa: BLE001
-        pass                                       # an optimisation, never required
+            for table, col, ddl in _SOFT_MIGRATIONS:
+                if not insp.has_table(table):
+                    continue
+                cols = {c["name"] for c in insp.get_columns(table)}
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+            # hot-path composite index (IF NOT EXISTS works on SQLite + Postgres).
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_vol_sym_date "
+                              "ON vol_surface_observations (symbol, obs_date)"))
+
+        _apply_unique_keys()
+
+        # Stamped LAST, so a migration that fails part-way leaves the fast path
+        # disarmed and the next boot retries instead of skipping incomplete work.
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "DELETE FROM app_snapshots WHERE key = 'schema_version'"))
+                conn.execute(text(
+                    "INSERT INTO app_snapshots (key, as_of, payload) "
+                    "VALUES ('schema_version', :d, :v)"), {"d": SCHEMA_VERSION,
+                                                           "v": SCHEMA_VERSION})
+        except Exception:                          # noqa: BLE001
+            pass                                   # an optimisation, never required
+    finally:
+        if lock_conn is not None:
+            try:
+                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"),
+                                  {"k": SCHEMA_LOCK_KEY})
+            finally:
+                lock_conn.close()
 
 
 # ---------------------------------------------------------------- egress meter
