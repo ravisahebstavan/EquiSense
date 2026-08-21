@@ -116,16 +116,12 @@ class PriceObservation(Base):
     volume: Mapped[float | None] = mapped_column(Float, nullable=True)  # shares traded
     # Provenance. Everything analytical must be able to tell a measured price
     # from a fabricated one, and until this column existed it could not.
-    #
-    # seed/demo_data.py writes a synthetic annual price path so the UI is
-    # navigable before any ingestion has run. It marks the COMPANY is_demo_data,
-    # but sync_universe then sets that flag False on every name the index
-    # actually contains — and the seeded names are real NIFTY constituents. The
-    # flag cleared, the fabricated bars stayed, and nine live index members were
-    # carrying invented prices that no query could distinguish from market data.
     # Provenance belongs on the observation, not on the company, because it is
-    # the observation that is or is not a measurement.
-    source: Mapped[str] = mapped_column(String(10), default="yahoo")  # yahoo | demo
+    # the observation that is or is not a measurement. The demo/seed generator
+    # that motivated this column has since been deleted — the platform runs on
+    # real data only — so in practice every row is now 'yahoo' or 'live'; the
+    # 'demo' value is retained solely so any legacy row could still be labelled.
+    source: Mapped[str] = mapped_column(String(10), default="yahoo")  # yahoo | live | demo
     # Cash dividend per share with this EX-date (0/None on ordinary days).
     # Required for money-weighted return: a dividend is a real cash inflow, and
     # omitting it understates XIRR by roughly the yield, every year.

@@ -501,6 +501,32 @@ _UNIVERSE_CACHE: dict = {"key": None, "snap": None, "checked_at": 0.0}
 # seconds buys nothing.
 FRESHNESS_PROBE_TTL_S = 15.0
 
+# Last-resort self-heal ceiling for serve-stale (live mode). Reads normally never
+# rebuild — staleness is repaired out of band by /api/live/refresh (⟳ button,
+# frontend auto-refresh, daily cron), each of which restamps built_at even when
+# the live Yahoo pull fails and it falls back to the stored panel. So built_at
+# ageing past this ceiling means NO refresh path has run for a full day: the
+# out-of-band contract has broken, and serving the stale row forever would make
+# the staleness permanent. Past the ceiling one read pays for a single guarded
+# inline rebuild to restore freshness; a rebuild failure still serves the stale
+# row, so the read never fails. The ceiling sits far above TTL_CLOSED_S and above
+# any weekend/holiday gap (over which refresh still runs and keeps built_at
+# fresh), so normal operation never trips it.
+HARD_STALE_CEILING_S = 24 * 3600.0
+
+
+def _snapshot_catastrophically_stale(snap: dict) -> bool:
+    """True when a live snapshot has not been rebuilt for longer than the hard
+    ceiling — the signal that every out-of-band refresh path has stopped."""
+    built = snap.get("built_at")
+    if not built:
+        return True
+    try:
+        age = (datetime.utcnow() - datetime.fromisoformat(built)).total_seconds()
+    except Exception:                                  # noqa: BLE001
+        return True
+    return age > HARD_STALE_CEILING_S
+
 
 def invalidate_universe_cache() -> None:
     """Drop the cached snapshot. Called after an ingest so a refresh is visible
@@ -541,6 +567,19 @@ def get_universe(session: Session, allow_rebuild: bool = True) -> dict:
             except Exception:                          # noqa: BLE001
                 cand = None
         if cand is not None and cand.get("version") == SNAP_VERSION:
+            # Serve instantly UNLESS the row is catastrophically stale — no refresh
+            # for a full day, meaning the out-of-band pipeline has died. Then one
+            # read self-heals with a single inline rebuild; if that rebuild fails,
+            # fall through and still serve the stale row (a slow-but-fresh recovery
+            # beats permanent staleness; a failed recovery must never fail the read).
+            if allow_rebuild and _snapshot_catastrophically_stale(cand):
+                try:
+                    snap = rebuild_universe_snapshot(session, prefer_live=True)
+                    _UNIVERSE_CACHE.update(key=(snap.get("as_of"), SNAP_VERSION),
+                                           snap=snap, checked_at=_time.time())
+                    return snap
+                except Exception:                      # noqa: BLE001 — serve stale
+                    pass
             _UNIVERSE_CACHE.update(key=(cand.get("as_of"), SNAP_VERSION), snap=cand,
                                    checked_at=_time.time())
             return cand

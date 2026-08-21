@@ -219,24 +219,6 @@ def _apply_unique_keys() -> None:
             continue
         SCHEMA_NOTES.pop(name, None)
 
-    # Retroactive provenance. Rows written before price_observations.source
-    # existed all defaulted to 'yahoo', including the fabricated seed path.
-    #
-    # The signature is exact rather than heuristic: seed/demo_data.py writes a
-    # close and nothing else, while every bar Yahoo has ever returned carries a
-    # volume. A row with no nominal price, no volume AND no intraday range is
-    # not something the provider produces — verified against the live database,
-    # where the rows matching this predicate are precisely the 54 seeded ones,
-    # on the six synthetic dates, across the nine seeded names.
-    try:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE price_observations SET source = 'demo' "
-                "WHERE source = 'yahoo' AND close_raw IS NULL "
-                "AND volume IS NULL AND open_price IS NULL"))
-    except Exception as exc:                           # noqa: BLE001
-        SCHEMA_NOTES["price_source_backfill"] = f"{type(exc).__name__}: {exc}"[:200]
-
     for name in _REDUNDANT_INDEXES:
         try:
             with engine.begin() as conn:
@@ -340,27 +322,39 @@ def ensure_schema() -> None:
     # Serialize the build across concurrent cold starts. On Postgres two parallel
     # first-request create_all() calls collide on the internal pg_type unique
     # index with a UniqueViolation — the exact IntegrityError this deployment hit
-    # on the fresh Supabase DB. A session-level advisory lock lets exactly one
-    # instance build at a time; the rest block briefly, then re-check and skip.
-    # SQLite (single writer) needs none of this.
+    # on the fresh Supabase DB. Exactly one instance builds at a time; the rest
+    # block briefly, then re-check and skip. SQLite (single writer) needs none of
+    # this.
+    #
+    # The lock is TRANSACTION-scoped (pg_advisory_xact_lock), held on a connection
+    # that keeps one explicit transaction open for the whole build. That choice is
+    # deliberate and load-bearing on Supabase's pooler: a session-level lock on an
+    # AUTOCOMMIT connection does NOT serialize under a transaction-mode pooler,
+    # because each statement can land on a different backend and the "session"
+    # holding the lock is handed back to the pool immediately. An open transaction
+    # pins exactly one backend for its entire lifetime, so the lock genuinely holds
+    # in both session- and transaction-pooling modes — and it auto-releases when
+    # the transaction ends, so a crashed instance can never strand it.
     lock_conn = None
+    lock_txn = None
     if not IS_SQLITE:
         try:
-            lock_conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
-            lock_conn.execute(text("SELECT pg_advisory_lock(:k)"),
+            lock_conn = engine.connect()
+            lock_txn = lock_conn.begin()
+            lock_conn.execute(text("SELECT pg_advisory_xact_lock(:k)"),
                               {"k": SCHEMA_LOCK_KEY})
             if _stamped():                         # a peer finished while we waited
-                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"),
-                                  {"k": SCHEMA_LOCK_KEY})
+                lock_txn.rollback()                # releases the xact lock
                 lock_conn.close()
                 return
         except Exception:                          # noqa: BLE001 — lock is best-effort
-            if lock_conn is not None:
-                try:
-                    lock_conn.close()
-                except Exception:                  # noqa: BLE001
-                    pass
-                lock_conn = None
+            for _closer in (lock_txn, lock_conn):
+                if _closer is not None:
+                    try:
+                        _closer.close()
+                    except Exception:              # noqa: BLE001
+                        pass
+            lock_conn = lock_txn = None
     try:
         Base.metadata.create_all(engine)
         insp = inspect(engine)
@@ -390,12 +384,18 @@ def ensure_schema() -> None:
         except Exception:                          # noqa: BLE001
             pass                                   # an optimisation, never required
     finally:
+        # Ending the transaction releases the xact lock; every step is guarded so a
+        # transient release/close failure can never fail an otherwise-clean build.
+        if lock_txn is not None:
+            try:
+                lock_txn.commit()
+            except Exception:                      # noqa: BLE001
+                pass
         if lock_conn is not None:
             try:
-                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"),
-                                  {"k": SCHEMA_LOCK_KEY})
-            finally:
                 lock_conn.close()
+            except Exception:                      # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------- egress meter
