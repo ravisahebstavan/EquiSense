@@ -314,10 +314,20 @@ def data_status(session: Session, verify_ledger: bool = False) -> dict:
     }
     try:
         from ..engine.india_market import eligibility_provenance
+        from ..ingestion import live_provider
         live_data["fno_executability"] = eligibility_provenance()
         if _live:
-            from ..ingestion import live_provider
             live_data["cache"] = live_provider.cache_state()
+        # Price-provider + KV-panel visibility, so the Twelve Data migration can be
+        # watched filling in live: which provider is active, and how much of the
+        # universe the incremental sweep has covered.
+        from ..ingestion.prices import active_provider
+        live_data["price_provider"] = active_provider()
+        if live_provider._panel_mode():
+            from ..ingestion import panel_store
+            tickers = [t for (t,) in session.execute(
+                select(Company.ticker).where(Company.is_index_member.is_(True))).all()]
+            live_data["price_panel"] = panel_store.panel_state(tickers)
     except Exception as exc:                           # noqa: BLE001
         live_data["error"] = f"{type(exc).__name__}: {exc}"[:120]
 
