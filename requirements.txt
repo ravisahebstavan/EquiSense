@@ -9,6 +9,10 @@ pandas>=2.0
 # explicit: engine/montecarlo.py and research/stats.py import numpy directly.
 # It arrives transitively via pandas today, which is not a guarantee.
 numpy>=1.26
+# HTTP client for the REST KV backend (equisense/kv.py) and the keyed market-data
+# providers. Present transitively via yfinance today, but — like numpy above — a
+# transitive dependency is not a guarantee, so it is named explicitly.
+requests>=2.31
 # Split deliberately. `psycopg[binary]` uses extras-bracket syntax, and Vercel's
 # Python builder resolved every other package while silently skipping this one —
 # the deployment died at import with ModuleNotFoundError: No module named

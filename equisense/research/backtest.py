@@ -577,18 +577,13 @@ def vol_managed_overlay(period_rets_pct: list[float], hold_days: int) -> dict:
 
 
 def cached_strategy_backtest(session: Session, refresh: bool = False) -> dict:
-    from ..models import AppSnapshot
+    from .. import docstore
     KEY = "strategy_backtest"
-    row = session.get(AppSnapshot, KEY)
-    if row is not None and not refresh:
-        cached = json.loads(row.payload)
+    doc = docstore.get(session, KEY)
+    if doc is not None and not refresh:
+        cached = json.loads(doc.payload)
         if cached.get("cache_version") == BACKTEST_CACHE_VERSION:
             return cached
     result = strategy_backtest(session)
-    if row is None:
-        from datetime import date
-        row = AppSnapshot(key=KEY, as_of=str(date.today()), payload="")
-        session.add(row)
-    row.payload = json.dumps(result)
-    session.commit()
+    docstore.put(session, KEY, json.dumps(result))
     return result

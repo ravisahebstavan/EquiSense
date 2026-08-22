@@ -48,7 +48,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..engine.regime import regime_series
-from ..models import (AppSnapshot, BaseRateRecord, Company, MacroObservation,
+from ..models import (BaseRateRecord, Company, MacroObservation,
                       PriceObservation)
 from .registry import REGISTRY
 from .stats import (HLZ_T_HURDLE, benjamini_hochberg, block_observations,
@@ -586,13 +586,8 @@ def run_all_studies(session: Session, panel=None) -> dict:
     # The cache write is isolated: a DB hiccup here must not clobber a result that
     # WAS computed (the run report still carries it), only fail to persist it.
     try:
-        row = session.get(AppSnapshot, "momentum_risk")
-        if row is None:
-            row = AppSnapshot(key="momentum_risk", as_of=panel_asof, payload="")
-            session.add(row)
-        row.payload = json.dumps(mom_risk)
-        row.as_of = panel_asof
-        session.commit()
+        from .. import docstore
+        docstore.put(session, "momentum_risk", json.dumps(mom_risk), as_of=panel_asof)
     except Exception:                                      # noqa: BLE001
         session.rollback()
 
