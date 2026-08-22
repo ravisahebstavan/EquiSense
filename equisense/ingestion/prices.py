@@ -17,13 +17,20 @@ from typing import Optional
 
 
 def active_provider() -> str:
-    """'twelvedata' | 'yahoo'. Explicit env wins; otherwise Twelve Data when its
-    key is set, else the legacy Yahoo path."""
+    """'twelvedata' | 'yahoo'. An explicit EQUISENSE_PRICE_PROVIDER wins.
+
+    Otherwise Twelve Data is selected only when BOTH its key AND a REST KV are
+    configured — because Twelve Data's rate limit forces the KV price panel, and a
+    panel with nowhere durable to live would read empty on every serverless cold
+    start. Requiring both makes the migration safe: setting the key alone changes
+    nothing, and the legacy keyless Yahoo path keeps serving until the KV store is
+    provisioned too."""
     choice = os.environ.get("EQUISENSE_PRICE_PROVIDER", "").strip().lower()
     if choice in ("twelvedata", "yahoo"):
         return choice
     from . import twelvedata
-    return "twelvedata" if twelvedata.configured() else "yahoo"
+    from .. import kv
+    return "twelvedata" if (twelvedata.configured() and kv.rest_configured()) else "yahoo"
 
 
 def fetch_series(tickers: list[str], years: int) -> tuple[dict[str, tuple], dict]:
