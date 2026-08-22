@@ -2883,9 +2883,40 @@ function scheduleQuotes() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopQuotes();
+  if (document.hidden) { stopQuotes(); stopPanelSweep(); return; }
   else if (!quoteTimer) quoteLoop();     // refetch at once, then reschedule
+  startPanelSweep();
 });
+
+/* Incremental price-panel sweep (KV-panel / Twelve Data mode). The free tier is
+   rate-limited, so the universe is refreshed a small batch at a time; while the
+   app is open the client drives that sweep so the panel fills in minutes instead
+   of waiting for the once-a-day cron. It stops itself the moment the server says
+   nothing is due (every name fresh) or that the deployment is not in panel mode,
+   so a Yahoo-mode or fully-warm deployment pays nothing. Purely a background
+   warmer — it never touches the DOM. */
+const PANEL_SWEEP_ACTIVE_MS = 9000;      // ~8 names / 9s ≈ under 8 credits/min
+const PANEL_SWEEP_IDLE_MS = 20 * 60 * 1000;
+let panelTimer = null;
+
+function stopPanelSweep() { clearTimeout(panelTimer); panelTimer = null; }
+
+async function panelSweep() {
+  let next = PANEL_SWEEP_IDLE_MS;
+  try {
+    const r = await api("/live/panel/refresh?batch=8", { method: "POST" });
+    /* keep sweeping fast only while names are actually still due */
+    if (r && !r.skipped && r.requested > 0) next = PANEL_SWEEP_ACTIVE_MS;
+  } catch { /* best-effort warmer; the status strip reports coverage */ }
+  finally {
+    if (!document.hidden) panelTimer = setTimeout(panelSweep, next);
+  }
+}
+
+function startPanelSweep() {
+  if (panelTimer || document.hidden) return;
+  panelTimer = setTimeout(panelSweep, 1500);   // let first paint settle
+}
 
 document.getElementById("help-grid").innerHTML = SHORTCUTS.map(([k, d]) =>
   `<span>${k.split(" ").map(p => `<kbd>${p}</kbd>`).join(" ")}</span><span>${d}</span>`).join("");
@@ -2898,4 +2929,5 @@ window.addEventListener("hashchange", route);
 refreshStatusStrip();
 setInterval(refreshStatusStrip, 120000);
 quoteLoop();   // self-reschedules on the exchange clock (see scheduleQuotes)
+startPanelSweep();   // warms the KV price panel in the background (panel mode only)
 route();

@@ -166,14 +166,51 @@ def _yahoo_symbol(ticker: str) -> str:
     return yahoo_symbol(ticker)
 
 
+def _panel_mode() -> bool:
+    """Read prices from the KV panel instead of a live per-request pull. Forced on
+    for Twelve Data, whose rate limit forbids a whole-universe live fetch; the
+    panel is populated incrementally out of band (panel_store.refresh_due)."""
+    import os
+    if os.environ.get("EQUISENSE_PRICE_PANEL", "").strip() in ("0", "false"):
+        return False
+    from .prices import active_provider
+    return active_provider() == "twelvedata"
+
+
+def _panel_read(tickers: list[str], years: int) -> tuple[dict[str, tuple], dict]:
+    """Serve the universe from the KV panel — instant, no network on the hot path.
+    Coverage below 100% is reported, never silent; the missing names are simply
+    ones the incremental refresh has not reached yet."""
+    from . import panel_store
+    series, missing = panel_store.get_many(tickers)
+    status = {
+        "provider": "twelvedata_kv_panel",
+        "requested": len(tickers), "returned": len(series),
+        "coverage_pct": round(100 * len(series) / len(tickers), 1) if tickers else 0.0,
+        "missing": missing[:50], "missing_count": len(missing),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "note": ("Prices served from the KV panel, refreshed incrementally from "
+                 "Twelve Data within its rate limit. Missing names are ones the "
+                 "round-robin refresh has not reached yet, not market movement."),
+    }
+    return series, status
+
+
 def get_universe_prices(tickers: list[str], years: int = DEFAULT_YEARS,
                         force: bool = False) -> tuple[dict[str, tuple], dict]:
-    """{ticker: 7-tuple series} fetched live from Yahoo, in-process TTL-cached.
+    """{ticker: 7-tuple series}. In Twelve Data mode this reads the KV panel; in
+    the legacy Yahoo mode it fetches live and in-process TTL-caches.
 
     Returns (series_by_ticker, status). `status` reports coverage and any names
-    that came back empty, so a degraded fetch is visible rather than silently
+    that came back empty, so a degraded read is visible rather than silently
     thinning the cross-section (which would move every percentile rank).
     """
+    if _panel_mode():
+        series, status = _panel_read(tickers, years)
+        _CACHE.update(key=(tuple(sorted(tickers)), years), series=series,
+                      status=status, fetched_at=time.time())
+        return series, status
+
     key = (tuple(sorted(tickers)), years)
     now = time.time()
     if (not force and _CACHE["key"] == key and _CACHE["series"] is not None
@@ -279,6 +316,16 @@ def get_deep_panel(tickers: list[str], years: int = DEEP_YEARS,
     bias the retained history existed to avoid. Live-mode study output is
     therefore current-members-only and must be caveated as such by its callers.
     """
+    if _panel_mode():
+        # The panel already holds the deepest window the refresh has fetched, so
+        # studies read it straight from KV — the same source the daily view uses,
+        # no separate deep pull. Depth is whatever the incremental refresh has
+        # reached; a still-shallow panel yields fewer usable names, reported by
+        # the caller, never fabricated.
+        from . import panel_store
+        series, _missing = panel_store.get_many(tickers)
+        return series
+
     key = (tuple(sorted(tickers)), years)
     now = time.time()
     if (not force and _DEEP_CACHE["key"] == key and _DEEP_CACHE["series"] is not None

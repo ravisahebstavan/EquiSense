@@ -773,6 +773,25 @@ def live_run_studies(s: Session = Depends(db)):
     return run_all_studies(s)
 
 
+@app.post("/api/live/panel/refresh")
+def live_panel_refresh(batch: int = 8, s: Session = Depends(db)):
+    """Incrementally refresh the KV price panel from the active provider — a
+    bounded round-robin batch per call. Twelve Data's free tier is 8 credits/min,
+    so the default batch of 8 is one safe request; the frontend calls this
+    periodically while open to sweep the universe, and the daily cron calls it
+    too. Names pulled within ~10h (an EOD bar is final) are skipped, which bounds
+    daily credit spend to about one pull per name."""
+    from ..ingestion import panel_store
+    from ..ingestion.live_provider import DEEP_YEARS, _panel_mode
+    if not _panel_mode():
+        return {"refreshed": 0, "requested": 0, "skipped": "not in KV-panel mode "
+                "(the active price provider fetches live, not via the panel)"}
+    tickers = [t for (t,) in s.execute(
+        select(Company.ticker).where(Company.is_index_member.is_(True))).all()]
+    return panel_store.refresh_due(tickers, years=DEEP_YEARS,
+                                   batch=max(1, min(batch, 60)), min_age_s=10 * 3600)
+
+
 @app.post("/api/live/realign")
 def live_realign(s: Session = Depends(db)):
     """Re-derive everything the stored data implies, WITHOUT re-ingesting it.
@@ -1010,6 +1029,31 @@ def cron_refresh(s: Session = Depends(db)):
     dstage("vol_surface", lambda: capture_vol_surface(s))
     if ids:
         dstage("nse_archives", lambda: nse_backfill(s, days=4, symbols=list(ids)))
+
+    # 2b. KV price panel. In panel mode (Twelve Data) this is HOW prices arrive:
+    # a bounded round-robin batch refreshed within the rate limit, the rest of
+    # the sweep driven by the frontend while the app is open. It runs as many
+    # rate-safe batches as the remaining cron budget allows, ~1 minute apart.
+    from ..ingestion.live_provider import _panel_mode
+    if ids and _panel_mode():
+        from ..ingestion import panel_store
+        from ..ingestion.live_provider import DEEP_YEARS
+        def _sweep():
+            done, batches = 0, 0
+            names = list(ids)
+            # A few rate-safe batches per run (the frontend drives the rest while
+            # the app is open). Capped well under maxDuration so the 60s spacing
+            # between batches cannot run the function into its limit.
+            while _time.monotonic() - t0 < CRON_BUDGET_S and batches < 3:
+                r = panel_store.refresh_due(names, years=DEEP_YEARS, batch=8,
+                                            min_age_s=10 * 3600)
+                done += r.get("refreshed", 0); batches += 1
+                if r.get("requested", 0) == 0:
+                    break                      # nothing due — panel already fresh
+                if _time.monotonic() - t0 < CRON_BUDGET_S - 60:
+                    _time.sleep(60)            # respect 8 credits/min
+            return {"refreshed": done, "batches": batches}
+        stage("price_panel", _sweep)
 
     # 3. Prices and macro — recoverable, but the learning loop below needs them.
     #
