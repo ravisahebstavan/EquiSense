@@ -37,7 +37,8 @@ function toast(message, kind = "") {
 const SHORTCUTS = [
   ["Ctrl K", "Open command palette"], ["g d", "Go to Dashboard"],
   ["g c", "Go to Companies"], ["g p", "Go to Portfolio"], ["g t", "Go to Trading Desk"],
-  ["g r", "Go to Research"], ["g l", "Go to Lab"], ["r", "Open refresh drawer"],
+  ["g r", "Go to Research"], ["g s", "Go to Simulation Studio"], ["g l", "Go to Lab"],
+  ["r", "Open refresh drawer"],
   ["/", "Also opens the command palette"],
   ["?", "This help"], ["Esc", "Close any overlay"],
 ];
@@ -318,6 +319,7 @@ const COMMANDS = [
   { label: "Go to Research", k: "gr", run: () => location.hash = "#/research" },
   { label: "Go to Lab", k: "gl", run: () => location.hash = "#/lab" },
   { label: "Go to Markets (derivatives, risk, cross-asset)", k: "gm", run: () => location.hash = "#/markets" },
+  { label: "Go to Simulation Studio (Monte Carlo, VaR, backtest)", k: "gs", run: () => location.hash = "#/simulation" },
   { label: "Refresh live data (staged pipeline)", k: "R", run: openRefreshDrawer },
   { label: "Run studies (recompute base rates)", k: "", run: async () => { await api("/live/studies/run", { method: "POST" }); route(); } },
   { label: "Score due claims", k: "", run: async () => { await api("/live/score", { method: "POST" }); route(); } },
@@ -370,7 +372,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "?") { e.preventDefault(); openHelp(); return; }
   if (pendingG) {
     pendingG = false;
-    const map = { d: "dashboard", c: "companies", p: "portfolio", t: "trading", r: "research", l: "lab", m: "markets" };
+    const map = { d: "dashboard", c: "companies", p: "portfolio", t: "trading", r: "research", l: "lab", m: "markets", s: "simulation" };
     if (map[e.key]) location.hash = "#/" + map[e.key];
     return;
   }
@@ -2548,6 +2550,251 @@ async function renderFlow(body) {
       <div class="sub" style="margin-top:10px;padding:8px 10px;border-left:2px solid var(--accent)">${esc(d.note || "")}</div></div>`;
 }
 
+/* ========================================================= simulation studio
+
+   Every pixel here is bound to the Monte Carlo engine's OWN output — the
+   bootstrap of real history, three tail models, quantile envelopes and a
+   handful of actual sample paths (montecarlo.py). The animation shows those
+   real paths settling into the cone and the histogram they summarise; nothing
+   is invented for effect. Pure SVG, no chart library, theme-aware via CSS vars. */
+
+const SIM = { horizon: 63, paths: 20000, running: false, data: null, bt: null };
+const MODEL_STYLE = {
+  gaussian: { c: "var(--series-1)", label: "Gaussian" },
+  student_t: { c: "var(--series-3)", label: "Student-t (fat tails)" },
+  bootstrap: { c: "var(--series-2)", label: "Bootstrap of real history" },
+};
+
+/* map a value in [lo,hi] to a pixel in [a,b] */
+const _lin = (v, lo, hi, a, b) => a + (hi === lo ? 0.5 : (v - lo) / (hi - lo)) * (b - a);
+
+function simFanSVG(fan, samples) {
+  const W = 720, H = 340, L = 46, R = 14, T = 14, B = 26;
+  const steps = fan.steps, n = steps.length;
+  const flat = [...fan.p05, ...fan.p95, ...samples.flat()];
+  let lo = Math.min(...flat), hi = Math.max(...flat);
+  const pad = (hi - lo) * 0.08 || 1; lo -= pad; hi += pad;
+  const X = (i) => _lin(i, 0, n - 1, L, W - R);
+  const Y = (v) => _lin(v, lo, hi, H - B, T);
+  const bandPath = (top, bot) => {
+    const up = top.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`);
+    const dn = bot.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).reverse();
+    return `M${up.join(" L")} L${dn.join(" L")} Z`;
+  };
+  const line = (arr) => arr.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
+  const spaghetti = samples.map((p, i) =>
+    `<polyline class="sim-path" style="animation-delay:${(i * 14)}ms"
+       points="${line(p)}"/>`).join("");
+  // zero reference + a few gridlines with % labels
+  const ticks = 4, gl = [];
+  for (let t = 0; t <= ticks; t++) {
+    const v = lo + (hi - lo) * t / ticks, y = Y(v);
+    gl.push(`<line x1="${L}" y1="${y.toFixed(1)}" x2="${W - R}" y2="${y.toFixed(1)}" class="sim-grid"/>
+      <text x="${L - 6}" y="${(y + 3).toFixed(1)}" class="sim-axis" text-anchor="end">${signed(v, 0)}%</text>`);
+  }
+  const zeroY = Y(0);
+  return `<svg viewBox="0 0 ${W} ${H}" class="sim-svg" preserveAspectRatio="xMidYMid meet">
+    ${gl.join("")}
+    <line x1="${L}" y1="${zeroY.toFixed(1)}" x2="${W - R}" y2="${zeroY.toFixed(1)}" class="sim-zero"/>
+    <path class="sim-band outer" d="${bandPath(fan.p95, fan.p05)}"/>
+    <path class="sim-band inner" d="${bandPath(fan.p75, fan.p25)}"/>
+    <polyline class="sim-median" points="${line(fan.p50)}"/>
+    <g class="sim-spaghetti">${spaghetti}</g>
+    <text x="${L}" y="${H - 8}" class="sim-axis">today</text>
+    <text x="${W - R}" y="${H - 8}" class="sim-axis" text-anchor="end">+${steps[n - 1]}d</text>
+  </svg>`;
+}
+
+function simHistSVG(dist) {
+  const W = 720, H = 220, L = 46, R = 14, T = 12, B = 26;
+  const centers = dist.bin_centers_pct, models = dist.models;
+  const all = Object.values(models).flat();
+  const hi = Math.max(...all) || 1, lo = Math.min(...centers), hic = Math.max(...centers);
+  const X = (v) => _lin(v, lo, hic, L, W - R);
+  const Y = (d) => _lin(d, 0, hi, H - B, T);
+  const area = (arr, cls, style) => {
+    const pts = arr.map((d, i) => `${X(centers[i]).toFixed(1)},${Y(d).toFixed(1)}`);
+    return `<polyline class="sim-hist ${cls}" style="${style}" points="${pts.join(" ")}"/>`;
+  };
+  const zeroX = X(0);
+  const layers = Object.entries(models).map(([m, arr]) =>
+    area(arr, m, `stroke:${MODEL_STYLE[m].c}`)).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" class="sim-svg" preserveAspectRatio="xMidYMid meet">
+    <line x1="${zeroX.toFixed(1)}" y1="${T}" x2="${zeroX.toFixed(1)}" y2="${H - B}" class="sim-zero"/>
+    <text x="${zeroX.toFixed(1)}" y="${H - 8}" class="sim-axis" text-anchor="middle">0%</text>
+    <text x="${L}" y="${H - 8}" class="sim-axis">${signed(lo, 0)}%</text>
+    <text x="${W - R}" y="${H - 8}" class="sim-axis" text-anchor="end">${signed(hic, 0)}%</text>
+    ${layers}
+  </svg>`;
+}
+
+function simEquitySVG(curve) {
+  const W = 720, H = 240, L = 46, R = 14, T = 12, B = 22;
+  const S = curve.map(p => p.strategy), N = curve.map(p => p.nifty);
+  const lo = Math.min(...S, ...N), hi = Math.max(...S, ...N), n = curve.length;
+  const X = (i) => _lin(i, 0, n - 1, L, W - R), Y = (v) => _lin(v, lo, hi, H - B, T);
+  const line = (arr) => arr.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
+  const y100 = Y(100);
+  return `<svg viewBox="0 0 ${W} ${H}" class="sim-svg" preserveAspectRatio="xMidYMid meet">
+    <line x1="${L}" y1="${y100.toFixed(1)}" x2="${W - R}" y2="${y100.toFixed(1)}" class="sim-zero"/>
+    <polyline class="sim-eq nifty" points="${line(N)}"/>
+    <polyline class="sim-eq strat" points="${line(S)}"/>
+    <text x="${L}" y="${(y100 - 5).toFixed(1)}" class="sim-axis">base 100</text>
+  </svg>`;
+}
+
+function simRiskTable(models, gap) {
+  const rows = ["gaussian", "student_t", "bootstrap"].filter(m => models[m]);
+  const cell = (m, k, d = 2) => signed(models[m][k], d);
+  const tr = (m) => {
+    const st = MODEL_STYLE[m];
+    return `<tr><td><span class="sim-dot" style="background:${st.c}"></span>${st.label}</td>
+      <td>${cell(m, "mean_return_pct")}%</td><td>${signed(models[m].volatility_pct, 1)}%</td>
+      <td class="neg">${cell(m, "var_95_pct")}%</td><td class="neg">${cell(m, "var_99_pct")}%</td>
+      <td class="neg">${cell(m, "cvar_95_pct")}%</td><td class="neg">${cell(m, "cvar_99_pct")}%</td>
+      <td>${fmtN(models[m].skew, 2)}</td><td>${fmtN(models[m].excess_kurtosis, 2)}</td></tr>`;
+  };
+  return `<div class="tablewrap"><table class="sim-table"><thead><tr>
+    <th>Return model</th><th>Mean</th><th>Vol</th><th>VaR 95</th><th>VaR 99</th>
+    <th>CVaR 95</th><th>CVaR 99</th><th>Skew</th><th>Ex. kurt</th></tr></thead>
+    <tbody>${rows.map(tr).join("")}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">Tail-model gap at 99%:
+      <strong>${signed(gap, 2)} pts</strong> — the amount the Gaussian assumption
+      under- or over-states the loss the bootstrap of real history actually shows.</div>`;
+}
+
+function simDrawdownBars(dd) {
+  if (!dd) return `<div class="sub">Drawdown path simulation unavailable for this book.</div>`;
+  const tp = dd.touch_probability_pct;
+  const bars = Object.entries(tp).map(([lvl, pct]) =>
+    `<div class="sim-bar-row"><span class="sim-bar-lbl">${lvl}</span>
+      <div class="sim-bar-track"><div class="sim-bar-fill" style="width:${Math.min(100, pct)}%"></div></div>
+      <span class="sim-bar-val">${fmtN(pct, 1)}%</span></div>`).join("");
+  return `${bars}<div class="sub" style="margin-top:8px">Probability of EVER touching each
+    drawdown over ${dd.horizon_days} sessions (path-dependent — what triggers a stop or a
+    margin call), median max drawdown <strong>${signed(dd.median_max_drawdown_pct, 1)}%</strong>,
+    worst simulated <strong>${signed(dd.worst_max_drawdown_pct, 1)}%</strong>.</div>`;
+}
+
+function simControls() {
+  const hz = [[21, "1M"], [63, "3M"], [126, "6M"], [252, "1Y"]];
+  const pa = [[10000, "10k"], [20000, "20k"], [40000, "40k"]];
+  const btn = (v, lbl, key) =>
+    `<button data-sim="${key}" data-v="${v}" class="${SIM[key] === v ? "active" : ""}">${lbl}</button>`;
+  return `<div class="sim-controls">
+    <div class="sim-ctl"><label>Horizon</label><div class="segbtns">
+      ${hz.map(([v, l]) => btn(v, l, "horizon")).join("")}</div></div>
+    <div class="sim-ctl"><label>Paths</label><div class="segbtns">
+      ${pa.map(([v, l]) => btn(v, l, "paths")).join("")}</div></div>
+    <button id="sim-run" class="primary">${SIM.running ? "Simulating…" : "⟳ Run simulation"}</button>
+  </div>`;
+}
+
+async function viewSimulation() {
+  document.title = "EquiSense · Simulation Studio";
+  app.innerHTML = `<div class="viewhead"><h1>Simulation Studio</h1>
+    <div class="sub">Monte Carlo on your actual book — three tail models over a
+    bootstrap of real history. VaR is a point; the distribution is the truth.</div></div>
+    ${simControls()}
+    <div id="sim-body">${skeleton(6)}</div>`;
+  wireSimControls();
+  await runSimulation();
+}
+
+function wireSimControls() {
+  app.querySelectorAll("[data-sim]").forEach(b => b.addEventListener("click", () => {
+    SIM[b.dataset.sim] = parseInt(b.dataset.v);
+    app.querySelectorAll(`[data-sim="${b.dataset.sim}"]`).forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+  }));
+  const run = document.getElementById("sim-run");
+  if (run) run.addEventListener("click", runSimulation);
+}
+
+async function runSimulation() {
+  const body = document.getElementById("sim-body");
+  const runBtn = document.getElementById("sim-run");
+  if (SIM.running) return;
+  SIM.running = true;
+  if (runBtn) { runBtn.disabled = true; runBtn.textContent = "Simulating…"; }
+  if (body) body.innerHTML = `<div class="panel sim-loading">
+    <div class="sim-pulse"></div>Drawing ${fmtN(SIM.paths, 0)} paths over ${SIM.horizon} sessions…</div>`;
+  try {
+    const [sim, bt] = await Promise.all([
+      api(`/markets/simulate?horizon_days=${SIM.horizon}&paths=${SIM.paths}&detail=1`),
+      api(`/backtest/strategy`).catch(() => null),
+    ]);
+    SIM.data = sim; SIM.bt = bt;
+    renderSimulation(sim, bt);
+  } catch (e) {
+    if (body) body.innerHTML = `<div class="panel"><strong>Simulation unavailable:</strong>
+      ${esc(e.message)}</div>`;
+  } finally {
+    SIM.running = false;
+    if (runBtn) { runBtn.disabled = false; runBtn.textContent = "⟳ Run simulation"; }
+  }
+}
+
+function renderSimulation(sim, bt) {
+  const body = document.getElementById("sim-body");
+  if (!body) return;
+  if (!sim || !sim.available) {
+    body.innerHTML = `<div class="panel"><strong>No simulable book yet.</strong>
+      <div class="sub" style="margin-top:6px">${esc((sim && sim.reason) ||
+      "Add positions on the Trading desk, or the live universe proxy needs more history.")}</div></div>`;
+    return;
+  }
+  const risk = sim.risk, legend = Object.entries(MODEL_STYLE).map(([m, s]) =>
+    `<span class="sim-leg"><span class="sim-dot" style="background:${s.c}"></span>${s.label}</span>`).join("");
+  const fan = risk.fan, dist = risk.distribution, samples = sim.risk.sample_paths || [];
+
+  body.innerHTML = `
+    <div class="panel sim-hero">
+      <div class="panel-head"><h3>Forward path simulation</h3>
+        <span class="sub">${esc(sim.basis)} · ${fmtN(risk.n_paths, 0)} paths · ${risk.horizon_days} sessions</span></div>
+      ${fan ? simFanSVG(fan, samples) : `<div class="sub">Path fan unavailable.</div>`}
+      <div class="sim-legend"><span class="sim-leg"><span class="sim-swatch band"></span>5–95% cone</span>
+        <span class="sim-leg"><span class="sim-swatch band inner"></span>25–75%</span>
+        <span class="sim-leg"><span class="sim-swatch median"></span>median</span>
+        <span class="sim-leg"><span class="sim-swatch thread"></span>sample paths</span></div>
+    </div>
+
+    <div class="grid2">
+      <div class="panel"><div class="panel-head"><h3>Terminal outcome distribution</h3></div>
+        ${dist ? simHistSVG(dist) : ""}
+        <div class="sim-legend">${legend}</div>
+        <div class="sub" style="margin-top:6px">${esc(risk.interpretation || "")}</div></div>
+      <div class="panel"><div class="panel-head"><h3>Drawdown — probability of touching</h3></div>
+        ${simDrawdownBars(sim.drawdown)}</div>
+    </div>
+
+    <div class="panel"><div class="panel-head"><h3>Risk under three tail models</h3>
+      <span class="sub">${esc(risk.correlation_estimator || "")}</span></div>
+      ${simRiskTable(risk.models, risk.tail_model_gap_99_pct)}</div>
+
+    ${bt ? `<div class="panel"><div class="panel-head"><h3>Strategy backtest — investable equity curve</h3>
+      <span class="sub">vs NIFTY, base 100</span></div>
+      ${simEquitySVG(bt.curve)}
+      <div class="sim-legend">
+        <span class="sim-leg"><span class="sim-swatch median"></span>Strategy</span>
+        <span class="sim-leg"><span class="sim-swatch thread"></span>NIFTY</span></div>
+      <div class="sim-stats">
+        ${simStat("Total return", signed(bt.total_return_pct, 1) + "%")}
+        ${simStat("NIFTY", signed(bt.nifty_total_return_pct, 1) + "%")}
+        ${simStat("Annualised (net)", signed(bt.annualized_net_pct, 1) + "%")}
+        ${simStat("Deflated Sharpe", fmtN(bt.deflated_sharpe, 2))}
+        ${simStat("Hit rate", fmtN((bt.hit_rate || 0) * 100, 0) + "%")}
+      </div>
+      <div class="sub" style="margin-top:8px">${esc((bt.caveats || []).slice(-1)[0] || "")}</div></div>` : ""}
+  `;
+  requestAnimationFrame(() => body.querySelectorAll(".sim-svg").forEach(s => s.classList.add("in")));
+}
+
+function simStat(label, value) {
+  return `<div class="sim-stat"><div class="sim-stat-v">${value}</div>
+    <div class="sim-stat-l">${esc(label)}</div></div>`;
+}
+
 /* ============================================================== routing */
 
 /* Views whose numbers move with live quotes. Lab and Research render study
@@ -2583,6 +2830,7 @@ async function route(opts) {
     else if (name === "research") await viewResearch();
     else if (name === "lab") await viewLab(arg || "hypotheses");
     else if (name === "markets") await viewMarkets(arg || "derivatives");
+    else if (name === "simulation") await viewSimulation();
     else await viewDashboard();
   } catch (e) {
     app.innerHTML = `<div class="panel"><strong>Error:</strong> ${esc(e.message)}

@@ -351,15 +351,24 @@ def simulate_portfolio_risk(returns_by_asset: dict[str, Sequence[float]],
 
     gauss_var, boot_var = results["gaussian"].var_99_pct, results["bootstrap"].var_99_pct
     understatement = gauss_var - boot_var        # both negative; positive = gaussian milder
-    distribution = fan = None
+    distribution = fan = sample_paths = None
     if include_paths:
         distribution = _shared_histogram({
             "gaussian": gauss_terminal, "student_t": t_terminal, "bootstrap": boot})
         fan = _path_fan(boot_paths)
+        # A handful of ACTUAL bootstrap paths (cumulative % return per step) for the
+        # studio's spaghetti-into-cone animation — real draws, not decoration, so
+        # the eye is watching the same simulation the cone and histogram summarise.
+        k = min(48, boot_paths.shape[0])
+        pick = np.random.default_rng(seed + 1).choice(
+            boot_paths.shape[0], size=k, replace=False)
+        sample_paths = [[round(float(x), 3) for x in ((boot_paths[i] - 1.0) * 100.0)]
+                        for i in pick]
     return {
         "computable": True,
         "distribution": distribution,
         "fan": fan,
+        "sample_paths": sample_paths,
         "horizon_days": horizon_days,
         "n_paths": n_paths,
         "assets": names,

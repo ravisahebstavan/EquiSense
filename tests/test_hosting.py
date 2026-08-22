@@ -130,6 +130,54 @@ def test_markets_view_uses_real_helpers_not_invented_ones():
         assert f".{n}" in css or n in ("primary",), f'CSS class "{n}" is not styled'
 
 
+def test_simulation_studio_is_wired_into_the_frontend():
+    """The Simulation Studio surfaces the Monte Carlo engine; nav entry, route
+    branch, endpoint and every render function must exist or the engine is
+    unreachable from the site."""
+    from pathlib import Path
+    from equisense.api.app import app
+    web = Path(__file__).resolve().parent.parent / "web"
+    js = (web / "app.js").read_text()
+    html = (web / "index.html").read_text()
+    assert 'data-route="simulation"' in html, "nav link missing"
+    assert 'name === "simulation"' in js, "route branch missing"
+    for fn in ("viewSimulation", "runSimulation", "renderSimulation",
+               "simFanSVG", "simHistSVG", "simEquitySVG", "simRiskTable"):
+        assert f"function {fn}" in js, f"{fn} not defined"
+    assert "/api/markets/simulate" in {r.path for r in app.routes}
+
+
+def test_simulation_studio_uses_only_styled_classes():
+    """Same silent-blank-panel guard the Markets view has: every static class the
+    studio block names must be styled, or a typo renders nothing with no error."""
+    import re
+    from pathlib import Path
+    web = Path(__file__).resolve().parent.parent / "web"
+    js = (web / "app.js").read_text()
+    css = (web / "style.css").read_text()
+    block = js[js.index("simulation studio"):js.index("routing */", js.index("simulation studio"))]
+    used = set(re.findall(r'class="([a-z0-9 _-]+)"', block))
+    names = {n for grp in used for n in grp.split()}
+    for n in names:
+        assert f".{n}" in css or n in ("primary",), f'CSS class "{n}" is not styled'
+
+
+def test_simulation_studio_binds_only_real_engine_fields():
+    """Substance-not-flash guard: the studio must read fields the risk engine
+    actually returns under detail=1, never invented ones."""
+    import inspect
+    from equisense.engine import montecarlo as MC
+    src = inspect.getsource(MC.simulate_portfolio_risk)
+    for field in ("distribution", "fan", "sample_paths"):
+        assert f'"{field}"' in src, f"engine no longer returns {field}"
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+    # the view reaches into these — they must be the engine's real keys
+    for ref in ("risk.fan", "risk.distribution", "sample_paths",
+                "touch_probability_pct", "tail_model_gap_99_pct"):
+        assert ref in js, f"studio references {ref!r} which must exist in the payload"
+
+
 def test_ic_panel_is_defined_not_just_called():
     """Caught a real silent failure: a string-replace anchored on the wrong
     function signature inserted the CALL but not the DEFINITION, leaving a tab
