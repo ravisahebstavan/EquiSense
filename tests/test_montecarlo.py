@@ -29,6 +29,36 @@ def _fat_tailed_returns(n=2000, seed=7):
     return ret
 
 
+# ------------------------------------------------------- studio distribution
+
+def test_distribution_and_fan_are_absent_unless_requested():
+    r = _gaussian_returns(1500, seed=3)
+    lean = MC.simulate_portfolio_risk({"A": r}, {"A": 1.0}, n_paths=4000, seed=1)
+    assert lean["distribution"] is None and lean["fan"] is None
+
+
+def test_detail_returns_a_shared_grid_histogram_and_a_monotone_fan():
+    r = _fat_tailed_returns(2000, seed=7)
+    res = MC.simulate_portfolio_risk({"A": r}, {"A": 1.0}, horizon_days=21,
+                                     n_paths=8000, include_paths=True, seed=1)
+    dist = res["distribution"]
+    centers = dist["bin_centers_pct"]
+    # Every model shares ONE grid — the comparison is only meaningful that way.
+    assert set(dist["models"]) == {"gaussian", "student_t", "bootstrap"}
+    for name, dens in dist["models"].items():
+        assert len(dens) == len(centers), name
+        assert all(d >= 0 for d in dens)
+    # Densities integrate to ~1 over the grid (histogram density * bin width).
+    width = centers[1] - centers[0]
+    mass = sum(dens for dens in dist["models"]["bootstrap"]) * width
+    assert 0.80 <= mass <= 1.02, "clipped tails may lose a little mass, never most"
+    fan = res["fan"]
+    assert fan["steps"] == list(range(1, 22))
+    # The cone widens: p95 is above p05 at every step, and the median sits between.
+    for i in range(21):
+        assert fan["p05"][i] <= fan["p25"][i] <= fan["p50"][i] <= fan["p75"][i] <= fan["p95"][i]
+
+
 # ------------------------------------------------------- analytic recovery
 
 def test_gaussian_model_recovers_analytic_volatility_and_var():

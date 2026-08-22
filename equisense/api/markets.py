@@ -319,7 +319,7 @@ def valuation_spread(session: Session) -> dict:
 # ------------------------------------------------------------ portfolio risk
 
 def portfolio_simulation(session: Session, horizon_days: int = 21,
-                         n_paths: int = 20_000) -> dict:
+                         n_paths: int = 20_000, include_paths: bool = False) -> dict:
     """Monte Carlo VaR / CVaR / drawdown risk on the ACTUAL book.
 
     Falls back to the live universe as an equal-weight proxy when no positions
@@ -364,7 +364,7 @@ def portfolio_simulation(session: Session, horizon_days: int = 21,
                 "reason": "no holding has the ≥260 sessions of history required"}
 
     risk = MC.simulate_portfolio_risk(returns, weights, horizon_days=horizon_days,
-                                      n_paths=n_paths)
+                                      n_paths=n_paths, include_paths=include_paths)
     if not risk.get("computable"):
         return {"available": False, "reason": risk.get("reason")}
 

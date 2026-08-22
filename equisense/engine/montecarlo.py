@@ -221,11 +221,52 @@ def _summarise(terminal: np.ndarray, model: str, horizon: int) -> RiskResult:
         skew=float((z ** 3).mean()), excess_kurtosis=float((z ** 4).mean() - 3.0))
 
 
+def _shared_histogram(terminals: dict[str, np.ndarray],
+                      bins: int = 48) -> dict:
+    """Binned terminal-return distributions for several models on ONE shared grid.
+
+    The grid is shared on purpose: the whole reason the engine runs three return
+    models side by side is to SEE that the Gaussian body and the fat-tailed /
+    bootstrap tails disagree. Histograms drawn on different axes hide exactly that
+    comparison; a common set of bin edges makes it visible. Density (not raw
+    counts) so unequal path counts across models stay comparable, and edges are
+    clipped to a robust range so a single catastrophic path cannot flatten the
+    body into one bar.
+    """
+    allv = np.concatenate([(v - 1.0) * 100.0 for v in terminals.values()])
+    lo, hi = float(np.percentile(allv, 0.2)), float(np.percentile(allv, 99.8))
+    if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+        lo, hi = float(allv.min()), float(allv.max() + 1e-9)
+    edges = np.linspace(lo, hi, bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    out = {"bin_centers_pct": [round(float(c), 3) for c in centers], "models": {}}
+    for name, v in terminals.items():
+        r = (v - 1.0) * 100.0
+        dens, _ = np.histogram(r, bins=edges, density=True)
+        out["models"][name] = [round(float(d), 6) for d in dens]
+    return out
+
+
+def _path_fan(paths: np.ndarray) -> dict:
+    """Per-step quantile bands of cumulative return — the simulation 'fan'.
+
+    paths is (n_paths, horizon) of cumulative growth factors. Returns the five
+    quantile envelopes as cumulative PERCENT return at each step, so the frontend
+    draws the cone of outcomes the point-estimate view collapses to a line."""
+    qs = {"p05": 5, "p25": 25, "p50": 50, "p75": 75, "p95": 95}
+    band = {k: [round(float(x), 3)
+                for x in ((np.percentile(paths, q, axis=0) - 1.0) * 100.0)]
+            for k, q in qs.items()}
+    band["steps"] = list(range(1, paths.shape[1] + 1))
+    return band
+
+
 def simulate_portfolio_risk(returns_by_asset: dict[str, Sequence[float]],
                             weights: dict[str, float],
                             horizon_days: int = 21,
                             n_paths: int = DEFAULT_PATHS,
                             student_t_df: float = 4.0,
+                            include_paths: bool = False,
                             seed: int = 42) -> dict:
     """Portfolio VaR / Expected Shortfall under three return models.
 
@@ -282,29 +323,43 @@ def simulate_portfolio_risk(returns_by_asset: dict[str, Sequence[float]],
     # --- gaussian & student-t: same mu/sigma, different tail shape
     z = _correlated_normals(rng, n_paths, horizon_days, psd_corr)
     gauss_paths = mu + sd * z
-    results["gaussian"] = _summarise(
-        np.prod(1.0 + gauss_paths @ w, axis=1), "gaussian", horizon_days)
+    gauss_terminal = np.prod(1.0 + gauss_paths @ w, axis=1)
+    results["gaussian"] = _summarise(gauss_terminal, "gaussian", horizon_days)
 
     t_raw = _student_t_shocks(rng, (n_paths, horizon_days, len(names)), student_t_df)
     L = _safe_cholesky(psd_corr)
     t_corr = t_raw @ L.T
+    t_terminal = np.prod(1.0 + (mu + sd * t_corr) @ w, axis=1)
     results["student_t"] = _summarise(
-        np.prod(1.0 + (mu + sd * t_corr) @ w, axis=1), f"student_t(df={student_t_df:g})",
-        horizon_days)
+        t_terminal, f"student_t(df={student_t_df:g})", horizon_days)
 
     # --- stationary block bootstrap of the real joint history
     port_hist = R @ w
     boot = np.empty(n_paths)
+    # The cumulative path per draw is retained only when the caller wants the fan
+    # (the risk table needs terminals alone); at 20k x ~21 it is a few MB, freed
+    # as soon as the quantile envelopes are taken.
+    boot_paths = np.empty((n_paths, horizon_days)) if include_paths else None
     mean_block = max(5.0, min(20.0, n_obs / 20.0))
     for i in range(n_paths):
         idx = stationary_bootstrap_indices(rng, n_obs, horizon_days, mean_block)
-        boot[i] = np.prod(1.0 + port_hist[idx])
+        cum = np.cumprod(1.0 + port_hist[idx])
+        boot[i] = cum[-1]
+        if boot_paths is not None:
+            boot_paths[i] = cum
     results["bootstrap"] = _summarise(boot, "stationary bootstrap", horizon_days)
 
     gauss_var, boot_var = results["gaussian"].var_99_pct, results["bootstrap"].var_99_pct
     understatement = gauss_var - boot_var        # both negative; positive = gaussian milder
+    distribution = fan = None
+    if include_paths:
+        distribution = _shared_histogram({
+            "gaussian": gauss_terminal, "student_t": t_terminal, "bootstrap": boot})
+        fan = _path_fan(boot_paths)
     return {
         "computable": True,
+        "distribution": distribution,
+        "fan": fan,
         "horizon_days": horizon_days,
         "n_paths": n_paths,
         "assets": names,

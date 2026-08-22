@@ -1190,12 +1190,17 @@ def markets_valuation(index: str = "Nifty 50", s: Session = Depends(db)):
 
 @app.get("/api/markets/simulate")
 def markets_simulate(horizon_days: int = 21, paths: int = 20000,
-                     s: Session = Depends(db)):
+                     detail: bool = False, s: Session = Depends(db)):
     """Monte Carlo VaR / Expected Shortfall / drawdown on the actual book,
-    under Gaussian, Student-t AND a bootstrap of real history."""
+    under Gaussian, Student-t AND a bootstrap of real history.
+
+    `detail=1` additionally returns the terminal-return distribution (three
+    models on a shared bin grid) and the bootstrap path fan, for the Simulation
+    Studio's charts. Off by default so the numeric risk call stays lean."""
     from .markets import portfolio_simulation
-    return portfolio_simulation(s, horizon_days=horizon_days,
-                                n_paths=max(1000, min(paths, 60000)))
+    return portfolio_simulation(s, horizon_days=max(1, min(horizon_days, 252)),
+                                n_paths=max(1000, min(paths, 60000)),
+                                include_paths=detail)
 
 
 @app.get("/api/markets/rates")
