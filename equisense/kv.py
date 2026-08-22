@@ -53,9 +53,27 @@ def rest_configured() -> bool:
     return bool(_REST_URL and _REST_TOKEN)
 
 
+def pg_configured() -> bool:
+    """Postgres KV is available when the deployment has a hosted database. This is
+    the zero-provisioning backend: it reuses DATABASE_URL, so the migration works
+    with no Upstash account. Local/SQLite dev and tests (no DATABASE_URL) fall
+    through to the file/memory store instead, keeping them offline and isolated."""
+    return bool(os.environ.get("DATABASE_URL"))
+
+
+def persistent() -> bool:
+    """True when writes survive a serverless cold start — i.e. a REST KV or the
+    Postgres table, but NOT the per-instance memory/file fallback. The price-panel
+    switch keys off this: a panel with nowhere durable to live would read empty on
+    every cold start."""
+    return rest_configured() or pg_configured()
+
+
 def backend_name() -> str:
     if rest_configured():
         return "rest_kv"
+    if pg_configured():
+        return "postgres_kv"
     return "local_dir" if os.environ.get("EQUISENSE_KV_DIR") else "memory"
 
 
@@ -118,6 +136,42 @@ def _reset_local_for_tests() -> None:
         _MEM.clear()
 
 
+# ------------------------------------------------------------- postgres backend
+
+def _pg_get(key: str) -> Optional[str]:
+    from sqlalchemy import text
+    from .db import engine
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT value FROM kv_store WHERE key = :k"),
+                               {"k": key}).first()
+            return row[0] if row is not None else None
+    except Exception as exc:                          # noqa: BLE001
+        _log.warning("pg kv get %s failed: %s", key, exc)
+        return None
+
+
+def _pg_set(key: str, value: str) -> None:
+    from sqlalchemy import text
+    from .db import engine
+    # Portable upsert: ON CONFLICT works on both Postgres and modern SQLite.
+    stmt = ("INSERT INTO kv_store (key, value, updated_at) "
+            "VALUES (:k, :v, CURRENT_TIMESTAMP) "
+            "ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = CURRENT_TIMESTAMP")
+    with engine.begin() as conn:
+        conn.execute(text(stmt), {"k": key, "v": value})
+
+
+def _pg_del(key: str) -> None:
+    from sqlalchemy import text
+    from .db import engine
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM kv_store WHERE key = :k"), {"k": key})
+    except Exception as exc:                          # noqa: BLE001
+        _log.warning("pg kv del %s failed: %s", key, exc)
+
+
 # ----------------------------------------------------------------- REST backend
 
 def _command(args: list) -> object:
@@ -140,40 +194,52 @@ def _command(args: list) -> object:
 def get(key: str) -> Optional[str]:
     """Value for key, or None. Never raises: a read failure degrades to 'absent'
     so the caller can fall back to recompute rather than error a page."""
-    if not rest_configured():
-        return _local_get(key)
-    try:
-        val = _command(["GET", key])
-        return val if val is None else str(val)
-    except Exception as exc:                          # noqa: BLE001
-        _log.warning("kv get %s failed: %s", key, exc)
-        return None
+    if rest_configured():
+        try:
+            val = _command(["GET", key])
+            return val if val is None else str(val)
+        except Exception as exc:                      # noqa: BLE001
+            _log.warning("kv get %s failed: %s", key, exc)
+            return None
+    if pg_configured():
+        return _pg_get(key)
+    return _local_get(key)
 
 
 def set(key: str, value: str) -> None:               # noqa: A001 - mirrors Redis verb
     """Store value. RAISES on failure — a dropped write to user or ledger state
     is data loss, and the caller must see it rather than believe it persisted."""
-    if not rest_configured():
+    if rest_configured():
+        _command(["SET", key, value])
+    elif pg_configured():
+        _pg_set(key, value)
+    else:
         _local_set(key, value)
-        return
-    _command(["SET", key, value])
 
 
 def delete(key: str) -> None:
-    if not rest_configured():
+    if rest_configured():
+        try:
+            _command(["DEL", key])
+        except Exception as exc:                      # noqa: BLE001
+            _log.warning("kv del %s failed: %s", key, exc)
+    elif pg_configured():
+        _pg_del(key)
+    else:
         _local_del(key)
-        return
-    try:
-        _command(["DEL", key])
-    except Exception as exc:                          # noqa: BLE001
-        _log.warning("kv del %s failed: %s", key, exc)
 
 
 def ping() -> bool:
     """Liveness probe for the status surface. True if the backend answers."""
-    if not rest_configured():
-        return True
-    try:
-        return _command(["PING"]) == "PONG"
-    except Exception:                                 # noqa: BLE001
-        return False
+    if rest_configured():
+        try:
+            return _command(["PING"]) == "PONG"
+        except Exception:                             # noqa: BLE001
+            return False
+    if pg_configured():
+        try:
+            _pg_get("__ping__")
+            return True
+        except Exception:                             # noqa: BLE001
+            return False
+    return True

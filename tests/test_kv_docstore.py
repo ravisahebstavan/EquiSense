@@ -66,6 +66,28 @@ def test_docstore_kv_backend_roundtrips(monkeypatch):
     assert docstore.get(None, "cfg") is None
 
 
+def test_pg_backend_persists_across_instances(monkeypatch):
+    """The zero-provisioning path: with DATABASE_URL set (no REST KV), KV routes to
+    the kv_store table, so a value written on one 'instance' is readable after the
+    in-memory fallback is cleared — proving it is not living in process memory."""
+    import equisense.kv as kvmod
+    from equisense.db import Base
+    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                        poolclass=StaticPool)
+    import equisense.models  # noqa: F401
+    Base.metadata.create_all(eng)
+    monkeypatch.setattr("equisense.db.engine", eng)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://ignored")   # flips pg_configured
+    assert kvmod.backend_name() == "postgres_kv" and kvmod.persistent()
+    kvmod.set("px:X", "payload-1")
+    kvmod._reset_local_for_tests()          # wipe the memory map; pg must still have it
+    assert kvmod.get("px:X") == "payload-1"
+    kvmod.set("px:X", "payload-2")          # upsert
+    assert kvmod.get("px:X") == "payload-2"
+    kvmod.delete("px:X")
+    assert kvmod.get("px:X") is None
+
+
 def test_docstore_defaults_to_db_backend(monkeypatch):
     monkeypatch.delenv("EQUISENSE_STORE", raising=False)
     assert docstore.backend() == "db"

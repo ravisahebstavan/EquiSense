@@ -30,7 +30,7 @@ def active_provider() -> str:
         return choice
     from . import twelvedata
     from .. import kv
-    return "twelvedata" if (twelvedata.configured() and kv.rest_configured()) else "yahoo"
+    return "twelvedata" if (twelvedata.configured() and kv.persistent()) else "yahoo"
 
 
 def fetch_series(tickers: list[str], years: int) -> tuple[dict[str, tuple], dict]:

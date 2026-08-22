@@ -302,6 +302,20 @@ class AppSnapshot(Base):
                                                  onupdate=datetime.utcnow)
 
 
+class KvStore(Base):
+    """A plain key→value table, the Postgres backing for the REST-KV abstraction
+    (equisense/kv.py). It exists so the KV migration — and the Twelve Data price
+    panel that rides on it — works on the database the deployment ALREADY has,
+    with no Upstash/Vercel-KV account to provision. Setting the REST KV
+    credentials later transparently moves the same keys off this table; nothing
+    else changes. Values are opaque strings (the caller JSON-encodes)."""
+    __tablename__ = "kv_store"
+    key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+                                                 onupdate=datetime.utcnow)
+
+
 class PanelBlob(Base):
     """The price panel in column-major order, compressed (see panel.py).
 
