@@ -1051,16 +1051,15 @@ def test_base_rates_are_not_recomputed_every_single_day():
 
     src = inspect.getsource(app_mod.cron_refresh)
     assert "STALE_STUDY_DAYS" in src, "the studies stage must be gated on age"
-    # Gate the EXECUTION site, not the first mention of the string. In live mode
-    # the studies are skipped outright (an even stronger gate) with a reported
-    # `out["base_rate_records"] = {...skipped...}`, so the first occurrence of the
-    # bare key is that skip notice. What must be gated is the one place the heavy
-    # `run_all_studies` actually runs — the `stage("base_rate_records", ...)` call.
+    # Gate the EXECUTION site — the one place the heavy run_all_studies actually
+    # runs — not the first mention of the string (the skip notice mentions the key
+    # too). Both modes now run behind the SAME weekly age gate; live mode only
+    # changes where the deep panel is fetched from (free Yahoo vs metered
+    # Postgres), never whether the studies run, so there is no live special-case
+    # to assert here — just that the run is behind `if _due:`.
     i = src.find('stage("base_rate_records"')
     assert i != -1, "the studies stage must exist"
     assert "if _due:" in src[:i], "the age gate has to precede the run"
-    # The whole stored-mode path is itself gated behind live-mode skip.
-    assert "if live:" in src[:i], "live mode must skip the deep-panel studies"
     assert STALE_STUDY_DAYS >= 7
 
 

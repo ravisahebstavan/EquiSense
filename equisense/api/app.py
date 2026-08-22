@@ -1092,32 +1092,31 @@ def cron_refresh(s: Session = Depends(db)):
     #    system, roughly 60 MB a run. Base rates are ten-year statistics: doing
     #    that every day bought a number that had not moved.
     #
-    #    In live mode there is no stored panel to reload at all: the deep,
-    #    survivorship-corrected history these studies need is precisely the bulk
-    #    data the rearchitecture stopped keeping. So the daily cron does not run
-    #    them — the last computed records (small JSON, persisted) are served, and
-    #    a refresh is an explicit on-demand job (/api/live/studies/run) that pays
-    #    the one-off deep fetch when the user asks for it.
+    #    The mode changes only WHERE the deep panel comes from, never WHETHER the
+    #    studies run. Stored mode reloads the survivorship-corrected panel from the
+    #    metered Postgres — genuinely the largest recurring transfer in the system,
+    #    so it is gated to a weekly cadence. Live mode fetches a deep current-
+    #    members-only panel from Yahoo instead: that is FREE bandwidth and a tiny
+    #    JSON write-back, not metered egress, so the old "skip in live mode
+    #    entirely" conflated the two and left a live deployment's base-rate layer
+    #    permanently empty — the learning loop never learned, and the data-quality
+    #    score sat pinned at 6/7 because studies_current scored zero forever. Both
+    #    modes now run on the SAME weekly gate; run_all_studies flags the live
+    #    panel's survivorship bias on its own records so it is never mistaken for
+    #    the corrected numbers.
     from ..models import BaseRateRecord
     from .status import STALE_STUDY_DAYS
-    if live:
-        out["base_rate_records"] = {
-            "skipped": "live mode — base-rate studies need a deep, survivorship-"
-                       "corrected historical panel that is not stored. Last "
-                       "computed records are served; refresh on demand."}
+    _computed = s.scalar(select(func.max(BaseRateRecord.computed_at)))
+    _due = (_computed is None
+            or (date.today() - _computed.date()).days >= STALE_STUDY_DAYS)
+    if _due:
+        stage("base_rate_records", lambda: run_all_studies(s)["records"])
     else:
-        _computed = s.scalar(select(func.max(BaseRateRecord.computed_at)))
-        _due = (_computed is None
-                or (date.today() - _computed.date()).days >= STALE_STUDY_DAYS)
-        if _due:
-            stage("base_rate_records", lambda: run_all_studies(s)["records"])
-        else:
-            age = (date.today() - _computed.date()).days
-            out["base_rate_records"] = {
-                "skipped": f"studies are {age}d old; recomputed every "
-                           f"{STALE_STUDY_DAYS}d. Ten-year statistics do not move "
-                           "on one session, and the full-panel reload is the "
-                           "largest recurring data transfer in the system."}
+        age = (date.today() - _computed.date()).days
+        out["base_rate_records"] = {
+            "skipped": f"studies are {age}d old; recomputed every "
+                       f"{STALE_STUDY_DAYS}d. Ten-year statistics do not move on "
+                       "one session, and this is the heaviest stage in the run."}
 
     out["elapsed_s"] = round(_time.monotonic() - t0, 1)
     out["budget_s"] = CRON_BUDGET_S
